@@ -24,7 +24,16 @@ enabled cargo features ask for.
   the README's "Regenerating the Sail model" section **followed by
   `scripts/fix_cpp_model.py`**. The model is a C++ class (`model::Model`): all
   architectural state is per-instance, which is what enables multiple
-  independent oracles per process. License: BSD-3-Clause (Sail translation,
+  independent oracles per process.
+
+  **Not a byte-for-byte Sail artifact.** Three of that script's fixes work
+  around `--cpp` backend defects, but fix 5 changes *semantics*: `ror_spec_N`
+  took CF from the result's LSB for rotate counts > 1, where upstream ACL2 uses
+  the MSB. All four widths ship corrected — `gzip -dc model.cpp.gz | grep -n
+  'zresult >> INT64_C(63)'` should find it inside `zror_spec_64`. See
+  `docs/backend-differences.md` §4b. Everything else is as generated.
+
+  License: BSD-3-Clause (Sail translation,
   Patrick Taylor / Thomas Bauereiss) AND BSD-3-Clause (original ACL2 X86isa
   model, Regents of the University of Texas; see the upstream `model/LICENSE`).
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Work around Sail 0.20.1 `--cpp` backend bugs on large models (arm-v9.4-a).
+"""Post-process the Sail-generated C++ model.
 
 Usage: fix_cpp_model.py path/to/model.h path/to/model.cpp
 
-Four fixes, each for a thing the C++ backend gets wrong:
+Fixes 1-4 work around Sail 0.20.1 `--cpp` backend bugs on large models
+(arm-v9.4-a); fix 5 corrects a semantic error in the ACL2->Sail translation
+itself, so it applies to the C backend too.
 
 1. Some method declarations are emitted TWICE in the class body — valid C, but
    a C++ error. -> drop exact duplicate declaration lines.
@@ -22,6 +24,14 @@ Four fixes, each for a thing the C++ backend gets wrong:
    pulls the scratch out from under the others. -> guard the startup block to
    the first live instance and finish to the last (refcounted), leaving the
    per-instance parts untouched.
+
+5. WRONG SEMANTICS: `ror_spec_N` computes CF from the result's LSB when the
+   rotate count is > 1 — that is ROL's rule. Upstream ACL2 x86isa uses
+   `(logbit size-1 result)`, the MSB, in *both* the `1` and `otherwise`
+   branches; the Sail translation kept MSB only for count 1. Confirmed against
+   Bochs and real hardware, which agree with each other and with the SDM.
+   Affects all four widths, count > 1 only. -> rewrite the shift amount from 0
+   to size-1 in each ror_spec_N. See docs/backend-differences.md §4b.
 """
 import os
 import re
@@ -187,8 +197,46 @@ def refcount_scratch(cpp_path: str) -> None:
     print(f"{cpp_path}: wrapped {runs_wrapped} startup/finish run(s) in refcount guards")
 
 
+ROR_WIDTHS = (8, 16, 32, 64)
+# The `otherwise` branch of ror_spec_N, which selects bit 0 of the result. The
+# count==1 branch uses zlogbit_bits instead, so this pattern occurs exactly once
+# per function — asserted below rather than assumed.
+ROR_CF_LSB = "(safe_rshift(UINT64_MAX, 64 - 1) & (zresult >> INT64_C(0)))"
+
+
+def fix_ror_cf(cpp_path: str) -> None:
+    """ror_spec_N with count > 1 must take CF from the MSB, not the LSB."""
+    src = open(cpp_path).read()
+    patched = 0
+    for size in ROR_WIDTHS:
+        fn = f"Model::zror_spec_{size}(uint64_t"
+        start = src.find(fn)
+        if start < 0:
+            raise SystemExit(f"{cpp_path}: no {fn} — model layout changed, fix 5 needs review")
+        end = src.index("\n}\n", start)
+        body = src[start:end]
+        want = ROR_CF_LSB.replace("INT64_C(0)", f"INT64_C({size - 1})")
+        if body.count(want) == 1:
+            continue  # already applied
+        n = body.count(ROR_CF_LSB)
+        if n != 1:
+            raise SystemExit(
+                f"{cpp_path}: expected 1 CF-from-LSB site in ror_spec_{size}, found {n} "
+                "— model layout changed, fix 5 needs review"
+            )
+        src = src[:start] + body.replace(ROR_CF_LSB, want) + src[end:]
+        patched += 1
+    if not patched:
+        print(f"{cpp_path}: ror_spec CF fix already applied, skipped")
+        return
+    with open(cpp_path, "w") as f:
+        f.write(src)
+    print(f"{cpp_path}: fixed CF for count > 1 in {patched} ror_spec_N function(s)")
+
+
 if __name__ == "__main__":
     header, cpp = sys.argv[1], sys.argv[2]
     kept = dedup_header(header)
     gen_missing(kept, header, cpp)
     refcount_scratch(cpp)
+    fix_ror_cf(cpp)

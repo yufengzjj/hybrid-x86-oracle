@@ -185,6 +185,34 @@ static ARITH: &[Case] = &[
     Case::new("rcr rax,1 (CF in)", &[0x48, 0xD1, 0xD8])
         .gprs(&[(RAX, 1)])
         .rflags(0x2 | FLAG_CF),
+    // Rotates by more than 1 take a different path than rotate-by-1 in every
+    // implementation, and the SDM leaves OF undefined there (AF always). CF is
+    // still defined: ROL takes it from the result's LSB, ROR from its MSB.
+    // Each operand below is chosen so those two bits disagree, which is what
+    // makes the case discriminating — see docs/backend-differences.md §4b.
+    Case::new("rol rax,11", &[0x48, 0xC1, 0xC0, 0x0B])
+        .gprs(&[(RAX, 1u64 << 53)])
+        .undef(FLAG_OF | FLAG_AF),
+    Case::new("ror rax,11", &[0x48, 0xC1, 0xC8, 0x0B])
+        .gprs(&[(RAX, 0x800)])
+        .undef(FLAG_OF | FLAG_AF),
+    Case::new("ror eax,5", &[0xC1, 0xC8, 0x05]).gprs(&[(RAX, 0x20)]).undef(FLAG_OF | FLAG_AF),
+    Case::new("ror ax,11", &[0x66, 0xC1, 0xC8, 0x0B])
+        .gprs(&[(RAX, 0x800)])
+        .undef(FLAG_OF | FLAG_AF),
+    Case::new("ror al,3", &[0xC0, 0xC8, 0x03]).gprs(&[(RAX, 0x08)]).undef(FLAG_OF | FLAG_AF),
+    // RCL/RCR by more than 1, for the same reason — these rotate through CF, so
+    // they take a different route to it than ROL/ROR and need their own cases.
+    Case::new("rcl rax,11 (CF in)", &[0x48, 0xC1, 0xD0, 0x0B])
+        .gprs(&[(RAX, 0x1F_FFFF_FFFF_FFFF)])
+        .rflags(0x2 | FLAG_CF)
+        .undef(FLAG_OF | FLAG_AF),
+    Case::new("rcr rax,11 (CF in)", &[0x48, 0xC1, 0xD8, 0x0B])
+        .gprs(&[(RAX, 0x1F_FFFF_FFFF_FFFF)])
+        .rflags(0x2 | FLAG_CF)
+        .undef(FLAG_OF | FLAG_AF),
+    Case::new("rcr eax,5", &[0xC1, 0xD8, 0x05]).gprs(&[(RAX, 0x8000_0021)]).undef(FLAG_OF | FLAG_AF),
+    Case::new("rol al,3", &[0xC0, 0xC0, 0x03]).gprs(&[(RAX, 0x91)]).undef(FLAG_OF | FLAG_AF),
     // SHLD leaves OF undefined for shift counts > 1, and AF undefined always.
     Case::new("shld rax,rbx,4", &[0x48, 0x0F, 0xA4, 0xD8, 0x04])
         .gprs(&[(RAX, 0xF000_0000_0000_0000), (RBX, 0xABCD)])

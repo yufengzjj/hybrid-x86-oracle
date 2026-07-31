@@ -150,6 +150,32 @@ unchanged everywhere.
 `cargo nextest run` gives process-per-test parallelism, which is also how you
 get more than one Bochs oracle at a time.
 
+### Build directory
+
+The Sail and Bochs builds produce a large `target/` (a few GB with both profiles
+and both host targets). If the checkout lives on a network or interop filesystem
+— a WSL2 `/mnt/c` path being the common case — put it on a local disk instead,
+or every rebuild pays the crossing:
+
+```sh
+export CARGO_TARGET_DIR=~/.cache/cargo-target/hybrid-x86-oracle
+```
+
+or, to make it stick for this checkout only, a gitignored `.cargo/config.toml`
+with `[build] target-dir = "..."`.
+
+Mind the interop edge if you drive Windows `cargo.exe` from the same WSL tree:
+it reads that same `.cargo/config.toml` but cannot resolve a WSL path, so a
+`target-dir` of `/home/you/...` silently becomes `C:\home\you\...`. Exporting
+`CARGO_TARGET_DIR` does **not** fix it — WSL only forwards variables named in
+`WSLENV`, so the env var never reaches the Windows process and the config wins
+anyway. Pass the override on the command line instead:
+
+```sh
+cargo.exe test --target x86_64-pc-windows-msvc --features bochs,whp \
+    --target-dir 'C:\Users\you\.cargo-target\hybrid-x86-oracle'
+```
+
 ## The differential suite
 
 `tests/differential.rs` runs 60 single-instruction cases from a bit-identical
@@ -331,6 +357,12 @@ Sail `main` (required even with `--c-no-main`) and `initialise_64_bit_mode()`.
 Sail's dead-code elimination drops anything unreferenced, hence one
 `--c-preserve` per wrapper. Then refresh `vendor/` as described in
 `vendor/README.md`.
+
+`fix_cpp_model.py` is not optional. Four of its fixes make the generated C++
+compile and survive multiple instances; the fifth corrects a real semantic error
+in the ACL2→Sail translation (`ROR` computes CF from the wrong bit for rotate
+counts > 1 — `docs/backend-differences.md` §4b). Skip it and the `sail` backend
+silently disagrees with hardware.
 
 ## Limitations
 

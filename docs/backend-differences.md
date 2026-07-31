@@ -86,6 +86,40 @@ test reads `rflags.ZF` where upstream ACL2 uses `(zf-spec counter)`. With ZF
 clear, RIP never advances and RCX wraps past zero. Drive REP loops per iteration
 and stop on `RCX == 0` yourself.
 
+## 4b. Rotates — a translation bug this crate patches
+
+Not a legitimate difference: a second ACL2→Sail translation error, found by the
+differential suite and **corrected in the vendored model**. Recorded here so
+that anyone regenerating from upstream knows to expect it.
+
+`ROR` sets CF from the **MSB** of the result, `ROL` from the LSB. Upstream ACL2
+`rotates-spec.lisp` has this right, using `(logbit size-1 result)` in both the
+`1` and the `otherwise` branch. The Sail translation
+([`model/rotates_spec.sail`](https://github.com/rems-project/sail-x86-from-acl2/blob/master/model/rotates_spec.sail))
+kept the MSB only for count 1 and fell back to `result[0 .. 0]` — ROL's rule —
+for every larger count:
+
+```sail
+1 => { let cf : bits(1) = logbit(7, result); ... }   // correct
+_ => { let cf : bits(1) = result[0 .. 0];   ... }    // wrong: that is ROL's CF
+```
+
+So `ror ax, 11` reported CF from the wrong bit. All four widths were affected,
+count > 1 only; `ROL`, `RCL` and `RCR` are correct. Bochs and the hardware
+backends agreed with each other and with the SDM, which is what identified Sail
+as the outlier.
+
+`scripts/fix_cpp_model.py` (fix 5) rewrites the shift amount from 0 to size-1 in
+each `ror_spec_N`, and `vendor/sail/model.cpp.gz` ships patched — so the `sail`
+backend is correct as distributed. A model you generate yourself is *not*, unless
+you run that script, which the regeneration recipe already ends with.
+
+The regression cases are `ror {rax,eax,ax,al}` plus `rol`/`rcl`/`rcr` at
+count > 1 in `tests/differential.rs`. The suite missed this for as long as it
+did because every rotate case it had used count 1 — the one path Sail got right.
+Rotate-by-1 and rotate-by-n are separate branches in every implementation; cover
+both.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was
