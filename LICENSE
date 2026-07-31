@@ -1,0 +1,106 @@
+hybrid-x86-oracle — licensing
+=============================
+
+This project's OWN source code — everything authored in this repository:
+`src/`, `csrc/`, `sail/`, `build.rs`, `scripts/`, the test suite, and the
+documentation — is licensed under the BSD 3-Clause License (below).
+
+It also BUNDLES and statically links several third-party components under their
+own licenses; see "Third-party components" at the end. Two of them are copyleft:
+the bundled GMP arithmetic (mini-gmp, LGPL/GPL) in every build, and the Bochs
+CPU sources (LGPL-2.1-or-later) when the `bochs` feature is on. A DISTRIBUTED
+BINARY of this crate is therefore a combined work subject to those terms as
+well. The accurate combined SPDX expression is:
+
+    BSD-3-Clause AND BSD-2-Clause AND MIT
+      AND LGPL-2.1-or-later
+      AND (LGPL-3.0-or-later OR GPL-2.0-or-later)
+
+The LGPL-2.1-or-later term covers Bochs, which only a `--features bochs` build
+links; a default build carries the rest.
+
+-------------------------------------------------------------------------------
+
+BSD 3-Clause License
+
+Copyright (c) 2026, hybrid-x86-oracle contributors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+===============================================================================
+Third-party components
+===============================================================================
+
+The `kvm` and `whp` cargo features add only ordinary Rust dependencies
+(kvm-ioctls, kvm-bindings, libc on Linux — Apache-2.0/MIT; windows-sys on
+Windows — MIT OR Apache-2.0) and talk to the host kernel or hypervisor; they
+bundle nothing.
+
+Vendored in vendor/ (see vendor/README.md for provenance):
+
+* vendor/bochs/ (the `bochs` cargo feature)
+    The Bochs CPU sources — libcpu, libfpu, libavx, libcpudb, libsoftfloat and
+    four of Bochs' own support sources (logio.cc, gui/siminterface.cc,
+    gui/paramtree.cc, pc_system.cc) — compiled by build.rs into this crate's
+    native archive and statically linked. Upstream files, unmodified; the exact
+    revision and ./configure flags are recorded in vendor/bochs/PROVENANCE, and
+    scripts/vendor-bochs.sh reproduces the tree. `BOCHS_DIR` builds a different
+    source root instead.
+    License: LGPL-2.1-or-later. Copyright (c) the Bochs Project. Full texts in
+    vendor/bochs/COPYING and vendor/bochs/LICENSE.
+    >> Linking these makes a distributed binary a combined work under the LGPL:
+    >> provide the Bochs source — it is vendored here — and allow relinking.
+    >> Building with only the default `sail` feature does not involve Bochs
+    >> at all.
+
+* vendor/sail/model.cpp.gz, vendor/sail/model.h, vendor/sail/model_missing.cpp
+    Generated from rems-project/sail-x86-from-acl2 (the Sail x86 model
+    translated from the ACL2 x86isa books).
+    License: BSD-3-Clause (Sail model: Copyright (c) 2020 Patrick Taylor;
+    2021-2023 Thomas Bauereiss) AND BSD-3-Clause (original ACL2 X86isa model:
+    Copyright (c) 2015 Regents of the University of Texas — Shilpi Goel,
+    Warren A. Hunt, Jr., Matt Kaufmann et al.; see the sail-x86-from-acl2
+    repository's model/LICENSE for both full texts).
+
+* vendor/sail/runtime/{sail,rts,sail_failure,sail_config}.{c,h} (patched)
+    The Sail C runtime, from the `sail` package.
+    License: BSD-2-Clause. Copyright (c) the Sail authors / contributors
+    (University of Cambridge et al.).
+
+* vendor/sail/runtime/cJSON.{c,h}
+    License: MIT. Copyright (c) 2009-2017 Dave Gamble and cJSON contributors.
+
+* vendor/sail/runtime/mini-gmp.{c,h}, mini-mpq.{c,h}
+    From GMP 6.3.0. License: dual LGPL-3.0-or-later OR GPL-2.0-or-later.
+    Copyright (c) the Free Software Foundation, Inc.
+    >> This is the only copyleft component. It is bundled and statically
+    >> linked by default, so redistributing a built binary triggers the
+    >> LGPL's obligations (provide the GMP source — included here — and allow
+    >> relinking). Building with SAIL_SYSTEM_GMP links the system libgmp
+    >> instead, which is LGPL all the same. Full GMP license texts:
+    >> https://www.gnu.org/licenses/lgpl-3.0.html and
+    >> https://www.gnu.org/licenses/old-licenses/gpl-2.0.html

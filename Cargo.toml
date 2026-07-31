@@ -1,0 +1,80 @@
+[package]
+name = "hybrid-x86-oracle"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable golden-reference x86-64 CPUs (Sail/ACL2 formal model, Bochs) behind one API, for differential testing"
+# Own code is BSD-3-Clause; the compound expression reflects the vendored,
+# statically-linked components (see LICENSE). The copyleft parts are mini-gmp
+# (LGPL-3.0-or-later OR GPL-2.0-or-later), linked in every build, and Bochs
+# (LGPL-2.1-or-later), linked only with `--features bochs`. Cargo has no way to
+# make a license expression conditional on a feature, so the field states the
+# superset.
+license = "BSD-3-Clause AND BSD-2-Clause AND MIT AND LGPL-2.1-or-later AND (LGPL-3.0-or-later OR GPL-2.0-or-later)"
+build = "build.rs"
+# `links` makes Cargo enforce a single version of the native lib per build graph,
+# which matches the reality that the Sail runtime is global per-process state.
+links = "x86oracle"
+
+[features]
+default = ["sail"]
+# The ACL2-derived Sail formal model. Self-contained: the pre-generated model
+# and a patched Sail runtime are vendored, so only C/C++ compilers are needed.
+sail = []
+# The Bochs CPU core, for near-complete user-mode coverage (incl. AVX-512).
+# Self-contained: the CPU sources are vendored under vendor/bochs and compiled
+# by build.rs (BOCHS_DIR overrides the source root). The vendored config.h was
+# generated on Linux; build.rs adjusts it for MSVC, so Linux and Windows both work
+# as shipped. Elsewhere, re-run scripts/vendor-bochs.sh on that platform, or point
+# BOCHS_DIR at your own tree.
+bochs = []
+# The host CPU itself, through KVM: hardware ground truth on **Linux**. Needs
+# read/write access to /dev/kvm (`sudo chmod 666 /dev/kvm`, or membership of the
+# kvm group). Coverage is whatever the host CPU implements.
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:libc"]
+# The same thing on **Windows**, through the Windows Hypervisor Platform. Needs
+# the "Windows Hypervisor Platform" optional feature (and hence Hyper-V) enabled;
+# when it is not, the backend reports itself unavailable instead of failing.
+whp = ["dep:windows-sys"]
+# "The host CPU, whatever this platform calls it." Enables both of the above;
+# each is inert off its own OS, so this is the portable way to ask for hardware
+# ground truth. `Backend::hardware()` then names the one that applies here.
+hardware = ["kvm", "whp"]
+# Link the system libgmp instead of the bundled mini-gmp (faster exact-rational
+# FP, ~3-6x). Auto-discovered: GMP_DIR env, else a scan of PATH for a prefix
+# with include/gmp.h + a gmp lib, else the toolchain's default search paths.
+# Equivalent to setting SAIL_SYSTEM_GMP=1. Correct on Windows too (sail.h LLP64).
+system-gmp = []
+# Same, but link libgmp statically (no runtime gmp DLL/.so to ship).
+system-gmp-static = ["system-gmp"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = { version = "0.25", optional = true }
+kvm-bindings = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
+
+# Only the WHP *type* definitions (and VirtualAlloc/LoadLibrary) are taken from
+# here — hand-writing those unions is exactly where a layout mistake would go
+# unnoticed. The WHP entry points themselves are resolved with GetProcAddress at
+# runtime, deliberately: an import-table dependency on winhvplatform.dll would
+# stop the whole test binary from starting on a machine without WHP.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }
+# Pure-Rust gzip (miniz_oxide backend) to unpack vendor/sail/model.cpp.gz at build time.
+flate2 = "1"
+
+[lib]
+name = "x86_oracle"
+path = "src/lib.rs"
+
+# The C++ backend keeps architectural state per Oracle instance, and the Rust
+# wrapper is Send + Sync (a process-wide mutex serializes model calls), so
+# plain `cargo test` is safe. Use `cargo nextest run` for process-level
+# parallelism (the mutex serializes within a process).
