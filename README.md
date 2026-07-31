@@ -123,6 +123,14 @@ cargo caches it. `BOCHS_DIR` overrides the source root if you want to track a
 different Bochs revision, and `scripts/vendor-bochs.sh` refreshes
 `vendor/bochs/` from a pinned upstream commit.
 
+The Bochs backend runs with its logging silenced below `PANIC`. Bochs' own
+defaults print INFO/WARN/ERROR and, on a guest fault, dump the full register
+file — which for an oracle is noise, since a fault is an expected result
+delivered through `StepOutcome`, not an emulator problem. The differential suite
+alone was emitting ~11 000 such lines. `PANIC` is deliberately left alone: that
+one means Bochs itself is in an impossible state. Set **`BOCHS_LOG=1`** to
+restore Bochs' defaults when debugging the backend.
+
 The hardware backends need hardware virtualization plus permission to use it.
 
 On **Linux** (KVM), access to `/dev/kvm`:

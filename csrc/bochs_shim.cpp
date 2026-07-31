@@ -39,6 +39,7 @@
 #include "plugin.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <unordered_map>
@@ -528,6 +529,35 @@ void enter_long_mode() {
 
 bool g_alive = false;
 
+/* Bochs logs to stderr through `logfunctions`, and its defaults are tuned for a
+ * full emulator run: INFO/WARN/ERROR all print, and PANIC asks the user. For an
+ * oracle that is pure noise — a guest fault is an *expected result* here,
+ * reported through StepOutcome, not an emulator problem. A single `ud2` case
+ * emits a full register dump plus "exception(): 3rd (13) exception with no
+ * resolution", and the ACT_ASK path then adds "notify called, but no
+ * bxevent_callback function is registered" because this shim has no GUI to ask.
+ *
+ * So drop everything below PANIC. PANIC is left alone: that one means Bochs
+ * itself reached an impossible state, which is a real bug and must stay visible.
+ *
+ * Two calls are needed because `logfunctions`' constructor copies the defaults
+ * into a per-instance array — set_default_log_action only affects objects built
+ * later, and bx_cpu is a file-scope global that was constructed before main().
+ * The -1 form walks the modules already registered with iofunctions.
+ *
+ * Set BOCHS_LOG=1 to keep Bochs' own defaults when debugging the backend. */
+void quiet_bochs_log() {
+    const char *verbose = std::getenv("BOCHS_LOG");
+    if (verbose != nullptr && verbose[0] != '\0' && std::strcmp(verbose, "0") != 0) {
+        return;
+    }
+    const int levels[] = {LOGLEV_DEBUG, LOGLEV_INFO, LOGLEV_WARN, LOGLEV_ERROR};
+    for (int level : levels) {
+        SIM->set_default_log_action(level, ACT_IGNORE);
+        SIM->set_log_action(-1, level, ACT_IGNORE);
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -558,6 +588,11 @@ void *oracle_bochs_new(void) {
         pluginlog = new logfunctions();
         pluginlog->put("PLGN");
         bx_init_siminterface();
+        /* As early as SIM allows — CPU model selection and initialize() are
+         * themselves chatty. bx_cpu is already registered with iofunctions
+         * (logfunctions' constructor does that), so the -1 sweep reaches it
+         * even though the object predates main(). */
+        quiet_bochs_log();
         build_param_tree();
         /* "bx_generic" enables everything the build supports (AVX-512, BMI,
          * CET...), which is the point of this backend. */
