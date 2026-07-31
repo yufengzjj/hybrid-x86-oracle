@@ -259,6 +259,73 @@ static MEMORY: &[Case] = &[
     Case::new("lea rax,[rbx+8]", &[0x48, 0x8D, 0x43, 0x08]).gprs(&[(RBX, DATA)]),
 ];
 
+/// String operations and compare-exchange — three separate ACL2->Sail
+/// translation errors lived here, all of them patched in the vendored model.
+/// See `docs/backend-differences.md` §4 and §4c.
+///
+/// Every `REP` case below either does nothing or finishes in one step. That is
+/// deliberate: hardware exposes no per-iteration flag state when the
+/// single-step trap lands *between* iterations of a `REPE CMPS`, while both
+/// models do, so a mid-loop CMPS is a legitimate backend difference rather than
+/// a finding. Mid-loop `MOVS`/`STOS` set no flags and so are safe to compare.
+static STRING: &[Case] = &[
+    // CMPS subtracts [rDI] from [rSI]. Getting that backwards leaves ZF right
+    // and CF/SF/AF/PF wrong, so only unequal operands can see it.
+    Case::new("cmpsb (src > dst)", &[0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8)])
+        .data(&[5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("cmpsb (src < dst)", &[0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8)])
+        .data(&[3, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("cmps qword", &[0x48, 0xA7])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8)])
+        .data(&[5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]),
+    // CMPXCHG compares rAX with the destination, not the other way round —
+    // again invisible when they are equal, which is all the suite used to have.
+    Case::new("cmpxchg [rbx],rcx (ne)", &[0x48, 0x0F, 0xB1, 0x0B])
+        .gprs(&[(RAX, 0xBB), (RCX, 0xCC), (RBX, DATA)])
+        .data(&[0x11, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("cmpxchg rbx,rcx (ne)", &[0x48, 0x0F, 0xB1, 0xCB])
+        .gprs(&[(RAX, 0xBB), (RCX, 0xCC), (RBX, 0x11)]),
+    Case::new("cmpxchg bl,cl (ne)", &[0x0F, 0xB0, 0xCB])
+        .gprs(&[(RAX, 0xBB), (RCX, 0xCC), (RBX, 0x11)]),
+    // rCX == 0 on entry: no iteration at all, and RIP moves on. rCX == 1: one
+    // iteration, then RIP moves on. Above that RIP parks on the instruction.
+    Case::new("rep movsb (rcx=0)", &[0xF3, 0xA4])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 0)])
+        .data(&[0xAA, 0xBB, 0xCC, 0, 0, 0, 0, 0]),
+    Case::new("rep movsb (rcx=1)", &[0xF3, 0xA4])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 1)])
+        .data(&[0xAA, 0xBB, 0xCC, 0, 0, 0, 0, 0]),
+    Case::new("rep movsb (rcx=2)", &[0xF3, 0xA4])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 2)])
+        .data(&[0xAA, 0xBB, 0xCC, 0, 0, 0, 0, 0]),
+    // 0xF2 on MOVS and STOS is REP as well; ZF plays no part in either.
+    Case::new("repne movsb (rcx=1)", &[0xF2, 0xA4])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 1)])
+        .rflags(0x2 | FLAG_ZF)
+        .data(&[0xAA, 0xBB, 0xCC, 0, 0, 0, 0, 0]),
+    Case::new("rep stosb (rcx=0)", &[0xF3, 0xAA]).gprs(&[(RAX, 0x5A), (RDI, DATA), (RCX, 0)]),
+    Case::new("rep stosb (rcx=1)", &[0xF3, 0xAA]).gprs(&[(RAX, 0x5A), (RDI, DATA), (RCX, 1)]),
+    Case::new("rep stosb (rcx=2)", &[0xF3, 0xAA]).gprs(&[(RAX, 0x5A), (RDI, DATA), (RCX, 2)]),
+    Case::new("repne stosb (rcx=1)", &[0xF2, 0xAA])
+        .gprs(&[(RAX, 0x5A), (RDI, DATA), (RCX, 1)])
+        .rflags(0x2 | FLAG_ZF),
+    // REPE stops on rCX == 0 or ZF == 0, REPNE on rCX == 0 or ZF == 1.
+    Case::new("repe cmpsb (rcx=0)", &[0xF3, 0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 0)])
+        .data(&[7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("repe cmpsb (rcx=1, eq)", &[0xF3, 0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 1)])
+        .data(&[7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("repe cmpsb (rcx=2, ne stops)", &[0xF3, 0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 2)])
+        .data(&[7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("repne cmpsb (rcx=2, eq stops)", &[0xF2, 0xA6])
+        .gprs(&[(RSI, DATA), (RDI, DATA + 8), (RCX, 2)])
+        .data(&[7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]),
+];
+
 /// Control transfer.
 static BRANCH: &[Case] = &[
     Case::new("jmp rel32", &[0xE9, 0x10, 0x00, 0x00, 0x00]),
@@ -316,6 +383,11 @@ fn memory_agrees_across_backends() {
 #[test]
 fn branches_agree_across_backends() {
     run_group("branch", BRANCH);
+}
+
+#[test]
+fn string_ops_agree_across_backends() {
+    run_group("string", STRING);
 }
 
 /// The backends must agree on the *starting* state too, or every later

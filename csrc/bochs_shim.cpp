@@ -640,10 +640,18 @@ void oracle_bochs_set_rip(uint64_t v) {
 }
 uint64_t oracle_bochs_get_rip(void) { return bx_cpu.gen_reg[BX_64BIT_REG_RIP].rrx; }
 
-/* read_eflags() forces the lazy OSZAPC flags — see the header comment. */
-uint64_t oracle_bochs_get_rflags(void) { return bx_cpu.read_eflags(); }
+/* read_eflags() forces the lazy OSZAPC flags — see the header comment.
+ *
+ * TF and RF are masked out on both directions, matching the KVM and WHP
+ * backends: they belong to whatever the backend uses to stop after one
+ * instruction, not to the program under test. Bochs sets RF itself whenever it
+ * parks RIP on a repeating string operation, so without this a `rep movs` mid
+ * -loop reads back 0x10002 here and 0x2 on hardware. */
+static const Bit32u kHarnessFlags = 0x100 /* TF */ | 0x10000 /* RF */;
+
+uint64_t oracle_bochs_get_rflags(void) { return bx_cpu.read_eflags() & ~kHarnessFlags; }
 void oracle_bochs_set_rflags(uint64_t v) {
-    bx_cpu.setEFlags((Bit32u)v | 0x2);
+    bx_cpu.setEFlags(((Bit32u)v & ~kHarnessFlags) | 0x2);
 }
 
 void oracle_bochs_set_zmm(uint32_t n, uint32_t chunk, uint64_t v) {

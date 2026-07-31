@@ -78,13 +78,68 @@ that XCR0 actually accepted. So a hypervisor that hides AVX-512 shows up as
 
 ## 4. String instructions (`REP`)
 
-Both backends stop after one iteration of a `REP` string operation, with RIP
-parked on the instruction — so per-iteration stepping is portable.
+Every backend runs **one iteration per step**, with RIP parked on the
+instruction until the loop ends — so per-iteration stepping is portable, and a
+`rep movsb` with `RCX = n` takes exactly `n` steps (`n = 0` takes one, which
+does nothing). That is real hardware's behaviour under a single-step trap, not a
+modelling convention.
 
-The Sail model has a **known translation bug** here: its `REP MOVS` termination
-test reads `rflags.ZF` where upstream ACL2 uses `(zf-spec counter)`. With ZF
-clear, RIP never advances and RCX wraps past zero. Drive REP loops per iteration
-and stop on `RCX == 0` yourself.
+One thing is *not* portable: the flags a `REPE`/`REPNE CMPS` computes **on an
+iteration that does not end the loop**. Bochs and Sail expose them; hardware
+does not — the `#DB` lands at an instruction boundary where the architectural
+flag update has not been committed:
+
+```text
+repe cmpsb, rcx=3, all operands equal
+             sail   bochs   kvm
+  step 1     0x46   0x46    0x02   <- rcx=2, RIP parked
+  step 2     0x46   0x46    0x02   <- rcx=1, RIP parked
+  step 3     0x46   0x46    0x46   <- rcx=0, RIP advances
+```
+
+The loops converge: compare only when the instruction has finished. `MOVS` and
+`STOS` set no flags, so mid-loop states are comparable there.
+
+Bochs also sets RF while parked on a repeat, where hardware does not; the Bochs
+backend masks TF and RF out of `get_rflags`/`set_rflags`, as the KVM and WHP
+backends already did.
+
+**This section used to describe a translation bug instead; it is now fixed in
+the vendored model.** `x86_movs` / `x86_cmps` / `x86_stos` had three distinct
+errors, all against
+[`model/string_ops.sail`](https://github.com/rems-project/sail-x86-from-acl2/blob/master/model/string_ops.sail):
+
+1. `x86_stos` reads `prefixes[seg]` where ACL2's `x86-stos` reads
+   `(prefixes->rep prefixes)`, so `rep stos` never repeated at all — one store,
+   RCX untouched, RIP straight past.
+2. The `rCX == 0` test ACL2 performs *before* reading either operand is absent,
+   so entering with `RCX = 0` executed an iteration anyway and wrapped the
+   counter to `0xFFFF_FFFF_FFFF_FFFF` — a `rep movsb` that should be a no-op
+   instead ran 2^64 times, writing memory as it went.
+3. The `0xF3` arm has its two branches the wrong way round, so RIP advanced
+   exactly when the loop should have continued and vice versa:
+
+```sail
+243 => {                                      // 0xF3
+    let counter = ...rCX - 1;
+    if counter == 0 | rflags[zf] == 0b0 then {
+        write_rgfi_size(..., counter, ...)    // wrong: this is the *stop* case
+    } else {
+        write_rgfi_size(..., counter, ...);
+        write_iptr(proc_mode, temp_rip)       // ...so RIP advances to continue
+    }
+}
+```
+
+   The `0xF2` arm next to it has the same two bodies in the opposite order,
+   which is what makes the mistake visible. On top of that, consulting ZF at all
+   is wrong for `MOVS` and `STOS`: there `0xF3` is plain `REP` and `0xF2`
+   behaves identically (confirmed against both Bochs and hardware), so only the
+   counter decides.
+
+`scripts/fix_cpp_model.py` (fix 7) reads the rep field, inserts the entry test
+and recomputes the advance condition. Regression cases: the `rep`/`repne`
+`movsb`/`stosb`/`cmpsb` block in `tests/differential.rs`, at counts 0, 1 and 2.
 
 ## 4b. Rotates — a translation bug this crate patches
 
@@ -119,6 +174,28 @@ count > 1 in `tests/differential.rs`. The suite missed this for as long as it
 did because every rotate case it had used count 1 — the one path Sail got right.
 Rotate-by-1 and rotate-by-n are separate branches in every implementation; cover
 both.
+
+## 4c. `CMPS` and `CMPXCHG` compare backwards — also patched
+
+A third ACL2→Sail translation error, same treatment. Both instructions hand
+`gpr_arith_logic_spec` its `dst` and `src` the wrong way round, so the flags
+describe the negated difference:
+
+| | ACL2 | Sail translation |
+|---|---|---|
+| `x86-cmps` | `(gpr-arith/logic-spec size *OP-SUB* src1 src2 ...)` where `src1 = [rSI]`, `src2 = [rDI]` | `gpr_arith_logic_spec(size, 4, dst, src, ...)` — `[rDI] - [rSI]` |
+| `x86-cmpxchg` | `(gpr-arith/logic-spec size *OP-CMP* rAX reg/mem ...)` | `gpr_arith_logic_spec(size, 8, reg_mem, rax_var, ...)` — `reg/mem - rAX` |
+
+`ZF` is right either way — which is why `CMPXCHG` still swapped correctly, and
+why the one `cmpxchg` case the suite had (equal operands, where both directions
+give zero) never noticed. `CF`, `SF`, `AF` and `PF` are all wrong whenever the
+operands differ: `cmpsb` with `[rSI] = 5`, `[rDI] = 3` reported `0x93` (the
+flags of `3 - 5`) instead of `0x02`.
+
+Fixed by `scripts/fix_cpp_model.py` (fix 6), which swaps the two operands at the
+single call site in each function. Regression cases are the `cmpsb`/`cmps
+qword`/`cmpxchg` entries in `tests/differential.rs`, all with **unequal**
+operands — an equal-operand comparison cannot distinguish `a - b` from `b - a`.
 
 ## 5. Faults
 

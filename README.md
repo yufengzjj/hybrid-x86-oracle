@@ -367,10 +367,15 @@ Sail's dead-code elimination drops anything unreferenced, hence one
 `vendor/README.md`.
 
 `fix_cpp_model.py` is not optional. Four of its fixes make the generated C++
-compile and survive multiple instances; the fifth corrects a real semantic error
-in the ACL2→Sail translation (`ROR` computes CF from the wrong bit for rotate
-counts > 1 — `docs/backend-differences.md` §4b). Skip it and the `sail` backend
-silently disagrees with hardware.
+compile and survive multiple instances; the last three correct real semantic
+errors in the ACL2→Sail translation, each found by the differential suite and
+each of which makes the `sail` backend silently disagree with hardware:
+
+| | what is wrong upstream | |
+|---|---|---|
+| 5 | `ROR` takes CF from the wrong bit for rotate counts > 1 | [§4b](docs/backend-differences.md) |
+| 6 | `CMPS` and `CMPXCHG` compare their operands in the wrong order | [§4c](docs/backend-differences.md) |
+| 7 | `REP`-prefixed string operations never terminate | [§4](docs/backend-differences.md) |
 
 ## Limitations
 

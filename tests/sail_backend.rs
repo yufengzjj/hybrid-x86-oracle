@@ -137,11 +137,10 @@ fn movsb_copies_and_advances() {
 
 #[test]
 fn rep_movsb_runs_one_iteration_per_step() {
-    // The ACL2 model executes one REP iteration per step, RIP parked on the
-    // instruction. KNOWN MODEL QUIRK (faithfully oracled): the translated
-    // termination test reads rflags.ZF where upstream ACL2 uses
-    // `(zf-spec counter)`, so with ZF==0 RIP never advances and RCX wraps past
-    // zero. Drive REP loops per iteration and stop on RCX==0 yourself.
+    // The ACL2 model executes one REP iteration per step with RIP parked on
+    // the instruction, and lets RIP move on once the counter reaches zero —
+    // the same shape Bochs and hardware show. Getting *out* of the loop is the
+    // part the translation had wrong; see docs/backend-differences.md §4.
     let mut c = cpu();
     c.set_gpr(RSI, 0x2_0000);
     c.set_gpr(RDI, 0x3_0000);
@@ -151,11 +150,29 @@ fn rep_movsb_runs_one_iteration_per_step() {
     for remaining in (0..4u64).rev() {
         assert!(c.step().is_retired());
         assert_eq!(c.get_gpr(RCX), remaining);
-        assert_eq!(c.get_rip(), CODE, "RIP parked during REP");
+        let parked = remaining > 0;
+        assert_eq!(
+            c.get_rip(),
+            if parked { CODE } else { CODE + 2 },
+            "rcx={remaining}: RIP should {} the instruction",
+            if parked { "stay parked on" } else { "move past" }
+        );
     }
     let mut dst = [0u8; 4];
     c.read_mem(0x3_0000, &mut dst);
     assert_eq!(dst, [1, 2, 3, 4]);
+
+    // And a REP that starts at zero is a no-op: no store, no pointer movement.
+    let mut c = cpu();
+    c.set_gpr(RSI, 0x2_0000);
+    c.set_gpr(RDI, 0x3_0000);
+    c.set_gpr(RCX, 0);
+    c.write_mem(0x2_0000, &[0xAB]);
+    assert!(c.step_bytes(&[0xF3, 0xA4]).is_retired());
+    assert_eq!(c.get_gpr(RCX), 0, "counter must not wrap past zero");
+    assert_eq!(c.get_gpr(RDI), 0x3_0000);
+    assert_eq!(c.read_mem_byte(0x3_0000), 0);
+    assert_eq!(c.get_rip(), CODE + 2);
 }
 
 #[test]

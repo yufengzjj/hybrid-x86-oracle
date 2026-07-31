@@ -26,12 +26,23 @@ enabled cargo features ask for.
   architectural state is per-instance, which is what enables multiple
   independent oracles per process.
 
-  **Not a byte-for-byte Sail artifact.** Three of that script's fixes work
-  around `--cpp` backend defects, but fix 5 changes *semantics*: `ror_spec_N`
-  took CF from the result's LSB for rotate counts > 1, where upstream ACL2 uses
-  the MSB. All four widths ship corrected — `gzip -dc model.cpp.gz | grep -n
-  'zresult >> INT64_C(63)'` should find it inside `zror_spec_64`. See
-  `docs/backend-differences.md` §4b. Everything else is as generated.
+  **Not a byte-for-byte Sail artifact.** Four of that script's fixes work
+  around `--cpp` backend defects; fixes 5-7 change *semantics*, correcting
+  errors in the ACL2→Sail translation that the differential suite found:
+
+  - **5** — `ror_spec_N` took CF from the result's LSB for rotate counts > 1,
+    where upstream ACL2 uses the MSB (`docs/backend-differences.md` §4b).
+  - **6** — `x86_cmps` and `x86_cmpxchg` passed the two compared values to
+    `gpr_arith_logic_spec` in the wrong order, so every flag but ZF described
+    the negated difference (§4c).
+  - **7** — `REP`-prefixed string ops never terminated: `x86_stos` read the
+    segment prefix instead of the rep prefix, the `rCX == 0` entry test was
+    missing, and the `0xF3` arm advanced RIP exactly when it should not (§4).
+
+  Each patched site carries an `oracle-fix-N` comment, so
+  `gzip -dc model.cpp.gz | grep -c oracle-fix` counts them (12: 2 for fix 6, 10
+  for fix 7), and fix 5 shows up as `grep -n 'zresult >> INT64_C(63)'` inside
+  `zror_spec_64`. Everything else is as generated.
 
   License: BSD-3-Clause (Sail translation,
   Patrick Taylor / Thomas Bauereiss) AND BSD-3-Clause (original ACL2 X86isa
