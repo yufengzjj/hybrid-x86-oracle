@@ -197,6 +197,77 @@ single call site in each function. Regression cases are the `cmpsb`/`cmps
 qword`/`cmpxchg` entries in `tests/differential.rs`, all with **unequal**
 operands — an equal-operand comparison cannot distinguish `a - b` from `b - a`.
 
+## 4d. CET shadow stacks are opt-in
+
+Only Bochs models CET, and even there the reset state leaves it **off**:
+`X86Oracle::enable_shadow_stack(base, len)` answers
+`Err(ShadowStackError::Unsupported)` on every other backend, which a diff
+harness should treat exactly like `Unimplemented` — skip the backend, do not
+fail the case. The other failure, `BadRange`, is deliberately a separate
+variant: it says the backend *has* CET and rejected the arguments, which is a
+caller bug and must not be swallowed as "no CET here".
+
+`Unsupported` is a runtime answer, not just a compile-time one. Bochs gates the
+CET instructions on the CPU model claiming the extension, so the backend asks
+`is_cpu_extension_supported(BX_ISA_CET)` before touching CR4 — writing CR4.CET
+regardless would report success while every CET instruction still raised `#UD`.
+Enabling also sets CR0.WP, which the architecture requires before CR4.CET (the
+reset state already has it; only a caller that wrote CR0 first would notice).
+
+Enabling it is a real change of machine, not a flag: `CALL` starts pushing the
+return address to the shadow stack and `RET` pops and *compares* it, so a caller
+must also point `set_ssp` into the mapped region. That is why the plain reset
+state cannot have it on — every existing call/ret case would need a shadow stack
+to run.
+
+What "mapped" means is a page attribute, so `enable_shadow_stack` rewrites the
+identity map: the leaf entry gets Dirty=1 and R/W=0 (Bochs enforces exactly this
+in `check_leaf_entry_faults`), which is what makes an ordinary store fault while
+`WRSS` and the CPU's own pushes succeed. Granularity is the identity map's 2 MiB
+frame — keep ordinary data out of the frames you convert. Seeding is unaffected:
+the memory accessors reach physical memory without walking the page tables.
+
+Because the granularity is a whole frame, a range sharing one with the identity
+map's own page tables (`BochsOracle::RESERVED_START`, which lies *inside* the
+mapped address space and so is not excluded by the address limit) is refused
+outright rather than trusted to the caller: accepting it would hand the CPU a
+shadow stack on top of PML4, and the first `CALL` would overwrite it — silently,
+since the walk keeps hitting stale TLB entries long after. `enable_shadow_stack`
+reports a refused range with the same `false` it uses for "this backend has no
+CET", so validate the range before reading that as a capability answer.
+
+A failed shadow-stack check raises **`#CP`**, which `FaultKind` names in its own
+right (`ControlProtection`). Distinguishing it from `#PF` is the whole point of
+a negative CET case: a `#PF` there means the case set the stacks up wrong and
+never reached the comparison.
+
+Three things surprise people writing cases here:
+
+- **A `CALL` with displacement 0 does not push.** Bochs guards the shadow-stack
+  push with `i->Id() != 0`, so the PIC idiom `call $+5` proves nothing. Use a
+  non-zero displacement.
+- **An ordinary store right after a `WRSS` to the same page may not fault**: it
+  hits the TLB entry the `WRSS` just installed. Test the fault on a fresh
+  instance, or before the first shadow-stack access to that page.
+- **A fault is the end of a case.** There is no IDT, so the `#PF` an ordinary
+  store takes leaves the CPU unable to retire anything after it.
+
+`RDSSPD`/`RDSSPQ` are the exception to all of this: they are ungated in Bochs'
+decoder (they must be NOPs on pre-CET CPUs), so they decode with CET off and
+merely do nothing. Every other CET instruction is `#UD` until the extension is
+enabled — which this crate now does at CPU-model construction (`add_features
+= "cet"`, since `bx_generic` does not claim CET), so with shadow stacks off they
+report the ISA's answer for "disabled" rather than "not implemented".
+
+That last part is **not** opt-in and cannot be: the CPU model is fixed before
+`initialize()`, long before anyone calls `enable_shadow_stack`. So every Bochs
+instance decodes the CET encodings and reports CET in `CPUID.(EAX=7).ECX[7]`,
+including instances that never enable shadow stacks. Nothing in the suite
+compares CPUID today (`tests/sail_backend.rs` only expects Sail to report it
+unimplemented), but a future CPUID diff would see Bochs claim CET where the KVM
+or WHP host may not — that is a difference in the *model*, not a bug in either.
+`SSP` is likewise not part of `CpuState`, so it never enters a state diff.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

@@ -452,12 +452,15 @@ constexpr uint64_t PT_BASE = 0x7F'C000'0000ull; // reserved: page tables
 constexpr uint64_t PT_PML4 = PT_BASE;
 constexpr uint64_t PT_PDPT = PT_BASE + 0x1000;
 constexpr uint64_t PT_PD0 = PT_BASE + 0x2000; // 512 consecutive page directories
-constexpr uint64_t IDENTITY_LIMIT = 512ull << 30; // 512 GiB
+constexpr uint64_t PT_BYTES = 0x2000 + 512 * 0x1000; // PML4 + PDPT + the 512 PDs
+constexpr uint64_t IDENTITY_LIMIT = 512ull << 30;    // 512 GiB
 
 constexpr uint64_t PTE_P = 0x001;  // present
 constexpr uint64_t PTE_W = 0x002;  // writable
 constexpr uint64_t PTE_US = 0x004; // user-accessible
+constexpr uint64_t PTE_D = 0x040;  // dirty
 constexpr uint64_t PTE_PS = 0x080; // page size (leaf at this level)
+constexpr uint64_t FRAME_2M = 2ull << 20;
 
 void build_identity_map() {
     const uint64_t pml4e = PT_PDPT | PTE_P | PTE_W | PTE_US;
@@ -474,6 +477,47 @@ void build_identity_map() {
             mem().write(pd + j * 8, 8, &pde);
         }
     }
+}
+
+/* Re-map the 2 MiB frames covering [base, base+len) as CET shadow-stack pages.
+ *
+ * Bochs enforces the architectural encoding in paging.cc's
+ * `check_leaf_entry_faults`: a shadow-stack access requires R/W=1 in every level
+ * ABOVE the leaf (the identity map already has that) and, in the leaf itself,
+ * Dirty=1 with R/W=0 — which is what makes ordinary stores fault while the CPU's
+ * own call/ret pushes succeed. U/S must match the CPL, so a CPL-0 shadow stack
+ * clears it here; combined_access is the AND down the walk, so the US=1 above
+ * does not interfere.
+ *
+ * The identity map uses 2 MiB frames, so this rounds outward to whole frames —
+ * a caller must keep ordinary data out of the frames it converts. Seeding is
+ * unaffected either way: `oracle_bochs_write_mem` reaches physical memory
+ * directly and never walks the page tables.
+ */
+bool map_shadow_stack(uint64_t base, uint64_t len) {
+    if (len == 0 || base >= IDENTITY_LIMIT || len > IDENTITY_LIMIT - base) {
+        return false;
+    }
+    const uint64_t first = base & ~(FRAME_2M - 1);
+    const uint64_t last = (base + len - 1) | (FRAME_2M - 1);
+    /* The page tables live INSIDE the identity map (see PT_BASE), so the limit
+     * check above does not cover them. Handing the CPU a shadow stack that
+     * shares a frame with them is not a caller's problem to notice later: the
+     * first CALL pushes its return address over PML4[0], and because the walk
+     * keeps hitting stale TLB entries the machine runs on for a while before
+     * dying somewhere unrelated. Reject the whole rounded-up window — the same
+     * region `BochsOracle::RESERVED_START` documents. */
+    const uint64_t pt_first = PT_BASE & ~(FRAME_2M - 1);
+    const uint64_t pt_last = (PT_BASE + PT_BYTES - 1) | (FRAME_2M - 1);
+    if (first <= pt_last && pt_first <= last) {
+        return false;
+    }
+    for (uint64_t a = first; a <= last; a += FRAME_2M) {
+        const uint64_t pd = PT_PD0 + (a >> 30) * 0x1000;
+        const uint64_t pde = a | PTE_P | PTE_D | PTE_PS;
+        mem().write(pd + ((a >> 21) & 0x1FF) * 8, 8, &pde);
+    }
+    return true;
 }
 
 /* Descriptor attribute words as Bochs stores them (descriptor high dword >> 8):
@@ -597,6 +641,16 @@ void *oracle_bochs_new(void) {
         /* "bx_generic" enables everything the build supports (AVX-512, BMI,
          * CET...), which is the point of this backend. */
         SIM->get_param_enum(BXPN_CPU_MODEL)->set_by_name("bx_generic");
+        /* ...except CET, which bx_generic does not claim (only tigerlake,
+         * sapphire_rapids and arrow_lake do in cpudb). Without the extension
+         * every CET instruction except RDSSP — which is deliberately ungated,
+         * being a NOP on older CPUs — decodes to BxError and reports #UD, so
+         * the whole group would look unimplemented instead of merely disabled.
+         * Enabling the extension alone changes nothing until CR4.CET is set
+         * (see oracle_bochs_enable_shadow_stack): the instructions then behave
+         * as the ISA says for "shadow stacks off". Must precede initialize(),
+         * which is what applies this parameter. */
+        SIM->get_param_string(BXPN_CPU_ADD_FEATURES)->set("cet");
         /* A20 masking is applied to EVERY physical address (A20ADDR in
          * paging.cc). bx_pc_system's mask is zero until this is called, which
          * silently translates every linear address to physical 0 — the CPU then
@@ -676,6 +730,10 @@ void oracle_bochs_set_msr(uint32_t msr, uint64_t v) {
         bx_cpu.sregs[BX_SEG_REG_GS].cache.u.segment.base = v;
         break;
     case 0xC000'0102: bx_cpu.msr.kernelgsbase = v; break;
+#if BX_SUPPORT_CET
+    case 0x6A2: bx_cpu.msr.ia32_cet_control[0] = v; break; // IA32_S_CET
+    case 0x6A0: bx_cpu.msr.ia32_cet_control[1] = v; break; // IA32_U_CET
+#endif
     default: break; // not modelled: ignored, per the trait contract
     }
 }
@@ -689,8 +747,73 @@ uint64_t oracle_bochs_get_msr(uint32_t msr) {
     case 0xC000'0100: return bx_cpu.sregs[BX_SEG_REG_FS].cache.u.segment.base;
     case 0xC000'0101: return bx_cpu.sregs[BX_SEG_REG_GS].cache.u.segment.base;
     case 0xC000'0102: return bx_cpu.msr.kernelgsbase;
+#if BX_SUPPORT_CET
+    case 0x6A2: return bx_cpu.msr.ia32_cet_control[0];
+    case 0x6A0: return bx_cpu.msr.ia32_cet_control[1];
+#endif
     default: return 0;
     }
+}
+
+/* SSP is a register, not an MSR, and it sits past the 16 ModRM slots that
+ * `oracle_bochs_set_gpr` masks into — so it needs its own door. */
+void oracle_bochs_set_ssp(uint64_t v) {
+#if BX_SUPPORT_CET
+    bx_cpu.gen_reg[BX_64BIT_REG_SSP].rrx = v;
+#else
+    (void)v;
+#endif
+}
+
+uint64_t oracle_bochs_get_ssp(void) {
+#if BX_SUPPORT_CET
+    return bx_cpu.gen_reg[BX_64BIT_REG_SSP].rrx;
+#else
+    return 0;
+#endif
+}
+
+/* Turn CET shadow stacks on and give them somewhere to live. Opt-in on purpose:
+ * with shadow stacks enabled every CALL pushes and every RET pops and COMPARES,
+ * so a caller must also point SSP at the mapped region — which is not something
+ * the plain reset state should impose on every test.
+ *
+ * Returns 0 on success, 1 if this build/model has no CET, 2 if the range was
+ * refused. The caller turns those into ShadowStackError, and the distinction is
+ * the point: "no CET here" is a reason to skip a case, a bad range is a bug. */
+int oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
+#if BX_SUPPORT_CET
+    /* The compile-time guard only says the Bochs *build* has the code. Whether
+     * this CPU model claims the extension is a runtime question, and the answer
+     * decides whether the instructions decode at all — oracle_bochs_new asks for
+     * it by name (`add_features = "cet"`), a string that a future Bochs could
+     * rename out from under us. Without this check CR4.CET would still be set,
+     * because set32 does no validation, and every CET instruction would then be
+     * #UD while this function reported success. */
+    if (!bx_cpu.is_cpu_extension_supported(BX_ISA_CET)) {
+        return 1;
+    }
+    if (!map_shadow_stack(base, len)) {
+        return 2;
+    }
+    /* CR0.WP is an architectural precondition of CR4.CET (Bochs enforces the
+     * converse in crregs.cc: clearing WP while CET is on is #GP). The reset
+     * state already sets it, so this only matters if a caller wrote CR0 first —
+     * and writing CR4.CET without it would build a machine no CPU can be. */
+    bx_cpu.cr0.set32(bx_cpu.cr0.get32() | (1u << 16)); // CR0.WP
+    bx_cpu.cr4.set32(bx_cpu.cr4.get32() | (1u << 23)); // CR4.CET
+    /* SH_STK_EN | WR_SHSTK_EN, for both CPL 0 (where the oracle runs) and CPL 3.
+     * WRSS needs the second bit; without it the instruction is #UD. */
+    bx_cpu.msr.ia32_cet_control[0] = 0x3;
+    bx_cpu.msr.ia32_cet_control[1] = 0x3;
+    bx_cpu.updateFetchModeMask(); // CR0.WP feeds the paging privilege checks
+    bx_cpu.TLB_flush();
+    return 0;
+#else
+    (void)base;
+    (void)len;
+    return 1;
+#endif
 }
 
 void oracle_bochs_set_cr(uint32_t n, uint64_t v) {
@@ -742,8 +865,30 @@ uint8_t oracle_bochs_read_mem(uint64_t addr) {
     return b;
 }
 
+/* Bochs caches decoded instruction traces keyed by PHYSICAL address, and its own
+ * stores keep that cache honest by stamping the written page (memory.cc's
+ * `decWriteStamp`, the self-modifying-code path). A host-side write from this
+ * API bypasses all of that: it goes straight into GuestMemory, so re-running an
+ * address that already executed would replay the OLD decoded instruction while
+ * memory plainly holds the new bytes.
+ *
+ * That is precisely what `step_bytes` does — write code at RIP, step, rewind,
+ * write different code at the same RIP — so stamp every host write the same way
+ * Bochs stamps its own. It is O(1): the table is only consulted, and the icache
+ * only walked, for pages a trace was actually built from. Writes are one byte at
+ * a time here, so `decWriteStamp`'s "must not split a page" contract holds.
+ * Above 4 GiB the stamp hash aliases, which can only over-invalidate.
+ *
+ * The prefetch queue holds raw bytes for the current page and is not covered by
+ * the stamp table, so it goes too. */
+void invalidate_decoded(uint64_t addr) {
+    pageWriteStampTable.decWriteStamp((bx_phy_address)addr, 1);
+    bx_cpu.invalidate_prefetch_q();
+}
+
 void oracle_bochs_write_mem(uint64_t addr, uint8_t byte) {
     mem().write(addr, 1, &byte);
+    invalidate_decoded(addr);
 }
 
 void oracle_bochs_read_mem_slice(uint64_t addr, uint8_t *dst, uint64_t len) {
@@ -755,6 +900,7 @@ void oracle_bochs_read_mem_slice(uint64_t addr, uint8_t *dst, uint64_t len) {
 void oracle_bochs_write_mem_slice(uint64_t addr, const uint8_t *src, uint64_t len) {
     for (uint64_t i = 0; i < len; i++) {
         mem().write(addr + i, 1, src + i);
+        invalidate_decoded(addr + i);
     }
 }
 

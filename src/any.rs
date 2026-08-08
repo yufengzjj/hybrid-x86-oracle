@@ -18,7 +18,7 @@
 //! }
 //! ```
 
-use crate::{CpuState, StepOutcome, X86Oracle, ZMM_CHUNKS};
+use crate::{CpuState, ShadowStackError, StepOutcome, X86Oracle, ZMM_CHUNKS};
 
 /// Which reference implementation to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,6 +230,15 @@ impl X86Oracle for AnyOracle {
     }
     fn get_cr(&self, n: u32) -> u64 {
         dispatch!(self, o => o.get_cr(n))
+    }
+    fn enable_shadow_stack(&mut self, base: u64, len: u64) -> Result<(), ShadowStackError> {
+        dispatch!(self, o => o.enable_shadow_stack(base, len))
+    }
+    fn set_ssp(&mut self, value: u64) {
+        dispatch!(self, o => o.set_ssp(value))
+    }
+    fn get_ssp(&self) -> u64 {
+        dispatch!(self, o => o.get_ssp())
     }
     fn set_seg_selector(&mut self, n: u32, value: u16) {
         dispatch!(self, o => o.set_seg_selector(n, value))

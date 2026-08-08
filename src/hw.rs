@@ -270,6 +270,7 @@ pub fn classify(vector: u8) -> FaultKind {
         13 => FaultKind::GeneralProtection,
         14 => FaultKind::PageFault,
         17 => FaultKind::AlignmentCheck,
+        21 => FaultKind::ControlProtection,
         _ => FaultKind::OtherException,
     }
 }

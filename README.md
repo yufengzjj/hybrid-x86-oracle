@@ -75,7 +75,9 @@ guarantee:
 
 - **Reset state**: 64-bit long mode, CPL 0, flat address space (linear == the
   address you pass to the memory API), all GPRs and vector registers zero,
-  `RFLAGS == 0x2`, `CR4.OSFXSR` set, `RIP == 0`.
+  `RFLAGS == 0x2`, `CR4.OSFXSR` set, `RIP == 0`. CET shadow stacks are **off**;
+  `enable_shadow_stack` turns them on for the instances that want them (Bochs
+  only), which is opt-in because it changes what `CALL`/`RET` do.
 - **`step()` = exactly one instruction**, fetched from the instance's own memory
   at RIP. No interrupts, no timers, nothing asynchronous. x86 instructions are
   variable-length, so there is no opcode injection: write the bytes at RIP

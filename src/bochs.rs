@@ -16,8 +16,9 @@
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::{
-    FaultKind, StepOutcome, X86Oracle, ZMM_CHUNKS, ZMM_REGS, IA32_EFER, IA32_FMASK, IA32_FS_BASE,
-    IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LSTAR, IA32_STAR, SEG_COUNT,
+    FaultKind, ShadowStackError, StepOutcome, X86Oracle, ZMM_CHUNKS, ZMM_REGS, IA32_EFER,
+    IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LSTAR, IA32_STAR, IA32_S_CET,
+    IA32_U_CET, SEG_COUNT,
 };
 
 extern "C" {
@@ -36,6 +37,9 @@ extern "C" {
     fn oracle_bochs_get_msr(msr: u32) -> u64;
     fn oracle_bochs_set_cr(n: u32, v: u64);
     fn oracle_bochs_get_cr(n: u32) -> u64;
+    fn oracle_bochs_set_ssp(v: u64);
+    fn oracle_bochs_get_ssp() -> u64;
+    fn oracle_bochs_enable_shadow_stack(base: u64, len: u64) -> i32;
     fn oracle_bochs_set_seg_selector(n: u32, v: u64);
     fn oracle_bochs_get_seg_selector(n: u32) -> u64;
     fn oracle_bochs_set_seg_base(n: u32, v: u64);
@@ -199,6 +203,7 @@ impl BochsOracle {
             13 => FaultKind::GeneralProtection,
             14 => FaultKind::PageFault,
             17 => FaultKind::AlignmentCheck,
+            21 => FaultKind::ControlProtection,
             _ => FaultKind::OtherException,
         }
     }
@@ -311,7 +316,7 @@ impl X86Oracle for BochsOracle {
     fn get_msr(&self, msr: u32) -> u64 {
         match msr {
             IA32_EFER | IA32_STAR | IA32_LSTAR | IA32_FMASK | IA32_FS_BASE | IA32_GS_BASE
-            | IA32_KERNEL_GS_BASE => {
+            | IA32_KERNEL_GS_BASE | IA32_U_CET | IA32_S_CET => {
                 let _g = lock();
                 unsafe { oracle_bochs_get_msr(msr) }
             }
@@ -328,6 +333,26 @@ impl X86Oracle for BochsOracle {
     fn get_cr(&self, n: u32) -> u64 {
         let _g = lock();
         unsafe { oracle_bochs_get_cr(n) }
+    }
+
+    fn enable_shadow_stack(&mut self, base: u64, len: u64) -> Result<(), ShadowStackError> {
+        let _g = lock();
+        // 0 ok, 1 no CET in this build or CPU model, 2 range refused.
+        match unsafe { oracle_bochs_enable_shadow_stack(base, len) } {
+            0 => Ok(()),
+            2 => Err(ShadowStackError::BadRange),
+            _ => Err(ShadowStackError::Unsupported),
+        }
+    }
+
+    fn set_ssp(&mut self, value: u64) {
+        let _g = lock();
+        unsafe { oracle_bochs_set_ssp(value) }
+    }
+
+    fn get_ssp(&self) -> u64 {
+        let _g = lock();
+        unsafe { oracle_bochs_get_ssp() }
     }
 
     fn set_seg_selector(&mut self, n: u32, value: u16) {

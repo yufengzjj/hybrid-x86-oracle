@@ -278,6 +278,26 @@ macro_rules! suite_for {
             }
 
             #[test]
+            fn rewriting_code_at_an_executed_address_takes_effect() {
+                // `step_bytes` writes code at RIP and steps, so reusing one
+                // address for case after case is the normal idiom. A backend
+                // that caches decoded instructions by address must notice the
+                // host rewriting them, or every case after the first silently
+                // re-runs the first one's opcode while memory shows the new
+                // bytes.
+                if !usable() {
+                    return;
+                }
+                let mut c = cpu();
+                let at = c.get_rip();
+                assert!(c.step_bytes(&[0x48, 0xFF, 0xC0]).is_retired()); // inc rax
+                assert_eq!(c.get_gpr(RAX), 1);
+                c.set_rip(at);
+                assert!(c.step_bytes(&[0x48, 0xFF, 0xC8]).is_retired()); // dec rax
+                assert_eq!(c.get_gpr(RAX), 0, "the second encoding is what must have run");
+            }
+
+            #[test]
             fn byte_and_word_accesses() {
                 if !usable() {
                     return;

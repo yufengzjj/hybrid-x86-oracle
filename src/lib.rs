@@ -120,6 +120,10 @@ pub const IA32_FMASK: u32 = 0xC000_0084;
 pub const IA32_FS_BASE: u32 = 0xC000_0100;
 pub const IA32_GS_BASE: u32 = 0xC000_0101;
 pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// CET control, one per privilege domain: bit 0 SH_STK_EN, bit 1 WR_SHSTK_EN,
+/// bit 2 ENDBR_EN. [`X86Oracle::enable_shadow_stack`] sets both for you.
+pub const IA32_U_CET: u32 = 0x6A0;
+pub const IA32_S_CET: u32 = 0x6A2;
 
 /// RFLAGS bit masks.
 pub const FLAG_CF: u64 = 1 << 0;
@@ -174,6 +178,11 @@ pub enum FaultKind {
     GeneralProtection,
     /// #AC — alignment check.
     AlignmentCheck,
+    /// #CP — control protection: a CET shadow-stack or indirect-branch check
+    /// failed. Only reachable on a backend where
+    /// [`X86Oracle::enable_shadow_stack`] succeeded; everywhere else CET is off
+    /// and nothing raises it.
+    ControlProtection,
     /// Another architectural exception the backend could name but this enum
     /// does not model separately.
     OtherException,
@@ -239,6 +248,14 @@ impl StepOutcome {
 
 /// A comparable snapshot of the architectural state a diff harness normally
 /// checks. Deliberately excludes anything backend-specific.
+///
+/// "Normally" is doing work here: control and model-specific registers,
+/// segments, memory and the CET shadow-stack pointer are **not** in it, so
+/// [`restore`](X86Oracle::restore) leaves all of those alone. That is what makes
+/// it comparable — a backend that models no CET would otherwise report SSP 0
+/// against another backend's real one and diff as a mismatch on every case.
+/// Configure that state per backend and compare it explicitly if a case needs
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuState {
     /// ModRM order: RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8..R15.
@@ -317,6 +334,29 @@ impl Default for CpuState {
     }
 }
 
+/// Why [`X86Oracle::enable_shadow_stack`] said no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowStackError {
+    /// This backend does not model CET. Nothing about the request was wrong —
+    /// treat it like [`FaultKind::Unimplemented`] and skip the backend.
+    Unsupported,
+    /// The backend models CET but refused *this* range: outside the address
+    /// space it maps, empty, or sharing a page-table frame it needs for itself.
+    /// A caller bug, not a capability answer.
+    BadRange,
+}
+
+impl std::fmt::Display for ShadowStackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ShadowStackError::Unsupported => "backend does not model CET shadow stacks",
+            ShadowStackError::BadRange => "range rejected for a shadow stack",
+        })
+    }
+}
+
+impl std::error::Error for ShadowStackError {}
+
 // ---------------------------------------------------------------------- trait
 
 /// One independent golden-reference x86-64 CPU.
@@ -376,6 +416,51 @@ pub trait X86Oracle: Send + Sync {
     /// Control register by number: 0, 2, 3, 4, 8.
     fn set_cr(&mut self, n: u32, value: u64);
     fn get_cr(&self, n: u32) -> u64;
+
+    // -- CET shadow stacks
+
+    /// Enable CET shadow stacks and map `[base, base+len)` as shadow-stack
+    /// pages. **Opt-in for a reason**:
+    /// once enabled, every `CALL` pushes the return address to the shadow stack
+    /// and every `RET` pops and *compares* it, so a caller must also point
+    /// [`set_ssp`](Self::set_ssp) into the mapped region — a requirement the
+    /// plain reset state has no business imposing on tests that never touch CET.
+    ///
+    /// Page attributes are what make a shadow stack one, so the range is rounded
+    /// outward to whole pages of whatever size the backend's identity map uses
+    /// (2 MiB on Bochs): keep ordinary data out of the frames you convert.
+    /// Seeding still works there — the memory accessors reach physical memory
+    /// without walking the page tables — but an ordinary *guest* store into the
+    /// region now faults, which is exactly the protection being modelled.
+    ///
+    /// The two failures are worth telling apart, so they are separate variants
+    /// rather than one `false`: [`ShadowStackError::Unsupported`] is a property
+    /// of the backend and a diff harness should skip the case, while
+    /// [`ShadowStackError::BadRange`] is a property of the *arguments* and
+    /// almost always a bug in the caller.
+    ///
+    /// Enabling also captures the CET preconditions the backend cannot police
+    /// afterwards — CR0.WP in particular, which real hardware requires to be set
+    /// before CR4.CET can be. Clearing it later leaves a state no CPU would
+    /// accept; [`set_cr`](Self::set_cr) writes what you give it.
+    ///
+    /// Note that [`snapshot`](Self::snapshot) does **not** carry SSP (nor any
+    /// control register), so `restore` leaves the shadow-stack pointer wherever
+    /// it happens to be — set it explicitly, like the rest of the CET state.
+    fn enable_shadow_stack(&mut self, base: u64, len: u64) -> Result<(), ShadowStackError> {
+        let _ = (base, len);
+        Err(ShadowStackError::Unsupported)
+    }
+
+    /// The shadow stack pointer — a register in its own right, reachable by no
+    /// MOV, so neither a GPR index nor an MSR. Reads 0 and ignores writes on a
+    /// backend without CET.
+    fn set_ssp(&mut self, value: u64) {
+        let _ = value;
+    }
+    fn get_ssp(&self) -> u64 {
+        0
+    }
 
     // -- segmentation (`SEG_ES`..`SEG_GS`)
 
