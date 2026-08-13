@@ -857,6 +857,27 @@ uint64_t oracle_bochs_get_seg_limit(uint32_t n) {
     return bx_cpu.sregs[n % 6].cache.u.segment.limit_scaled;
 }
 
+/* GDTR (which == 0) / IDTR (which == 1). Register values only — the Rust side
+ * uses this to mirror the hardware backends' table addresses; no memory backs
+ * the tables here. That is safe NOT because delivery never reads the IDT — it
+ * does: bx_instr_exception only sets stop flags, and exception() then walks
+ * the IDT regardless — but because guest memory is sparse and reads as zeros,
+ * so every gate is non-present and delivery aborts (cascading into Bochs'
+ * "3rd exception with no resolution" bail-out) before committing any state;
+ * bx_instr_exception's guard keeps only the first vector. Do NOT mirror real
+ * tables into guest memory: a present gate would let delivery SUCCEED and
+ * vector through the IDT, breaking the faults-do-not-vector contract. */
+void oracle_bochs_set_dtr(uint32_t which, uint64_t base, uint64_t limit) {
+    bx_global_segment_reg_t *r = which ? &bx_cpu.idtr : &bx_cpu.gdtr;
+    r->base = (bx_address)base;
+    r->limit = (Bit16u)limit;
+}
+/* The selector alone — the hidden TSS base/limit stay at reset, since nothing
+ * here delivers through a TSS. STR reads only the selector. */
+void oracle_bochs_set_tr_selector(uint64_t v) {
+    bx_cpu.tr.selector.value = (Bit16u)v;
+}
+
 /* -- memory (linear addresses; identity-mapped, so linear == physical) ---- */
 
 uint8_t oracle_bochs_read_mem(uint64_t addr) {

@@ -39,13 +39,20 @@ pub const CTRL_BASE: u64 = RAM_SIZE - (4 << 20);
 pub const PML4_ADDR: u64 = CTRL_BASE;
 const PDPT_ADDR: u64 = CTRL_BASE + 0x1000;
 const PD_ADDR: u64 = CTRL_BASE + 0x2000;
-pub const GDT_ADDR: u64 = CTRL_BASE + 0x3000;
-/// Five 8-byte slots: null, code64, data, and the two halves of the TSS
-/// descriptor.
-pub const GDT_LIMIT: u16 = 39;
-pub const IDT_ADDR: u64 = CTRL_BASE + 0x4000;
-/// One 16-byte gate per vector: 256 * 16 == 4 KiB.
-pub const IDT_LIMIT: u16 = 0xFFF;
+// GDT/IDT addresses and the TSS selector are the crate-level descriptor-table
+// contract (Bochs mirrors the register values); this assert pins the contract's
+// literals to the layout actually built here, so neither can drift alone: the
+// addresses to the control-region slots, the GDT limit to its last slot (the
+// 16-byte TSS descriptor, written at offset SEL_TSS), and the IDT limit to its
+// 256 16-byte gates.
+pub use crate::{GDT_ADDR, GDT_LIMIT, IDT_ADDR, IDT_LIMIT, SEL_TSS};
+const _: () = assert!(
+    GDT_ADDR == CTRL_BASE + 0x3000
+        && IDT_ADDR == CTRL_BASE + 0x4000
+        && GDT_LIMIT as u64 == SEL_TSS as u64 + 16 - 1
+        && IDT_LIMIT as u64 == 256 * 16 - 1,
+    "the crate contract must match the control-region layout"
+);
 /// 256 fault stubs, one per vector, `STUB_STRIDE` bytes apart.
 const STUB_BASE: u64 = CTRL_BASE + 0x5000;
 const STUB_STRIDE: u64 = 16;
@@ -61,7 +68,6 @@ const IST_STACK_TOP: u64 = CTRL_BASE + 0x8000;
 
 pub const SEL_CODE64: u16 = 0x08;
 pub const SEL_DATA: u16 = 0x10;
-pub const SEL_TSS: u16 = 0x18;
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
@@ -224,8 +230,8 @@ pub fn build_control_structures(ram: &mut GuestRam) {
         | (((TSS_ADDR >> 16) & 0xFF) << 32)
         | (0x89 << 40) // present, type 9
         | (((TSS_ADDR >> 24) & 0xFF) << 56);
-    ram.write_u64(GDT_ADDR + 24, tss_low);
-    ram.write_u64(GDT_ADDR + 32, TSS_ADDR >> 32);
+    ram.write_u64(GDT_ADDR + SEL_TSS as u64, tss_low);
+    ram.write_u64(GDT_ADDR + SEL_TSS as u64 + 8, TSS_ADDR >> 32);
 
     // The TSS itself: everything zero except IST1.
     let mut tss = [0u8; 0x68];

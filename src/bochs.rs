@@ -16,9 +16,9 @@
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::{
-    FaultKind, ShadowStackError, StepOutcome, X86Oracle, ZMM_CHUNKS, ZMM_REGS, IA32_EFER,
-    IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LSTAR, IA32_STAR, IA32_S_CET,
-    IA32_U_CET, SEG_COUNT,
+    FaultKind, ShadowStackError, StepOutcome, X86Oracle, ZMM_CHUNKS, ZMM_REGS, GDT_ADDR, GDT_LIMIT,
+    IA32_EFER, IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LSTAR, IA32_STAR,
+    IA32_S_CET, IA32_U_CET, IDT_ADDR, IDT_LIMIT, SEG_COUNT, SEL_TSS,
 };
 
 extern "C" {
@@ -40,6 +40,8 @@ extern "C" {
     fn oracle_bochs_set_ssp(v: u64);
     fn oracle_bochs_get_ssp() -> u64;
     fn oracle_bochs_enable_shadow_stack(base: u64, len: u64) -> i32;
+    fn oracle_bochs_set_dtr(which: u32, base: u64, limit: u64);
+    fn oracle_bochs_set_tr_selector(v: u64);
     fn oracle_bochs_set_seg_selector(n: u32, v: u64);
     fn oracle_bochs_get_seg_selector(n: u32) -> u64;
     fn oracle_bochs_set_seg_base(n: u32, v: u64);
@@ -174,6 +176,20 @@ impl BochsOracle {
             MODE_LONG_64,
             "Bochs did not enter 64-bit long mode"
         );
+        // Align the descriptor-table REGISTER values to the crate contract, so
+        // SGDT/SIDT/STR read the same as on the hardware backends. Values only:
+        // no memory backs the tables. Faulting still behaves exactly as with
+        // the reset-value IDTR — a fault's delivery does walk the IDT (the
+        // instrumentation stop is only a flag), but sparse guest memory reads
+        // as zeros, so every gate is non-present and delivery aborts before
+        // committing state (see oracle_bochs_set_dtr in the shim, which also
+        // explains why real tables must never be mirrored into Bochs memory).
+        // LDTR is already the null selector from reset.
+        unsafe {
+            oracle_bochs_set_dtr(0, GDT_ADDR, GDT_LIMIT as u64);
+            oracle_bochs_set_dtr(1, IDT_ADDR, IDT_LIMIT as u64);
+            oracle_bochs_set_tr_selector(SEL_TSS as u64);
+        }
         Some(BochsOracle { h, last_fault: None })
     }
 

@@ -83,6 +83,27 @@ pub use whp::WhpOracle;
 mod any;
 pub use any::{AnyOracle, Backend};
 
+// ------------------------------------------------- descriptor-table contract
+
+/// Every backend that carries descriptor-table *register* state reports these
+/// values, so `SGDT`/`SIDT`/`STR` read the same everywhere (and `SLDT` reads
+/// the null selector). On the hardware backends the tables really exist at
+/// these addresses — they live in the control region and interrupt delivery
+/// walks them. Bochs aligns only the register VALUES: its sparse guest memory
+/// reads as zeros, so a fault's (deliberately unbacked) delivery finds only
+/// non-present gates and aborts before committing state — the memory behind
+/// the tables need not exist there. The Sail model has no descriptor-table
+/// instructions at all and reports `Unimplemented` instead.
+pub const GDT_ADDR: u64 = 0xFC0_3000;
+/// Five 8-byte slots: null, code64, data, and the two halves of the 16-byte
+/// TSS descriptor.
+pub const GDT_LIMIT: u16 = 39;
+pub const IDT_ADDR: u64 = 0xFC0_4000;
+/// One 16-byte gate per vector: 256 * 16 - 1.
+pub const IDT_LIMIT: u16 = 0xFFF;
+/// The TR selector: the TSS descriptor's GDT slot.
+pub const SEL_TSS: u16 = 0x18;
+
 // ------------------------------------------------------------------ registers
 
 /// GPR indices (x86 ModRM / ACL2 x86isa encoding).
