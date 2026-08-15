@@ -197,7 +197,39 @@ single call site in each function. Regression cases are the `cmpsb`/`cmps
 qword`/`cmpxchg` entries in `tests/differential.rs`, all with **unequal**
 operands — an equal-operand comparison cannot distinguish `a - b` from `b - a`.
 
-## 4d. CET shadow stacks are opt-in
+## 4d. `MOVD`/`MOVQ` to an XMM register merged instead of zero-extending — patched
+
+`x86-movd/movq-to-xmm` (66 0F 6E, all operand shapes) wrote only
+`operand_size` (4 or 8) bytes of the destination XMM register, leaving the
+rest as it was. The SDM is explicit that the destination is **zero-extended**
+across the full register, and Bochs and real hardware both do so. On a
+reset-zero register the two behaviours coincide, which is why the suite never
+noticed before it started seeding dirty vector registers.
+
+Fixed by `scripts/fix_cpp_model.py` (fix 8): the value passed to the register
+write is already the zero-extended unsigned source, so the write size becomes
+the full 16 bytes. Regression cases are the `movd`/`movq ... (zero-ext)`
+entries in `tests/differential.rs`, each with a dirtied destination.
+
+## 4e. `MOVDDUP`/`MOVSLDUP` executed as `MOVLPS` — patched
+
+x86isa implements neither MOVDDUP (F2 0F 12) nor MOVSLDUP (F3 0F 12), but its
+two-byte dispatch routed **all four** mandatory prefixes of 0F 12 to
+`x86-movlps/movlpd`. The F2/F3 forms therefore executed silently with
+MOVLPS/MOVLPD semantics — a 64-bit load into the low half — leaving the high
+half stale where the real instructions duplicate lanes. The neighbouring
+unimplemented prefix arms (F3 0F 16 MOVSHDUP, F3 0F 7E MOVQ) already raise the
+model's "Opcode Unimplemented in x86isa!" error, which the shim classifies as
+`FaultKind::Unimplemented` — a skippable coverage gap rather than a wrong
+answer.
+
+Fixed by `scripts/fix_cpp_model.py` (fix 9): the F3 and F2 dispatch arms of
+0F 12 now raise that same error. Regression cases are the `movsldup`/`movddup`
+entries in `tests/differential.rs` (sail skips them; backends that implement
+the instructions are diffed on the real semantics) plus the `movlps`/`movlpd`
+entries pinning that the legitimate arms kept their meaning.
+
+## 4f. CET shadow stacks are opt-in
 
 Only Bochs models CET, and even there the reset state leaves it **off**:
 `X86Oracle::enable_shadow_stack(base, len)` answers

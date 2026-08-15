@@ -28,6 +28,9 @@ struct Case {
     rflags: u64,
     /// Bytes seeded at `DATA`.
     data: &'static [u8],
+    /// (xmm index, [low, high] qwords) seeded before the step. A dirty
+    /// destination is what makes merge-vs-zero-extend bugs discriminating.
+    zmm: &'static [(u32, [u64; 2])],
     /// RFLAGS bits this instruction leaves **architecturally undefined**, so
     /// two correct implementations may differ there. Comparing them would
     /// report noise, not bugs.
@@ -36,7 +39,7 @@ struct Case {
 
 impl Case {
     const fn new(name: &'static str, code: &'static [u8]) -> Self {
-        Case { name, code, gprs: &[], rflags: 0x2, data: &[], undef_flags: 0 }
+        Case { name, code, gprs: &[], rflags: 0x2, data: &[], zmm: &[], undef_flags: 0 }
     }
     const fn gprs(mut self, gprs: &'static [(u32, u64)]) -> Self {
         self.gprs = gprs;
@@ -48,6 +51,10 @@ impl Case {
     }
     const fn data(mut self, d: &'static [u8]) -> Self {
         self.data = d;
+        self
+    }
+    const fn zmm(mut self, z: &'static [(u32, [u64; 2])]) -> Self {
+        self.zmm = z;
         self
     }
     const fn undef(mut self, flags: u64) -> Self {
@@ -66,6 +73,11 @@ fn run(mut cpu: AnyOracle, case: &Case) -> (StepOutcome, CpuState, Vec<u8>) {
     }
     if !case.data.is_empty() {
         cpu.write_mem(DATA, case.data);
+    }
+    for &(n, lo) in case.zmm {
+        let mut chunks = [0u64; ZMM_CHUNKS];
+        chunks[..2].copy_from_slice(&lo);
+        cpu.set_zmm(n, &chunks);
     }
     let outcome = cpu.step_bytes(case.code);
     let state = cpu.snapshot();
@@ -337,6 +349,44 @@ static BRANCH: &[Case] = &[
     Case::new("loop rel8", &[0xE2, 0x02]).gprs(&[(RCX, 3)]),
 ];
 
+/// SSE data movement — two model errors lived here, both patched in the
+/// vendored model (`docs/backend-differences.md` §4d, §4e): MOVD/MOVQ to an
+/// XMM register merged instead of zero-extending, and F3/F2 0F 12
+/// (MOVSLDUP/MOVDDUP, which x86isa does not implement) executed as
+/// MOVLPS/MOVLPD instead of reporting the opcode unimplemented. Every case
+/// dirties the destination register first — on a reset-zero register the
+/// merge and the zero-extension produce identical results.
+static SSE_MOVE: &[Case] = &[
+    Case::new("movd xmm1,ebx (zero-ext)", &[0x66, 0x0F, 0x6E, 0xCB])
+        .gprs(&[(RBX, 0x1122_3344)])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB])]),
+    Case::new("movq xmm1,rbx (zero-ext)", &[0x66, 0x48, 0x0F, 0x6E, 0xCB])
+        .gprs(&[(RBX, 0x1122_3344_5566_7788)])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB])]),
+    Case::new("movd xmm1,[rbx] (zero-ext)", &[0x66, 0x0F, 0x6E, 0x0B])
+        .gprs(&[(RBX, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB])]),
+    // The legitimate 0F 12 arms keep their semantics: a 64-bit load into the
+    // low half, high half preserved.
+    Case::new("movlps xmm1,[rbx]", &[0x0F, 0x12, 0x0B])
+        .gprs(&[(RBX, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB])]),
+    Case::new("movlpd xmm1,[rbx]", &[0x66, 0x0F, 0x12, 0x0B])
+        .gprs(&[(RBX, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB])]),
+    // The F3/F2 arms are MOVSLDUP/MOVDDUP. A backend that implements them is
+    // diffed on the real semantics; the sail model must report Unimplemented
+    // (and so skip) rather than silently run MOVLPS, which these dirty
+    // destinations would expose as a stale high half.
+    Case::new("movsldup xmm1,xmm2", &[0xF3, 0x0F, 0x12, 0xCA])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB]), (2, [0x8877_6655_4433_2211, 0x99AA_BBCC_DDEE_FF00])]),
+    Case::new("movddup xmm1,xmm2", &[0xF2, 0x0F, 0x12, 0xCA])
+        .zmm(&[(1, [0xAAAA_AAAA_AAAA_AAAA, 0xBBBB_BBBB_BBBB_BBBB]), (2, [0x8877_6655_4433_2211, 0x99AA_BBCC_DDEE_FF00])]),
+];
+
 /// Run one group of cases across every available pair of backends.
 fn run_group(label: &str, cases: &[Case]) {
     let pairs = Backend::pairs();
@@ -388,6 +438,11 @@ fn branches_agree_across_backends() {
 #[test]
 fn string_ops_agree_across_backends() {
     run_group("string", STRING);
+}
+
+#[test]
+fn sse_moves_agree_across_backends() {
+    run_group("sse-move", SSE_MOVE);
 }
 
 /// The backends must agree on the *starting* state too, or every later

@@ -27,7 +27,7 @@ enabled cargo features ask for.
   independent oracles per process.
 
   **Not a byte-for-byte Sail artifact.** Four of that script's fixes work
-  around `--cpp` backend defects; fixes 5-7 change *semantics*, correcting
+  around `--cpp` backend defects; fixes 5-9 change *semantics*, correcting
   errors in the ACL2→Sail translation that the differential suite found:
 
   - **5** — `ror_spec_N` took CF from the result's LSB for rotate counts > 1,
@@ -38,11 +38,17 @@ enabled cargo features ask for.
   - **7** — `REP`-prefixed string ops never terminated: `x86_stos` read the
     segment prefix instead of the rep prefix, the `rCX == 0` entry test was
     missing, and the `0xF3` arm advanced RIP exactly when it should not (§4).
+  - **8** — `x86_movd_movq_to_xmm` merged the destination register where the
+    SDM zero-extends it (§4d).
+  - **9** — the F3/F2 arms of 0F 12 (MOVSLDUP/MOVDDUP, unimplemented in
+    x86isa) executed as MOVLPS/MOVLPD instead of reporting the opcode
+    unimplemented (§4e).
 
   Each patched site carries an `oracle-fix-N` comment, so
-  `gzip -dc model.cpp.gz | grep -c oracle-fix` counts them (12: 2 for fix 6, 10
-  for fix 7), and fix 5 shows up as `grep -n 'zresult >> INT64_C(63)'` inside
-  `zror_spec_64`. Everything else is as generated.
+  `gzip -dc model.cpp.gz | grep -c oracle-fix` counts them (15: 2 for fix 6, 10
+  for fix 7, 1 for fix 8, 2 for fix 9), and fix 5 shows up as
+  `grep -n 'zresult >> INT64_C(63)'` inside `zror_spec_64`. Everything else is
+  as generated.
 
   License: BSD-3-Clause (Sail translation,
   Patrick Taylor / Thomas Bauereiss) AND BSD-3-Clause (original ACL2 X86isa
