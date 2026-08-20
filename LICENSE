@@ -5,6 +5,10 @@ This project's OWN source code — everything authored in this repository:
 `src/`, `csrc/`, `sail/`, `build.rs`, `scripts/`, the test suite, and the
 documentation — is licensed under the BSD 3-Clause License (below).
 
+`patches/` is the one exception: those files modify third-party sources, so
+each inherits the license of what it patches (today: `patches/bochs/*.patch`
+is LGPL-2.1-or-later, being a modification of Bochs).
+
 It also BUNDLES and statically links several third-party components under their
 own licenses; see "Third-party components" at the end. Two of them are copyleft:
 the bundled GMP arithmetic (mini-gmp, LGPL/GPL) in every build, and the Bochs
@@ -13,11 +17,25 @@ BINARY of this crate is therefore a combined work subject to those terms as
 well. The accurate combined SPDX expression is:
 
     BSD-3-Clause AND BSD-2-Clause AND MIT
+      AND Apache-2.0
       AND LGPL-2.1-or-later
       AND (LGPL-3.0-or-later OR GPL-2.0-or-later)
 
-The LGPL-2.1-or-later term covers Bochs, which only a `--features bochs` build
-links; a default build carries the rest.
+Which terms a given build actually carries:
+
+  * a default build carries BSD-3-Clause, BSD-2-Clause, MIT and the mini-gmp
+    (LGPL-3.0-or-later OR GPL-2.0-or-later) term;
+  * `--features bochs` adds LGPL-2.1-or-later;
+  * `--features kvm` adds Apache-2.0. Rust dependencies are statically linked
+    like anything else, and while kvm-ioctls, libc and windows-sys are all
+    "Apache-2.0 OR MIT" — electing MIT keeps them inside the MIT term above —
+    kvm-bindings is Apache-2.0 only, so that term is unavoidable in a KVM build.
+    `--features whp` adds nothing beyond MIT.
+
+Those terms coexist because the copyleft ones can be taken at version 3:
+Apache-2.0 is incompatible with GPL-2.0-only, but Bochs is LGPL-2.1-OR-LATER
+and mini-gmp offers LGPL-3.0-or-later, so a build that mixes Apache-2.0 with
+either must exercise that "or later" option.
 
 -------------------------------------------------------------------------------
 
@@ -55,10 +73,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Third-party components
 ===============================================================================
 
-The `kvm` and `whp` cargo features add only ordinary Rust dependencies
-(kvm-ioctls, kvm-bindings, libc on Linux — Apache-2.0/MIT; windows-sys on
-Windows — MIT OR Apache-2.0) and talk to the host kernel or hypervisor; they
-bundle nothing.
+The `kvm` and `whp` cargo features add only ordinary Rust dependencies and
+talk to the host kernel or hypervisor; they vendor nothing into this repository
+(though cargo does link them into the binary like any other dependency):
+
+    kvm-ioctls    Apache-2.0 OR MIT     Linux
+    kvm-bindings  Apache-2.0            Linux   <- no MIT option; see above
+    libc          MIT OR Apache-2.0     Linux
+    windows-sys   MIT OR Apache-2.0     Windows
 
 Vendored in vendor/ (see vendor/README.md for provenance):
 
@@ -69,12 +91,13 @@ Vendored in vendor/ (see vendor/README.md for provenance):
     native archive and statically linked. Upstream files, except for the bug
     fixes in patches/bochs/, which scripts/vendor-bochs.sh applies on top. Those
     patches are the record of what was changed and why — they are kept as
-    separate files, rather than as edits with in-line notes, so the modification
-    stays visible and reversible; vendor/bochs/PROVENANCE names the ones applied,
-    alongside the exact revision and ./configure flags, and
+    separate files, rather than as edits with in-line notes, so the
+    modification stays visible and reversible; vendor/bochs/PROVENANCE names
+    the ones applied, alongside the exact revision and ./configure flags, and
     scripts/vendor-bochs.sh reproduces the whole tree. `BOCHS_DIR` builds a
     different source root instead.
-    License: LGPL-2.1-or-later. Copyright (c) the Bochs Project. Full texts in
+    License: LGPL-2.1-or-later, which the patches in patches/bochs/ inherit as
+    modifications of these files. Copyright (c) the Bochs Project. Full texts in
     vendor/bochs/COPYING and vendor/bochs/LICENSE.
     >> Linking these makes a distributed binary a combined work under the LGPL:
     >> provide the Bochs source — it is vendored here — and allow relinking.
@@ -101,10 +124,12 @@ Vendored in vendor/ (see vendor/README.md for provenance):
 * vendor/sail/runtime/mini-gmp.{c,h}, mini-mpq.{c,h}
     From GMP 6.3.0. License: dual LGPL-3.0-or-later OR GPL-2.0-or-later.
     Copyright (c) the Free Software Foundation, Inc.
-    >> This is the only copyleft component. It is bundled and statically
-    >> linked by default, so redistributing a built binary triggers the
-    >> LGPL's obligations (provide the GMP source — included here — and allow
-    >> relinking). Building with SAIL_SYSTEM_GMP links the system libgmp
-    >> instead, which is LGPL all the same. Full GMP license texts:
+    >> This is the only copyleft component in a DEFAULT build (a
+    >> `--features bochs` build also links Bochs, LGPL-2.1-or-later — see
+    >> above). It is bundled and statically linked by default, so
+    >> redistributing a built binary triggers the LGPL's obligations
+    >> (provide the GMP source — included here — and allow relinking).
+    >> Building with SAIL_SYSTEM_GMP links the system libgmp instead, which
+    >> is LGPL all the same. Full GMP license texts:
     >> https://www.gnu.org/licenses/lgpl-3.0.html and
     >> https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
