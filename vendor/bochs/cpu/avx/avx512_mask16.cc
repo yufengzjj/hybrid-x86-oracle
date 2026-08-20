@@ -157,8 +157,6 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::KSHIFTLW_KGwKEwIbR(bxInstruction_c *i)
 #if BX_SUPPORT_EVEX
   unsigned count = i->Ib();
   Bit16u opmask = 0;
-  /* upstream has `count < 15`, wrongly zeroing at the SDM-valid count 15
-   * (IF COUNT <= 15); the 8/32/64-bit siblings all use `count < width` */
   if (count < 16)
     opmask = BX_READ_16BIT_OPMASK(i->src()) << count;
 
@@ -173,8 +171,6 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::KSHIFTRW_KGwKEwIbR(bxInstruction_c *i)
 #if BX_SUPPORT_EVEX
   unsigned count = i->Ib();
   Bit16u opmask = 0;
-  /* upstream has `count < 15`, wrongly zeroing at the SDM-valid count 15
-   * (IF COUNT <= 15); the 8/32/64-bit siblings all use `count < width` */
   if (count < 16)
     opmask = BX_READ_16BIT_OPMASK(i->src()) >> count;
 

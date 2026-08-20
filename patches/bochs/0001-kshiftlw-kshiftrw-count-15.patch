@@ -1,0 +1,38 @@
+KSHIFTLW/KSHIFTRW: shift is valid at count 15, not only below it
+
+The SDM's pseudocode for the 16-bit opmask shifts is
+
+    IF COUNT <= 15 THEN DEST[15:0] := SRC << COUNT ELSE DEST := 0
+
+but Bochs guards them with `count < 15`, so `kshiftlw k1, k0, 15` — the
+idiomatic "isolate the top mask bit" — yields 0 instead of 0x8000. A pure
+typo: the 8/32/64-bit siblings in avx512_mask8/32/64.cc all use
+`count < width`.
+
+Found by this crate's differential suite; see docs/backend-differences.md
+§4g. Still present on upstream master as of 2026-08-19 (d5c0ad9), unlike the
+VPCONFLICT bug the same campaign found, which upstream fixed on 2026-06-09.
+
+The hunks below are deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/avx/avx512_mask16.cc
++++ b/cpu/avx/avx512_mask16.cc
+@@ -157,7 +157,7 @@
+ #if BX_SUPPORT_EVEX
+   unsigned count = i->Ib();
+   Bit16u opmask = 0;
+-  if (count < 15)
++  if (count < 16)
+     opmask = BX_READ_16BIT_OPMASK(i->src()) << count;
+ 
+   BX_WRITE_OPMASK(i->dst(), opmask);
+@@ -171,7 +171,7 @@
+ #if BX_SUPPORT_EVEX
+   unsigned count = i->Ib();
+   Bit16u opmask = 0;
+-  if (count < 15)
++  if (count < 16)
+     opmask = BX_READ_16BIT_OPMASK(i->src()) >> count;
+ 
+   BX_WRITE_OPMASK(i->dst(), opmask);
