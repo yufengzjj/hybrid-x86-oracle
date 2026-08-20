@@ -285,6 +285,14 @@ void bx_instr_vmexit(unsigned, Bit32u, Bit64u) {}
 BOCHSAPI bx_devices_c bx_devices;
 BOCHSAPI bx_virt_timer_c bx_virt_timer;
 BOCHSAPI bx_hdimage_ctl_c bx_hdimage_ctl;
+/* No window, so no GUI object. Every use of this in the code we actually link
+ * is guarded (pc_system.cc:219 checks it) EXCEPT bx_real_sim_c::
+ * update_runtime_options() (gui/siminterface.cc), which dereferences it
+ * unconditionally. Nothing calls that today — it is a `SIM->` virtual that only
+ * the config UI drives — so this stays null rather than growing a stub: bx_gui_c
+ * is abstract with 16 pure virtuals, and faking a whole GUI to satisfy one dead
+ * call is worse than the null. If you ever add a `SIM->update_runtime_options()`
+ * call, that changes. */
 BOCHSAPI bx_gui_c *bx_gui = nullptr;
 /* Zero-initialized: every debug/trace flag off, which is what
  * main.cc's bx_init_bx_dbg() amounts to for a CPU-only embedding. */
@@ -295,7 +303,57 @@ BOCHSAPI logfunctions *pluginlog = nullptr;
 /* Bochs' main.cc sets this; the local APIC reads it to pick xAPIC vs legacy. */
 bool simulate_xapic = true;
 
-bx_devices_c::bx_devices_c() = default;
+/* The real constructor (iodev/devices.cc, not linked here) calls init_stubs(),
+ * pointing every plugin pointer at the embedded stub instance of the same name.
+ * A defaulted constructor left them all NULL, and the CPU dereferences one of
+ * them without ever going near a device: every x87 state-management instruction
+ * updates FERR# through DEV_extfpuirq_set_fpu_error (cpu/fpu/ferr.cc), i.e.
+ * `bx_devices.pluginExtFpuIRQ->set_fpu_error()`. FNCLEX and FNSTENV do it
+ * unconditionally; FLDCW, FLDENV, FRSTOR, FXRSTOR and XRSTOR do it on BOTH
+ * branches of their "any unmasked exception?" test. A two-byte FNCLEX was
+ * enough to segfault the process.
+ *
+ * That was true of every Bochs revision this crate has vendored, not something
+ * a version bump introduced — it stayed hidden only because no case executed
+ * x87 until now. tests/bochs_embedding.rs is the pin.
+ *
+ * So mirror init_stubs() exactly, guards included: the FERR# stub's
+ * set_fpu_error is a genuine no-op (right for a CPU-only embedding), and the
+ * other stubs panic through pluginlog rather than fault, which is the visible
+ * failure an unreachable device path should have. A plugin pointer added
+ * upstream would land here as a null dereference rather than a compile error,
+ * so tests/bochs_embedding.rs checks this list against the vendored iodev.h. */
+bx_devices_c::bx_devices_c()
+{
+  /* The real ctor's other work is redundant here: bx_devices is a global, so
+   * the handler lists, irq_handler_name[] and sound_device_count it clears are
+   * already zero. The log prefix is not — without this, anything this object
+   * logs comes out as "[?  ]". */
+  put("devices", "DEV");
+
+  pluginCmosDevice = &stubCmos;
+  pluginDmaDevice = &stubDma;
+  pluginHardDrive = &stubHardDrive;
+  pluginPicDevice = &stubPic;
+  pluginPitDevice = &stubPit;
+  pluginSpeaker = &stubSpeaker;
+  pluginVgaDevice = &stubVga;
+#if BX_SUPPORT_IODEBUG
+  pluginIODebug = &stubIODebug;
+#endif
+#if BX_SUPPORT_APIC
+  pluginIOAPIC = &stubIOAPIC;
+#endif
+#if BX_SUPPORT_GAMEPORT
+  pluginGameport = &stubGameport;
+#endif
+#if BX_SUPPORT_PCI
+  pluginPci2IsaBridge = &stubPci2Isa;
+  pluginPciIdeController = &stubPciIde;
+  pluginACPIController = &stubACPIController;
+#endif
+  pluginExtFpuIRQ = &stubExtFpuIRQ;
+}
 bx_devices_c::~bx_devices_c() = default;
 void bx_devices_c::init(BX_MEM_C *) {}
 void bx_devices_c::exit(void) {}
@@ -412,7 +470,10 @@ void build_param_tree() {
                        4000000);
     new bx_param_num_c(cpu, "quantum", "SMP quantum", "", 1, 32, 16);
     /* An oracle must not restart itself: a triple fault is a result to report,
-     * not a reason to reset the machine. */
+     * not a reason to reset the machine. Incidentally this is also what keeps
+     * DEV_cmos_get_reg off the triple-fault path (exception.cc reads the CMOS
+     * shutdown status only in the resetting branch); turn it on and that read
+     * reaches the CMOS stub, which panics rather than answering. */
     new bx_param_bool_c(cpu, "reset_on_triple_fault", "Reset on triple fault", "", 0);
     /* Unknown MSRs read as zero rather than #GP, matching the trait contract
      * that unmodelled MSRs are simply inert. */
