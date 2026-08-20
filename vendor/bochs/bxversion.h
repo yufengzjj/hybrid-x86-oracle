@@ -6,4 +6,4 @@
 #define VERSION       "3.0.devel"
 #define VER_DEVFLAG   1
 #define REL_STRING    "Built from GitHub snapshot after release 3.0"
-#define REL_TIMESTAMP "Sun Feb 16 10:00:00 CET 2025"
+#define REL_TIMESTAMP "Wed Jul 08 10:50:00 CET 2025"

@@ -52,7 +52,7 @@
 // adds support for the GNU readline library in the debugger command
 // prompt.
 #define HAVE_LIBREADLINE 0
-#define HAVE_READLINE_HISTORY_H 0
+#define HAVE_READLINE_HISTORY_H 1
 
 // Define to 1 if you have <locale.h>
 #define HAVE_LOCALE_H 0
@@ -210,6 +210,7 @@
 #define BX_USE_EFI_SMF      1  // External FPU IRQ
 #define BX_USE_GAMEPORT_SMF 1  // Gameport
 #define BX_USE_CIRRUS_SMF   1  // SVGA Cirrus
+#define BX_USE_GEFORCE_SMF  1  // GeForce
 #define BX_USE_BUSM_SMF     1  // Bus Mouse
 #define BX_USE_ACPI_SMF     1  // ACPI
 
@@ -227,7 +228,7 @@
    || !BX_USE_USB_OHCI_SMF || !BX_USE_USB_EHCI_SMF || !BX_USE_USB_XHCI_SMF \
    || !BX_USE_PCIPNIC_SMF || !BX_USE_PIDE_SMF || !BX_USE_ACPI_SMF \
    || !BX_USE_EFI_SMF || !BX_USE_GAMEPORT_SMF || !BX_USE_PCIDEV_SMF \
-   || !BX_USE_CIRRUS_SMF)
+   || !BX_USE_CIRRUS_SMF || !BX_USE_GEFORCE_SMF)
 #error You must use SMF to have plugins
 #endif
 
@@ -625,6 +626,7 @@ typedef Bit32u bx_phy_address;
 #define BX_SUPPORT_PKEYS 0
 #define BX_SUPPORT_CET 1
 #define BX_SUPPORT_UINTR 0
+#define BX_SUPPORT_FRED 0
 #define BX_SUPPORT_MONITOR_MWAIT 1
 #define BX_SUPPORT_PERFMON 1
 #define BX_SUPPORT_MEMTYPE 0
@@ -636,6 +638,10 @@ typedef Bit32u bx_phy_address;
 
 #if BX_SUPPORT_UINTR && BX_SUPPORT_X86_64 == 0
   #error "UINTR require x86-64 support"
+#endif
+
+#if BX_SUPPORT_FRED && BX_SUPPORT_X86_64 == 0
+  #error "FRED require x86-64 support"
 #endif
 
 #if BX_SUPPORT_SVM && BX_SUPPORT_X86_64 == 0
@@ -796,6 +802,9 @@ typedef Bit32u bx_phy_address;
 // CLGD54XX emulation
 #define BX_SUPPORT_CLGD54XX 0
 
+// GeForce emulation
+#define BX_SUPPORT_GEFORCE 0
+
 // 3dfx Voodoo (SST-1/2) and Banshee / Voodoo3 emulation
 #define BX_SUPPORT_VOODOO 0
 
@@ -824,6 +833,7 @@ typedef Bit32u bx_phy_address;
 #define BX_SUPPORT_CDROM 1
 
 #if BX_SUPPORT_CDROM
+#  define LOWLEVEL_CDAUDIO 0
    // This is the C++ class name to use if we are supporting
    // low-level CDROM.
 #  define LOWLEVEL_CDROM cdrom_misc_c

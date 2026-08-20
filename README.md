@@ -120,7 +120,7 @@ cargo test                  # sail backend only
 cargo test --features bochs # + the Bochs CPU, compiled from vendor/bochs/
 ```
 
-The first Bochs build compiles ~670 files and takes about a minute; after that
+The first Bochs build compiles ~630 files and takes about a minute; after that
 cargo caches it. `BOCHS_DIR` overrides the source root if you want to track a
 different Bochs revision, and `scripts/vendor-bochs.sh` refreshes
 `vendor/bochs/` from a pinned upstream commit.
@@ -247,8 +247,13 @@ wrapper that serializes calls.
 - **Sail**: `sail --cpp` turns the model into `class model::Model` whose
   architectural state is instance members, which is what allows many
   independent oracles; regeneration steps are below.
-- **Bochs**: `vendor/bochs/` holds the upstream CPU sources (unpatched, pinned
-  revision — see `vendor/bochs/PROVENANCE`), which `build.rs` compiles directly.
+- **Bochs**: `vendor/bochs/` holds the upstream CPU sources at a pinned
+  revision, plus the fixes in `patches/bochs/` that `scripts/vendor-bochs.sh`
+  applies on top — upstream bugs this crate's differential suite found and
+  upstream has not taken yet (see `vendor/bochs/PROVENANCE` and
+  `docs/backend-differences.md` §4g). Patching there rather than by hand is what
+  keeps a re-vendor from silently reverting them; `tests/bochs_patches.rs` fails
+  if one stops taking effect. `build.rs` compiles the tree directly.
   `csrc/bochs_shim.cpp` supplies the pieces of the emulator the CPU
   core expects — the CPU/memory singletons, a sparse page-map memory, the
   instrumentation callbacks that make a step stop after one instruction, an

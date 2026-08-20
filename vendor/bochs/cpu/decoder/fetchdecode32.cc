@@ -2,7 +2,7 @@
 // $Id$
 /////////////////////////////////////////////////////////////////////////
 //
-//  Copyright (C) 2001-2024  The Bochs Project
+//  Copyright (C) 2001-2026  The Bochs Project
 //
 //  This library is free software; you can redistribute it and/or
 //  modify it under the terms of the GNU Lesser General Public
@@ -714,7 +714,7 @@ static unsigned sreg_mod1or2_base32[8] = {
 extern int fetchImmediate(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, Bit16u ia_opcode, bool is_64);
 extern Bit16u findOpcode(const Bit64u *opMap, Bit32u opMsk);
 
-static const Bit8u *decodeModrm32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsigned mod, unsigned nnn, unsigned rm)
+static const Bit8u *decodeModrm32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsigned mod, unsigned rm)
 {
   unsigned seg = BX_SEG_REG_DS;
 
@@ -879,7 +879,7 @@ static const Bit8u *parseModrm32(const Bit8u *iptr, unsigned &remain, bxInstruct
     i->assertModC0();
   }
   else {
-    iptr = decodeModrm32(iptr, remain, i, modrm->mod, modrm->nnn, modrm->rm);
+    iptr = decodeModrm32(iptr, remain, i, modrm->mod, modrm->rm);
   }
 
   return iptr;
@@ -1221,7 +1221,7 @@ BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, unsigned nnn, 
 }
 
 #if BX_SUPPORT_AVX
-BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, unsigned nnn, unsigned rm, unsigned vvv, unsigned vex_w, bool had_evex = false, bool displ8 = false)
+BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, unsigned nnn, unsigned rm, unsigned vvv, unsigned vex_w, Bit32u had_evex = 0, bool displ8 = false)
 {
   bool use_vvv = false;
 #if BX_SUPPORT_EVEX
@@ -1319,7 +1319,7 @@ BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, un
     case BX_SRC_VIB:
       if (is_64) {
 #if BX_SUPPORT_EVEX
-        if (had_evex)
+        if (had_evex != 0)
           i->setSrcReg(n, ((i->Ib() << 1) & 0x10) | (i->Ib() >> 4));
         else
 #endif
@@ -1347,7 +1347,7 @@ BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, un
     }
 
 #if BX_SUPPORT_EVEX
-    if (had_evex && displ8 && mem_src) {
+    if (had_evex != 0 && displ8 && mem_src) {
       displ8_scale = evex_displ8_compression(i, ia_opcode, src, type, vex_w);
     }
 #endif
@@ -1510,7 +1510,7 @@ int decoder_evex32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   //    7 6 5 4 3 2 1 0
   //    ---------------
   // P0 R X B R'0 m m m
-  // P1 w v v v v u p p ; evex.u was always '1 before avx10.2
+  // P1 w v v v v u p p
   // P2 z L'L b V'a a a
 
   // EVEX.mmmm - opcode group
@@ -1523,11 +1523,14 @@ int decoder_evex32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   // EVEX.W    - opsize promotion / opcode extension
   // EVEX.z    - zero masking / merging
   // EVEX.b    - broadcast / round control / SAE
-  // EVEX.u    - round control / SAE for 256-bit (AVX10.2)
   // EVEX.LL   - vector length control
 
   // check for reserved EVEX bits
   if ((evex & 0x08) != 0)
+    return(ia_opcode);
+
+  // EVEX.U must be '1
+  if ((evex & 0x400) == 0)
     return(ia_opcode);
 
   unsigned evex_opc_map = evex & 0x7;
@@ -1554,9 +1557,6 @@ int decoder_evex32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   i->setVL(1 << evex_vl_rc);
   i->setVexW(vex_w);
 
-  unsigned evex_u = (evex >> 10) & 0x1;
-  i->setEvexU(evex_u);
-
   unsigned evex_z = (evex >> 23) & 0x1;
   i->setZeroMasking(evex_z);
 
@@ -1576,9 +1576,6 @@ int decoder_evex32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   if (modrm.mod == 0xc0) {
     // EVEX.b in reg form implies 512-bit vector length
     if (i->getEvexb()) i->setVL(BX_VL512);
-
-    // EVEX.u=0 in reg form implies 256-bit vector length
-    if (!i->getEvexU()) i->setVL(BX_VL256);
   }
 
   Bit32u vl = i->getVL()-1; // 0: VL128, 1: VL256, 3: VL512
@@ -1608,7 +1605,10 @@ int decoder_evex32(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
     }
   }
 
-  BxDecodeError decode_err = assign_srcs(i, ia_opcode, false, modrm.nnn, modrm.rm, vvv, vex_w, true, displ8);
+  // evex cannot be zero because opcode map 0 is not populated
+  BX_ASSERT(evex != 0);
+
+  BxDecodeError decode_err = assign_srcs(i, ia_opcode, false, modrm.nnn, modrm.rm, vvv, vex_w, evex, displ8);
   if (decode_err != BX_DECODE_OK)
     ia_opcode = BX_IA_ERROR;
 
@@ -2074,24 +2074,26 @@ int BX_CPU_C::assignHandler(bxInstruction_c *i, Bit32u fetchModeMask)
         if ((op_flags & BX_PREPARE_EVEX_NO_BROADCAST) == BX_PREPARE_EVEX_NO_BROADCAST) {
           BX_DEBUG(("%s: broadcast is not supported for this instruction", i->getIaOpcodeNameShort()));
           i->execute1 = &BX_CPU_C::BxError;
+          return(1);
         }
       }
       else {
         if ((op_flags & BX_PREPARE_EVEX_NO_SAE) == BX_PREPARE_EVEX_NO_SAE) {
           BX_DEBUG(("%s: EVEX.b in reg form is not allowed for instructions which cannot cause floating point exception", i->getIaOpcodeNameShort()));
           i->execute1 = &BX_CPU_C::BxError;
+          return(1);
         }
-      }
-    }
-
-    if (! i->getEvexU()) {
-      if (! BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_AVX10_2)) {
-        BX_DEBUG(("%s: EVEX.U must be '1 without AVX10.2", i->getIaOpcodeNameShort()));
-        i->execute1 = &BX_CPU_C::BxError;
       }
     }
   }
 #endif
+
+  if (! protected_mode()) {
+     if ((op_flags & BX_PROTECTED_MODE_ONLY) != 0) {
+        if (i->execute1 != &BX_CPU_C::BxError) i->execute1 = &BX_CPU_C::BxProtectedModeRequired;
+        return(1);
+     }
+  }
 
   if (! (fetchModeMask & BX_FETCH_MODE_FPU_MMX_OK)) {
      if (op_flags & BX_PREPARE_FPU) {
@@ -2118,12 +2120,6 @@ int BX_CPU_C::assignHandler(bxInstruction_c *i, Bit32u fetchModeMask)
     }
   }
 #if BX_SUPPORT_EVEX
-  if (! (fetchModeMask & BX_FETCH_MODE_OPMASK_OK)) {
-    if (op_flags & BX_PREPARE_OPMASK) {
-       if (i->execute1 != &BX_CPU_C::BxError) i->execute1 = &BX_CPU_C::BxNoOpMask;
-       return(1);
-    }
-  }
   if (! (fetchModeMask & BX_FETCH_MODE_EVEX_OK)) {
     if (op_flags & BX_PREPARE_EVEX) {
        if (i->execute1 != &BX_CPU_C::BxError) i->execute1 = &BX_CPU_C::BxNoEVEX;
@@ -2137,10 +2133,10 @@ int BX_CPU_C::assignHandler(bxInstruction_c *i, Bit32u fetchModeMask)
        return(1);
     }
   }
-#endif
-#endif
-#endif
-#endif
+#endif // BX_SUPPORT_AMX
+#endif // BX_SUPPORT_EVEX
+#endif // BX_SUPPORT_AVX
+#endif // BX_CPU_LEVEL >= 6
 
   if ((op_flags & BX_TRACE_END) != 0 || i->execute1 == &BX_CPU_C::BxError)
      return(1);
@@ -2203,8 +2199,7 @@ void BX_CPU_C::init_FetchDecodeTables(void)
         case BX_ISA_AVX512_BITALG:
         case BX_ISA_AVX512_BF16:
         case BX_ISA_AVX512_FP16:
-          // It is possible that AVX512 is not supported on this processor but AVX10 is (for example AVX10_VL256 only)
-          // AVX10_1 includes all above AVX512 extensions
+          // It is possible that AVX512 is not supported on this processor but AVX10 is AVX10_1 includes all above AVX512 extensions
           if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_AVX10_1)) continue;
 
         default: break;

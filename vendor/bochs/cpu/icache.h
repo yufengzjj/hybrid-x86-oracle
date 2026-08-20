@@ -2,7 +2,7 @@
 // $Id$
 /////////////////////////////////////////////////////////////////////////
 //
-//   Copyright (c) 2007-2015 Stanislav Shwartsman
+//   Copyright (c) 2007-2025 Stanislav Shwartsman
 //          Written by Stanislav Shwartsman [sshwarts at sourceforge net]
 //
 //  This library is free software; you can redistribute it and/or
@@ -26,7 +26,7 @@
 
 extern void handleSMC(bx_phy_address pAddr, Bit32u mask);
 
-class bxPageWriteStampTable
+class alignas(64) bxPageWriteStampTable
 {
   const Bit32u PHY_MEM_PAGES_IN_4G_SPACE;
   Bit32u *fineGranularityMapping;
@@ -119,7 +119,7 @@ static const bx_phy_address BX_ICACHE_INVALID_PHY_ADDRESS = bx_phy_address(-1);
 
 void flushSMC(bxICacheEntry_c *e);
 
-class BOCHSAPI bxICache_c {
+class alignas(64) bxICache_c {
 public:
   bxICacheEntry_c entry[BxICacheEntries];
   bxInstruction_c mpool[BxICacheMemPool];
@@ -172,6 +172,7 @@ public:
   BX_CPP_INLINE void handleSMC(bx_phy_address pAddr, Bit32u mask);
 
   BX_CPP_INLINE void flushICacheEntries(void);
+  BX_CPP_INLINE void invalidatePageSplitICacheEntries(void);
 
   BX_CPP_INLINE bxICacheEntry_c* get_entry(bx_phy_address pAddr, unsigned fetchModeMask)
   {
@@ -189,7 +190,9 @@ public:
 
   BX_CPP_INLINE bool breakLinks()
   {
-    // break all links bewteen traces
+    invalidatePageSplitICacheEntries();
+
+    // break all links between traces
     if (++traceLinkTimeStamp == 0xffffffff) {
       flushICacheEntries();
       return true;
@@ -201,15 +204,15 @@ public:
 BX_CPP_INLINE void bxICache_c::flushICacheEntries(void)
 {
   bxICacheEntry_c* e = entry;
-  unsigned i;
 
-  for (i=0; i<BxICacheEntries; i++, e++) {
+  for (unsigned i=0; i<BxICacheEntries; i++, e++) {
     e->pAddr = BX_ICACHE_INVALID_PHY_ADDRESS;
     e->traceMask = 0;
   }
 
+  // flush all page split entries
   nextPageSplitIndex = 0;
-  for (i=0;i<BX_ICACHE_PAGE_SPLIT_ENTRIES;i++)
+  for (unsigned i=0;i<BX_ICACHE_PAGE_SPLIT_ENTRIES;i++)
     pageSplitIndex[i].ppf = BX_ICACHE_INVALID_PHY_ADDRESS;
 
   mpindex = 0;
@@ -221,7 +224,7 @@ BX_CPP_INLINE void bxICache_c::handleSMC(bx_phy_address pAddr, Bit32u mask)
 {
   Bit32u pAddrIndex = bxPageWriteStampTable::hash(pAddr);
 
-  // break all links bewteen traces
+  // break all links between traces
   if (breakLinks()) return;
 
   // Need to invalidate all traces in the trace cache that might include an
@@ -259,6 +262,17 @@ BX_CPP_INLINE void bxICache_c::handleSMC(bx_phy_address pAddr, Bit32u mask)
       }
     }
   }
+}
+
+BX_CPP_INLINE void bxICache_c::invalidatePageSplitICacheEntries(void)
+{
+  for (unsigned i=0;i<BX_ICACHE_PAGE_SPLIT_ENTRIES;i++) {
+    if (pageSplitIndex[i].ppf != BX_ICACHE_INVALID_PHY_ADDRESS) {
+      pageSplitIndex[i].ppf = BX_ICACHE_INVALID_PHY_ADDRESS;
+      flushSMC(pageSplitIndex[i].e);
+    }
+  }
+  nextPageSplitIndex = 0;
 }
 
 extern void flushICaches(void);

@@ -30,6 +30,9 @@
 #include "bochs.h"
 #include "param_names.h"
 #include "cpu/cpu.h"
+/* pageWriteStampTable (see invalidate_decoded). Bochs 3.0.5 made the icache a
+ * dynamic object specifically so that cpu.h would stop including this. */
+#include "cpu/icache.h"
 #include "memory/memory-bochs.h"
 #include "pc_system.h"
 #include "iodev/iodev.h"
@@ -249,9 +252,10 @@ void bx_instr_reset(unsigned, unsigned) {}
 void bx_instr_mwait(unsigned, bx_phy_address, unsigned, Bit32u) {}
 void bx_instr_debug_promt(void) {}
 void bx_instr_debug_cmd(const char *) {}
-void bx_instr_cnear_branch_taken(unsigned, bx_address, bx_address) {}
-void bx_instr_cnear_branch_not_taken(unsigned, bx_address) {}
-void bx_instr_ucnear_branch(unsigned, unsigned, bx_address, bx_address) {}
+/* One pair since Bochs 3.0.5; the conditional/unconditional split is now the
+ * `what` argument. */
+void bx_instr_near_branch_taken(unsigned, unsigned, bx_address, bx_address) {}
+void bx_instr_near_branch_not_taken(unsigned, bx_address) {}
 void bx_instr_far_branch(unsigned, unsigned, Bit16u, bx_address, Bit16u, bx_address) {}
 void bx_instr_opcode(unsigned, bxInstruction_c *, const Bit8u *, unsigned, bool, bool) {}
 void bx_instr_interrupt(unsigned, unsigned) {}
@@ -340,7 +344,7 @@ int bx_begin_simulation(int, char **) { return 0; }
 void bx_set_log_actions_by_device(bool) {}
 void print_statistics_tree(bx_param_c *, int) {}
 
-bool pluginDevicePresent(const char *) { return false; }
+bool pluginDevicePresent(const char *, bool) { return false; }
 Bit8u bx_get_plugins_count_np(Bit16u) { return 0; }
 const char *bx_get_plugin_name_np(Bit16u, Bit8u) { return nullptr; }
 Bit8u bx_get_plugin_flags_np(Bit16u, Bit8u) { return 0; }
@@ -414,6 +418,15 @@ void build_param_tree() {
      * that unmodelled MSRs are simply inert. */
     new bx_param_bool_c(cpu, "ignore_bad_msrs", "Ignore unknown MSRs", "", 1);
     new bx_param_bool_c(cpu, "cpuid_limit_winnt", "Limit CPUID to 3", "", 0);
+    /* How CPUID leaves 0x15/0x16 report frequencies (bx_cpuid_t::get_freq_leaf_15).
+     * "hardware" is the CPU model's own dumped values, which is what an oracle
+     * wants. Every parameter the core reads MUST exist here: get_param_enum()
+     * returns NULL for one that does not, and the core dereferences it without
+     * checking — this one is read from reset(), so its absence is an immediate
+     * segfault rather than a wrong answer. */
+    static const char *cpuid_freq_names[] = { "hardware", "none", "ips", nullptr };
+    new bx_param_enum_c(cpu, "cpuid_freq", "CPUID frequency reporting", "",
+                        cpuid_freq_names, 0, 0);
     new bx_param_bool_c(cpu, "mwait_is_nop", "MWAIT is a NOP", "", 1);
     new bx_param_filename_c(cpu, "msrs", "Configurable MSR file", "", "",
                             BX_PATHNAME_LEN);
@@ -533,7 +546,7 @@ void load_segment(bx_segment_reg_t *seg, Bit16u selector, Bit16u attr) {
 /* Put the CPU in 64-bit long mode, CPL 0, flat identity-mapped. */
 void enter_long_mode() {
     bx_cpu.cr0.set32(0x8005'0033); // PE MP ET NE WP AM PG
-    bx_cpu.cr4.set32(0x0004'0220); // PAE OSFXSR OSXSAVE
+    bx_cpu.cr4.set(0x0004'0220); // PAE OSFXSR OSXSAVE
     bx_cpu.cr3 = PT_PML4;
     bx_cpu.efer.set32(0x0000'0D00); // LME LMA NXE
     bx_cpu.xcr0.set32(0xE7);        // x87 SSE AVX opmask zmm_hi256 hi16_zmm
@@ -638,25 +651,34 @@ void *oracle_bochs_new(void) {
          * even though the object predates main(). */
         quiet_bochs_log();
         build_param_tree();
-        /* "bx_generic" enables everything the build supports (AVX-512, BMI,
-         * CET...), which is the point of this backend. */
-        SIM->get_param_enum(BXPN_CPU_MODEL)->set_by_name("bx_generic");
-        /* ...except CET, which bx_generic does not claim (only tigerlake,
-         * sapphire_rapids and arrow_lake do in cpudb). Without the extension
-         * every CET instruction except RDSSP — which is deliberately ungated,
-         * being a NOP on older CPUs — decodes to BxError and reports #UD, so
-         * the whole group would look unimplemented instead of merely disabled.
-         * Enabling the extension alone changes nothing until CR4.CET is set
-         * (see oracle_bochs_enable_shadow_stack): the instructions then behave
-         * as the ISA says for "shadow stacks off". Must precede initialize(),
-         * which is what applies this parameter. */
-        SIM->get_param_string(BXPN_CPU_ADD_FEATURES)->set("cet");
+        /* "sapphire_rapids" is the widest AVX-512-capable model in cpudb —
+         * the whole family (F/DQ/CD/BW/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ/
+         * BF16/FP16), plus CET, MOVDIR*, WAITPKG — which is the point of this
+         * backend. (arrow_lake is newer and adds sha512/sm3/sm4/avx_ifma/
+         * cmpccxadd/avx_vnni_int8|16/avx_ne_convert, but has no AVX-512 at all;
+         * reach for `add_features` if a campaign ever needs those.) There is no "bx_generic" model in this Bochs tree: an
+         * unknown name leaves set_by_name a NO-OP and the build default
+         * (corei7_haswell_4770, no AVX-512) silently selected — an earlier
+         * revision of this shim ran that way for months — hence the hard
+         * failure instead of an assert that NDEBUG would compile out. CET
+         * still changes nothing until CR4.CET is set (see
+         * oracle_bochs_enable_shadow_stack): until then the instructions
+         * behave as the ISA says for "shadow stacks off". Must precede
+         * initialize(), which is what applies this parameter. */
+        if (!SIM->get_param_enum(BXPN_CPU_MODEL)->set_by_name("sapphire_rapids")) {
+            fprintf(stderr, "bochs_shim: cpu model 'sapphire_rapids' not in cpudb\n");
+            abort();
+        }
+        bx_cpu.initialize();
         /* A20 masking is applied to EVERY physical address (A20ADDR in
          * paging.cc). bx_pc_system's mask is zero until this is called, which
          * silently translates every linear address to physical 0 — the CPU then
-         * fetches zeroes no matter what the page tables say. */
+         * fetches zeroes no matter what the page tables say.
+         *
+         * Must follow initialize(): enabling A20 flushes every CPU's TLB, and
+         * TLB_flush() breaks the trace links in bx_cpu.iCache, which initialize()
+         * is what allocates. Doing this first is a null dereference. */
         bx_pc_system.set_enable_a20(1);
-        bx_cpu.initialize();
         bx_cpu.sanity_checks();
     }
 
@@ -785,10 +807,10 @@ int oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
 #if BX_SUPPORT_CET
     /* The compile-time guard only says the Bochs *build* has the code. Whether
      * this CPU model claims the extension is a runtime question, and the answer
-     * decides whether the instructions decode at all — oracle_bochs_new asks for
-     * it by name (`add_features = "cet"`), a string that a future Bochs could
-     * rename out from under us. Without this check CR4.CET would still be set,
-     * because set32 does no validation, and every CET instruction would then be
+     * decides whether the instructions decode at all — sapphire_rapids claims it
+     * today, but a re-vendored Bochs could drop it from that model or gate it
+     * behind a configure switch. Without this check CR4.CET would still be set,
+     * because set() does no validation, and every CET instruction would then be
      * #UD while this function reported success. */
     if (!bx_cpu.is_cpu_extension_supported(BX_ISA_CET)) {
         return 1;
@@ -801,7 +823,7 @@ int oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
      * state already sets it, so this only matters if a caller wrote CR0 first —
      * and writing CR4.CET without it would build a machine no CPU can be. */
     bx_cpu.cr0.set32(bx_cpu.cr0.get32() | (1u << 16)); // CR0.WP
-    bx_cpu.cr4.set32(bx_cpu.cr4.get32() | (1u << 23)); // CR4.CET
+    bx_cpu.cr4.set(bx_cpu.cr4.get() | (1u << 23)); // CR4.CET
     /* SH_STK_EN | WR_SHSTK_EN, for both CPL 0 (where the oracle runs) and CPL 3.
      * WRSS needs the second bit; without it the instruction is #UD. */
     bx_cpu.msr.ia32_cet_control[0] = 0x3;
@@ -821,7 +843,9 @@ void oracle_bochs_set_cr(uint32_t n, uint64_t v) {
     case 0: bx_cpu.cr0.set32((Bit32u)v); bx_cpu.updateFetchModeMask(); break;
     case 2: bx_cpu.cr2 = v; break;
     case 3: bx_cpu.cr3 = v; bx_cpu.TLB_flush(); break;
-    case 4: bx_cpu.cr4.set32((Bit32u)v); bx_cpu.TLB_flush(); break;
+    /* CR4 is 64 bits wide since FRED (bit 32), hence set()/get() rather than
+     * the set32()/get32() the other control registers still use. */
+    case 4: bx_cpu.cr4.set(v); bx_cpu.TLB_flush(); break;
     default: break;
     }
 }
@@ -831,7 +855,7 @@ uint64_t oracle_bochs_get_cr(uint32_t n) {
     case 0: return bx_cpu.cr0.get32();
     case 2: return bx_cpu.cr2;
     case 3: return bx_cpu.cr3;
-    case 4: return bx_cpu.cr4.get32();
+    case 4: return bx_cpu.cr4.get();
     default: return 0;
     }
 }

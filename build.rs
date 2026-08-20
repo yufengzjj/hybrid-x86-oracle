@@ -544,10 +544,10 @@ fn build_bochs() {
         "gui/siminterface.cc",
         "gui/paramtree.cc",
     ];
-    // Berkeley SoftFloat-3e. The files are named *.c but are compiled as C++ —
-    // softfloat-extra.h declares overloads (extF80_exp(extFloat80_t) alongside
-    // extF80_exp(float64)) that are only legal in C++. Bochs' own Makefile does
-    // the same, passing CXX explicitly for this directory.
+    // Berkeley SoftFloat-3e. C++ sources: softfloat-extra.h declares overloads
+    // (extF80_exp(extFloat80_t) alongside extF80_exp(float64)) that are only legal
+    // in C++. Upstream named these *.c until Bochs 3.0.5 and relied on the Makefile
+    // passing CXX; they are *.cc now, so the extension carries the language.
     let softfloat_dir = "cpu/softfloat3e";
     // SoftFloat's target-specific parts (NaN propagation and the like) live in
     // a "specialize" directory; Bochs uses the 8086-SSE one.
@@ -632,14 +632,6 @@ fn build_bochs() {
     // those headers shadow softfloat3e's own.
     let mut sf = cc::Build::new();
     sf.cpp(true).std("c++17").warnings(false);
-    // cc's cpp(true) only picks the C++ *driver*, which for MSVC is the same
-    // cl.exe that decides the language from the file extension — and these
-    // sources are named *.c. gcc/clang infer C++ from the g++/clang++ driver, so
-    // only MSVC needs to be told, and told it must be: compiled as C, the
-    // overloads in softfloat-extra.h are a syntax error.
-    if msvc_config.is_some() {
-        sf.flag("/TP");
-    }
     force_config(&mut sf);
     sf.include(&bochs)
         .include(bochs.join(softfloat_dir))
@@ -652,10 +644,10 @@ fn build_bochs() {
         .define("INLINE_LEVEL", "5")
         .define("SOFTFLOAT_FAST_DIV32TO16", None)
         .define("SOFTFLOAT_FAST_DIV64TO32", None);
-    for src in sources_with_ext(softfloat_dir, "c") {
+    for src in sources_with_ext(softfloat_dir, "cc") {
         sf.file(src);
     }
-    for src in sources_with_ext(softfloat_specialize, "c") {
+    for src in sources_with_ext(softfloat_specialize, "cc") {
         sf.file(src);
     }
     if env::var_os("SAIL_MODEL_DEBUG").is_none() {
@@ -664,7 +656,12 @@ fn build_bochs() {
     sf.compile("x86oracle_softfloat");
 
     println!("cargo:rerun-if-changed=csrc/bochs_shim.cpp");
-    println!("cargo:rerun-if-changed=vendor/bochs/config.h");
+    // The whole source root, not just the files listed above: a semantic fix in a
+    // vendored .cc (e.g. the KSHIFTLW/KSHIFTRW count off-by-one from
+    // patches/bochs/) must trigger a rebuild, or the oracle silently keeps
+    // executing the old semantics. It has to be `bochs`, not a literal
+    // "vendor/bochs", or a BOCHS_DIR build watches a tree it is not compiling.
+    println!("cargo:rerun-if-changed={}", bochs.display());
     println!("cargo:rerun-if-env-changed=BOCHS_DIR");
 }
 

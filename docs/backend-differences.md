@@ -42,7 +42,18 @@ cases must be skipped (`StepOutcome::is_comparable()` returns false).
   arithmetic, most of the two-byte map, all of VEX/EVEX (decoded, then reported
   as unimplemented).
 - **Bochs** implements essentially everything a user-mode program can execute,
-  including AVX-512.
+  including AVX-512. What it *claims* is the selected CPU model's CPUID: the
+  shim picks `sapphire_rapids`, the widest **AVX-512-capable** model in cpudb
+  (the full AVX-512 family, CET, MOVDIR*, WAITPKG). `arrow_lake` is newer and
+  carries a handful of ISAs sapphire lacks — `sha512`, `sm3`, `sm4`,
+  `avx_ifma`, `avx_ne_convert`, `avx_vnni_int8/16`, `cmpccxadd` — but no
+  AVX-512 at all; add them with `add_features` if a campaign ever needs them.
+  An earlier revision asked for the nonexistent model name `bx_generic`, which
+  `set_by_name` ignores — leaving the build default `corei7_haswell_4770`
+  silently selected, so every EVEX encoding (and `kmov*`) raised #UD despite
+  the core being compiled with EVEX support. The shim now aborts on an unknown
+  model name, and `tests/bochs_patches.rs` pins that AVX-512 and CET really are
+  claimed.
 - **KVM / WHP** implement exactly what the host CPU does — no more, no less. On
   a host without AVX-512, EVEX encodings raise a genuine #UD. That is correct
   ground truth for that machine but *not* a semantic disagreement with a
@@ -287,9 +298,10 @@ Three things surprise people writing cases here:
 `RDSSPD`/`RDSSPQ` are the exception to all of this: they are ungated in Bochs'
 decoder (they must be NOPs on pre-CET CPUs), so they decode with CET off and
 merely do nothing. Every other CET instruction is `#UD` until the extension is
-enabled — which this crate now does at CPU-model construction (`add_features
-= "cet"`, since `bx_generic` does not claim CET), so with shadow stacks off they
-report the ISA's answer for "disabled" rather than "not implemented".
+enabled — which the `sapphire_rapids` CPU model claims natively (an earlier
+revision added it via `add_features = "cet"` on a model without it), so with
+shadow stacks off they report the ISA's answer for "disabled" rather than "not
+implemented".
 
 That last part is **not** opt-in and cannot be: the CPU model is fixed before
 `initialize()`, long before anyone calls `enable_shadow_stack`. So every Bochs
@@ -299,6 +311,53 @@ compares CPUID today (`tests/sail_backend.rs` only expects Sail to report it
 unimplemented), but a future CPUID diff would see Bochs claim CET where the KVM
 or WHP host may not — that is a difference in the *model*, not a bug in either.
 `SSP` is likewise not part of `CpuState`, so it never enters a state diff.
+
+## 4g. `KSHIFTLW`/`KSHIFTRW` zeroed at count 15 — patched (Bochs)
+
+The first Bochs semantic bug this suite found (4b–4e were all model-side bugs
+on the ACL2/Sail branch): `cpu/avx/avx512_mask16.cc` guards the 16-bit mask
+shifts with `count < 15` where the SDM says `COUNT ≤ 15` — so
+`kshiftlw k, k, 15`, the idiomatic top-bit isolate, returns 0 instead of
+0x8000. A pure typo: the 8/32/64-bit siblings all use `count < width`.
+
+Found by the zens k-op differential suite the first day the Bochs backend
+actually executed AVX-512 (see §2 — the CPU-model fallback had kept it #UD
+until then); no second backend could confirm (the host CPU lacks AVX-512, Sail
+has no vector ISA), but the SDM text and the sibling-width pattern are
+unambiguous.
+
+Still present on upstream master as of 2026-08-19 (`d5c0ad9`), so this crate
+carries the fix itself, as
+[`patches/bochs/0001-kshiftlw-kshiftrw-count-15.patch`](../patches/bochs/0001-kshiftlw-kshiftrw-count-15.patch).
+`scripts/vendor-bochs.sh` applies it after copying, so re-vendoring replays it
+instead of silently reverting it, and `tests/bochs_patches.rs` fails if it ever
+stops taking effect. If a future bump makes it stop applying because upstream
+took the fix, delete the patch and say so here — do not force it through.
+
+## 4h. `VPCONFLICTD/Q` — two compounding bugs, fixed upstream
+
+Found by the zens phase-5 differential suite the day the family landed, against
+the then-vendored Bochs `b64f49e` (2025-05-13). Two bugs stacked:
+`simd_pconflictd/q` (`cpu/simd_int.h`) looped `i < index-1` — an off-by-one
+that never compares a lane with its immediate predecessor, though its own
+comment says "all previous elements" — and the `VPCONFLICTD/Q` handlers
+(`cpu/avx/avx512_bitalg.cc`) wrote each lane's result back over the copy of the
+source they were still reading, so lane 2 onward compared against conflict
+bitmaps instead of source values. `[7,3,7,7,…]` returned all-zeros where the
+SDM (and the zens model) give lanes 2/3 the bits 0x1/0x5.
+
+**No longer patched here.** Upstream fixed both on 2026-06-09 ("fixed bug in
+VPCONFLICTD/VPCONFLICTQ instructions" plus "complete fix for VPCONFLICT*"),
+taking `i < index` in the helper and iterating the handlers backwards so the
+in-place write is safe. Bumping to `d5c0ad9` picked that up, and the vendored
+tree is stock here again. Kept as a record: it is the reason the pin is no
+longer allowed to drift far behind upstream. The same bump also brought
+upstream fixes for masked `VPEXPANDB/W` with a memory operand, missing
+zero-upper on `VPBROADCASTMB2Q/MW2D`, masked `VPMULTISHIFTQB`, MAXVL being read
+from the encoding rather than XCR0, `VEXTRACT*` masked memory fault
+suppression, zero-mask `VMOVAPS/APD` still accessing memory, `VPSHUFBITQMB`,
+and spurious #PE from `VREDUCE*` — every one of which this suite would
+otherwise have rediscovered one instruction at a time.
 
 ## 5. Faults
 

@@ -105,7 +105,7 @@ extern Bit16u findOpcode(const Bit64u *opMap, Bit32u opMsk);
 
 extern BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, unsigned nnn, unsigned rm);
 #if BX_SUPPORT_AVX
-extern BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, unsigned nnn, unsigned rm, unsigned vvv, unsigned vex_w, bool had_evex = false, bool displ8 = false);
+extern BxDecodeError assign_srcs(bxInstruction_c *i, unsigned ia_opcode, bool is_64, unsigned nnn, unsigned rm, unsigned vvv, unsigned vex_w, Bit32u had_evex = 0, bool displ8 = false);
 #endif
 
 extern int fetchImmediate(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, Bit16u ia_opcode, bool is_64);
@@ -649,7 +649,7 @@ static BxOpcodeDecodeDescriptor64 decode64_descriptor[] =
    /* 0F FF */ { &decoder_simple64, BxOpcodeTable0FFF }
 };
 
-const Bit8u *decodeModrm64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsigned mod, unsigned nnn, unsigned rm, unsigned rex_r, unsigned rex_x, unsigned rex_b)
+const Bit8u *decodeModrm64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsigned mod, unsigned rm, unsigned rex_x, unsigned rex_b)
 {
   unsigned seg = BX_SEG_REG_DS;
 
@@ -755,7 +755,7 @@ static const Bit8u *parseModrm64(const Bit8u *iptr, unsigned &remain, bxInstruct
     i->assertModC0();
   }
   else {
-    iptr = decodeModrm64(iptr, remain, i, modrm->mod, modrm->nnn, modrm->rm, rex_r, rex_x, rex_b);
+    iptr = decodeModrm64(iptr, remain, i, modrm->mod, modrm->rm, rex_x, rex_b);
   }
 
   return iptr;
@@ -810,16 +810,23 @@ int decoder_vex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsig
     return(-1);
   remain--;
   unsigned opcode_byte = *iptr++; // fetch new b1
-  // there are instructions only from maps 1,2,3 and 7 for now
-  if (vex_opc_map != 1 && vex_opc_map != 2 && vex_opc_map != 3 && vex_opc_map != 7)
+  // there are instructions only from maps 1,2,3,5 and 7 for now
+  if (vex_opc_map != 1 && vex_opc_map != 2 && vex_opc_map != 3 && vex_opc_map != 5 && vex_opc_map != 7)
     return(ia_opcode);
+#if BX_SUPPORT_AMX == 0
+  if (vex_opc_map == 5) // map5 is defined only with AMX instructions for now
+    return(ia_opcode);
+#endif
   opcode_byte += 256 * vex_opc_map;
   bool has_modrm = (opcode_byte != 0x177); // if not VZEROUPPER/VZEROALL opcode
   opcode_byte -= 256;
-  if (vex_opc_map > 3) {
-    // tables skip maps 4, 5 and 6
-    opcode_byte -= 768;
-  }
+#if BX_SUPPORT_AMX
+  // tables skip maps 4 and 6, need to adjust index
+  if (vex_opc_map == 5) opcode_byte -= 256; // map4 tables skipped
+  if (vex_opc_map == 7) opcode_byte -= 512; // map4 and map6 tables skipped
+#else
+  if (vex_opc_map == 7) opcode_byte -= 768; // map4,5,6 tables skipped
+#endif
 
   unsigned rm = 0, nnn = 0;
   if (has_modrm) {
@@ -916,7 +923,7 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   //    7 6 5 4 3 2 1 0
   //    ---------------
   // P0 R X B R'0 m m m
-  // P1 w v v v v u p p ; evex.u was always '1 before avx10.2
+  // P1 w v v v v u p p
   // P2 z L'L b V'a a a
 
   // EVEX.mmmm - opcode group
@@ -929,11 +936,14 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   // EVEX.W    - opsize promotion / opcode extension
   // EVEX.z    - zero masking / merging
   // EVEX.b    - broadcast / round control / SAE
-  // EVEX.u    - round control / SAE for 256-bit (AVX10.2)
   // EVEX.LL   - vector length control
 
   // check for reserved EVEX bits
   if ((evex & 0x08) != 0)
+    return(ia_opcode);
+
+  // EVEX.U must be '1
+  if ((evex & 0x400) == 0)
     return(ia_opcode);
 
   unsigned evex_opc_map = evex & 0x7;
@@ -946,7 +956,6 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   rex_r |= (evex & 0x10) ^ 0x10;
   rex_x = ((evex >> 3) & 0x8) ^ 0x8;
   rex_b = ((evex >> 2) & 0x8) ^ 0x8;
-  rex_b |= (rex_x << 1);
 
   sse_prefix = (evex >> 8) & 0x3;
   int vvv = 15 - ((evex >> 11) & 0xf);
@@ -968,9 +977,6 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   i->setVL(1 << evex_vl_rc);
   i->setVexW(vex_w);
 
-  unsigned evex_u = (evex >> 10) & 0x1;
-  i->setEvexU(evex_u);
-
   unsigned evex_z = (evex >> 23) & 0x1;
   i->setZeroMasking(evex_z);
 
@@ -986,18 +992,17 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
   if (! iptr)
     return(-1);
 
-  unsigned nnn = modrm.nnn;
-  unsigned rm  = modrm.rm;
-
   bool displ8 = (modrm.mod == 0x40); // mod == 01b
 
   if (i->modC0()) {
+    modrm.rm |= (rex_x << 1); // extension for vector register size only valid for mod==3
+
     // EVEX.b in reg form implies 512-bit vector length
     if (i->getEvexb()) i->setVL(BX_VL512);
-
-    // EVEX.u=0 in reg form implies 256-bit vector length
-    if (!i->getEvexU()) i->setVL(BX_VL256);
   }
+
+  unsigned nnn = modrm.nnn;
+  unsigned rm  = modrm.rm;
 
   Bit32u vl = i->getVL()-1; // 0: VL128, 1: VL256, 3: VL512
   Bit32u decmask = (1 << IS64_OFFSET) |
@@ -1027,7 +1032,10 @@ int decoder_evex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsi
     }
   }
 
-  BxDecodeError decode_err = assign_srcs(i, ia_opcode, true, nnn, rm, vvv, vex_w, true, displ8);
+  // evex cannot be zero because opcode map 0 is not populated
+  BX_ASSERT(evex != 0);
+
+  BxDecodeError decode_err = assign_srcs(i, ia_opcode, true, nnn, rm, vvv, vex_w, evex, displ8);
   if (decode_err != BX_DECODE_OK)
     ia_opcode = BX_IA_ERROR;
 

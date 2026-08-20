@@ -66,10 +66,12 @@ Vendored in vendor/ (see vendor/README.md for provenance):
     The Bochs CPU sources — libcpu, libfpu, libavx, libcpudb, libsoftfloat and
     four of Bochs' own support sources (logio.cc, gui/siminterface.cc,
     gui/paramtree.cc, pc_system.cc) — compiled by build.rs into this crate's
-    native archive and statically linked. Upstream files, unmodified; the exact
-    revision and ./configure flags are recorded in vendor/bochs/PROVENANCE, and
-    scripts/vendor-bochs.sh reproduces the tree. `BOCHS_DIR` builds a different
-    source root instead.
+    native archive and statically linked. Upstream files, except for the bug
+    fixes in patches/bochs/, which scripts/vendor-bochs.sh applies on top and
+    which carry a notice of the change in the affected file; the exact revision,
+    ./configure flags and applied patches are recorded in vendor/bochs/PROVENANCE,
+    and scripts/vendor-bochs.sh reproduces the tree. `BOCHS_DIR` builds a
+    different source root instead.
     License: LGPL-2.1-or-later. Copyright (c) the Bochs Project. Full texts in
     vendor/bochs/COPYING and vendor/bochs/LICENSE.
     >> Linking these makes a distributed binary a combined work under the LGPL:

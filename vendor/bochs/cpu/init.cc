@@ -2,7 +2,7 @@
 // $Id$
 /////////////////////////////////////////////////////////////////////////
 //
-//  Copyright (C) 2001-2023  The Bochs Project
+//  Copyright (C) 2001-2025  The Bochs Project
 //
 //  This library is free software; you can redistribute it and/or
 //  modify it under the terms of the GNU Lesser General Public
@@ -24,6 +24,8 @@
 #include "bochs.h"
 #include "cpu.h"
 #define LOG_THIS BX_CPU_THIS_PTR
+
+#include "icache.h"
 
 #include "gui/siminterface.h"
 #include "param_names.h"
@@ -205,6 +207,8 @@ void BX_CPU_C::initialize(void)
   BX_CPU_THIS_PTR cpuid->sanity_checks();
 #endif
 
+  iCache = new bxICache_c;
+
   init_FetchDecodeTables(); // must be called after init_isa_features_bitmask()
 
 #if BX_CPU_LEVEL >= 6
@@ -360,20 +364,20 @@ void BX_CPU_C::register_state(void)
   BXRS_HEX_PARAM_FIELD(cpu, DR1, dr[1]);
   BXRS_HEX_PARAM_FIELD(cpu, DR2, dr[2]);
   BXRS_HEX_PARAM_FIELD(cpu, DR3, dr[3]);
-  BXRS_HEX_PARAM_FIELD(cpu, DR6, dr6.val32);
-  BXRS_HEX_PARAM_FIELD(cpu, DR7, dr7.val32);
+  BXRS_HEX_PARAM_FIELD(cpu, DR6, dr6.val);
+  BXRS_HEX_PARAM_FIELD(cpu, DR7, dr7.val);
 #endif
 
-  BXRS_HEX_PARAM_FIELD(cpu, CR0, cr0.val32);
+  BXRS_HEX_PARAM_FIELD(cpu, CR0, cr0.val);
   BXRS_HEX_PARAM_FIELD(cpu, CR2, cr2);
   BXRS_HEX_PARAM_FIELD(cpu, CR3, cr3);
-#if BX_CPU_LEVEL >= 5
-  BXRS_HEX_PARAM_FIELD(cpu, CR4, cr4.val32);
+#if BX_CPU_LEVEL >= 4
+  BXRS_HEX_PARAM_FIELD(cpu, CR4, cr4.val);
 #endif
 
 #if BX_CPU_LEVEL >= 6
   if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_XSAVE)) {
-    BXRS_HEX_PARAM_FIELD(cpu, XCR0, xcr0.val32);
+    BXRS_HEX_PARAM_FIELD(cpu, XCR0, xcr0.val);
   }
 #endif
 
@@ -459,7 +463,7 @@ void BX_CPU_C::register_state(void)
 #if BX_SUPPORT_APIC
   BXRS_HEX_PARAM_FIELD(MSR, apicbase, msr.apicbase);
 #endif
-  BXRS_HEX_PARAM_FIELD(MSR, EFER, efer.val32);
+  BXRS_HEX_PARAM_FIELD(MSR, EFER, efer.val);
   BXRS_HEX_PARAM_FIELD(MSR,  star, msr.star);
 #if BX_SUPPORT_X86_64
   if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_LONG_MODE)) {
@@ -533,6 +537,11 @@ void BX_CPU_C::register_state(void)
     BXRS_HEX_PARAM_FIELD(MSR, ia32_umwait_ctrl, msr.ia32_umwait_ctrl);
   }
 #endif
+#if BX_SUPPORT_X86_64
+  if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_USER_MSR)) {
+    BXRS_HEX_PARAM_FIELD(MSR, ia32_user_msr_ctrl, msr.ia32_user_msr_ctrl);
+  }
+#endif
 
 #if BX_SUPPORT_SVM
   if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_SVM)) {
@@ -558,15 +567,34 @@ void BX_CPU_C::register_state(void)
 #endif
 
 #if BX_SUPPORT_UINTR
-  bx_list_c *UINTR = new bx_list_c(cpu, "UINTR");
-  BXRS_PARAM_BOOL(UINTR, UIF, uintr.UIF);
-  BXRS_HEX_PARAM_FIELD(UINTR, uirr, uintr.uirr);
-  BXRS_HEX_PARAM_FIELD(UINTR, ui_handler, uintr.ui_handler);
-  BXRS_HEX_PARAM_FIELD(UINTR, stack_adjust, uintr.stack_adjust);
-  BXRS_HEX_PARAM_FIELD(UINTR, uinv, uintr.uinv);
-  BXRS_HEX_PARAM_FIELD(UINTR, uitt_size, uintr.uitt_size);
-  BXRS_HEX_PARAM_FIELD(UINTR, uitt_addr, uintr.uitt_addr);
-  BXRS_HEX_PARAM_FIELD(UINTR, upid_addr, uintr.upid_addr);
+  if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_UINTR)) {
+    bx_list_c *UINTR = new bx_list_c(cpu, "UINTR");
+    BXRS_PARAM_BOOL(UINTR, UIF, uintr.UIF);
+    BXRS_HEX_PARAM_FIELD(UINTR, uirr, uintr.uirr);
+    BXRS_HEX_PARAM_FIELD(UINTR, ui_handler, uintr.ui_handler);
+    BXRS_HEX_PARAM_FIELD(UINTR, stack_adjust, uintr.stack_adjust);
+    BXRS_HEX_PARAM_FIELD(UINTR, uinv, uintr.uinv);
+    BXRS_HEX_PARAM_FIELD(UINTR, uitt_size, uintr.uitt_size);
+    BXRS_HEX_PARAM_FIELD(UINTR, uitt_addr, uintr.uitt_addr);
+    BXRS_HEX_PARAM_FIELD(UINTR, upid_addr, uintr.upid_addr);
+  }
+#endif
+
+#if BX_SUPPORT_FRED
+  if (BX_CPUID_SUPPORT_ISA_EXTENSION(BX_ISA_FRED)) {
+    bx_list_c *FRED = new bx_list_c(cpu, "FRED");
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_rsp0, msr.ia32_fred_rsp[0]);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_rsp1, msr.ia32_fred_rsp[1]);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_rsp2, msr.ia32_fred_rsp[2]);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_rsp3, msr.ia32_fred_rsp[3]);
+#if BX_SUPPORT_CET
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_ssp1, msr.ia32_fred_ssp[1]);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_ssp2, msr.ia32_fred_ssp[2]);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_ssp3, msr.ia32_fred_ssp[3]);
+#endif
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_stack_levels, msr.ia32_fred_stack_levels);
+    BXRS_HEX_PARAM_FIELD(FRED, ia32_fred_cfg, msr.ia32_fred_cfg);
+  }
 #endif
 
 #if BX_SUPPORT_FPU
@@ -825,6 +853,8 @@ void BX_CPU_C::after_restore_state(void)
 
 BX_CPU_C::~BX_CPU_C()
 {
+  delete iCache;
+
 #if BX_CPU_LEVEL >= 4
   delete cpuid;
 #endif
@@ -886,6 +916,7 @@ void BX_CPU_C::reset(unsigned source)
 
   BX_CPU_THIS_PTR activity_state = BX_ACTIVITY_STATE_ACTIVE;
   BX_CPU_THIS_PTR debug_trap = 0;
+  BX_CPU_THIS_PTR async_event = 0;
 
   /* instruction pointer */
 #if BX_CPU_LEVEL < 2
@@ -893,6 +924,8 @@ void BX_CPU_C::reset(unsigned source)
 #else /* from 286 up */
   BX_CPU_THIS_PTR prev_rip = RIP = 0x0000FFF0;
 #endif
+
+  BX_CPU_THIS_PTR speculative_rsp = false;
 
   /* CS (Code Segment) and descriptor cache */
   /* Note: on a real cpu, CS initially points to upper memory.  After
@@ -1031,7 +1064,7 @@ void BX_CPU_C::reset(unsigned source)
   // handle reserved bits
 #if BX_CPU_LEVEL == 3
   // reserved bits all set to 1 on 386
-  BX_CPU_THIS_PTR cr0.val32 |= 0x7fffffe0;
+  BX_CPU_THIS_PTR cr0.val |= 0x7fffffe0;
 #endif
 
 #if BX_CPU_LEVEL >= 3
@@ -1039,8 +1072,8 @@ void BX_CPU_C::reset(unsigned source)
   BX_CPU_THIS_PTR cr3 = 0;
 #endif
 
-#if BX_CPU_LEVEL >= 5
-  BX_CPU_THIS_PTR cr4.set32(0);
+#if BX_CPU_LEVEL >= 4
+  BX_CPU_THIS_PTR cr4.set(0);
   BX_CPU_THIS_PTR cr4_suppmask = get_cr4_allow_mask();
 #if BX_SUPPORT_X86_64
   BX_CPU_THIS_PTR linaddr_width = 48;
@@ -1060,6 +1093,10 @@ void BX_CPU_C::reset(unsigned source)
   BX_CPU_THIS_PTR msr.ia32_umwait_ctrl = 0;
 #endif
 
+#if BX_SUPPORT_X86_64
+  BX_CPU_THIS_PTR msr.ia32_user_msr_ctrl = 0;
+#endif
+
 #if BX_SUPPORT_SVM
   BX_CPU_THIS_PTR msr.svm_hsave_pa = 0;
   BX_CPU_THIS_PTR msr.svm_vm_cr = 0;     // enable SVME if was disabled, clear LOCK bit
@@ -1071,6 +1108,19 @@ void BX_CPU_C::reset(unsigned source)
   for (n=0;n<4;n++)
     BX_CPU_THIS_PTR msr.ia32_pl_ssp[n] = 0;
   SSP = 0;
+#endif
+
+#if BX_SUPPORT_FRED
+  if (source == BX_RESET_HARDWARE) {
+    BX_CPU_THIS_PTR msr.ia32_fred_cfg = 0;
+    BX_CPU_THIS_PTR msr.ia32_fred_stack_levels = 0;
+    for (n=0;n<4;n++) {
+#if BX_SUPPORT_CET
+      BX_CPU_THIS_PTR msr.ia32_fred_ssp[n] = 0;
+#endif
+      BX_CPU_THIS_PTR msr.ia32_fred_rsp[n] = 0;
+    }
+  }
 #endif
 #endif // BX_CPU_LEVEL >= 6
 
@@ -1158,7 +1208,11 @@ void BX_CPU_C::reset(unsigned source)
   }
 
   BX_CPU_THIS_PTR EXT = 0;
-  BX_CPU_THIS_PTR last_exception_type = 0;
+  BX_CPU_THIS_PTR last_exception_type = BX_ET_NONE;
+#if BX_SUPPORT_FRED
+  BX_CPU_THIS_PTR fred_event_info = 0;
+  BX_CPU_THIS_PTR fred_event_data = 0;
+#endif
 
   // invalidate the code prefetch queue
   BX_CPU_THIS_PTR eipPageBias = 0;
@@ -1267,6 +1321,19 @@ void BX_CPU_C::reset(unsigned source)
 
   BX_INSTR_RESET(BX_CPU_ID, source);
 }
+
+#if BX_SUPPORT_VMX
+void BX_CPU_C::allowVmxForFirmware(void)
+{
+  // The Bochs BIOS enables VMX in IA32_FEATURE_CONTROL itself. External
+  // firmware uses the fw_cfg path and needs the same setup from the emulator.
+  if (! is_cpu_extension_supported(BX_ISA_VMX)) {
+    return;
+  }
+
+  BX_CPU_THIS_PTR msr.ia32_feature_ctrl |= BX_IA32_FEATURE_CONTROL_BITS;
+}
+#endif
 
 void BX_CPU_C::sanity_checks(void)
 {
@@ -1394,9 +1461,9 @@ void BX_CPU_C::assert_checks(void)
   if (! check_CR0(BX_CPU_THIS_PTR cr0.get32()))
     BX_PANIC(("assert_checks: CR0 consistency checks failed !"));
 
-#if BX_CPU_LEVEL >= 5
+#if BX_CPU_LEVEL >= 4
   // check CR4 consistency
-  if (! check_CR4(BX_CPU_THIS_PTR cr4.get32()))
+  if (! check_CR4(BX_CPU_THIS_PTR cr4.get()))
     BX_PANIC(("assert_checks: CR4 consistency checks failed !"));
 #endif
 
