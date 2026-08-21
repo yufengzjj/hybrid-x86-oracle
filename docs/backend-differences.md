@@ -359,6 +359,45 @@ suppression, zero-mask `VMOVAPS/APD` still accessing memory, `VPSHUFBITQMB`,
 and spurious #PE from `VREDUCE*` — every one of which this suite would
 otherwise have rediscovered one instruction at a time.
 
+## 4i. `VCVTTPH2{,U}DQ` / `VCVTTPH2{,U}QQ` decoded to the non-truncating handlers — patched (Bochs)
+
+Found by the zens FP16 differential suite the day the FP16 converts landed.
+`decoder/ia_opcodes_evex.def` bound all eight truncating packed fp16-to-dword
+and fp16-to-qword rows (`BX_IA_EVEX_VCVTTPH2DQ_VdqWph`, `..UDQ..`, `..QQ..`,
+`..UQQ..`, each plus its `_Kmask` twin) to the NON-truncating execute methods
+(`VCVTPH2DQ_VdqWphR` and friends) — and to the non-truncating disassembly
+strings, so even the internal disasm hid the difference. The truncating
+handlers (`VCVTTPH2DQ_VdqWphR`, ..., keyed on `f16_to_i32_round_to_zero` etc.)
+exist in `avx/avx512_cvt16.cc` but were never referenced: a copy-paste bug in
+the def rows. `vcvttph2dq` of -367.5 returned RN's -368 instead of truncation's
+-367. The word-sized rows (`VCVTTPH2{,U}W`) and the scalar `VCVTTSH2{,U}SI`
+rows were bound correctly, which is what narrowed it to the def table rather
+than the softfloat layer.
+
+Nothing else about those rows was wrong: the load functions, operand kinds, ISA
+gate and EVEX attributes already matched their non-truncating siblings, so the
+fix is eight two-token substitutions and nothing more.
+
+Still present on upstream master as of 2026-08-21 (`7cf9830`), so this crate
+carries the fix itself, as
+[`patches/bochs/0002-vcvttph2-truncating-handlers.patch`](../patches/bochs/0002-vcvttph2-truncating-handlers.patch).
+`scripts/vendor-bochs.sh` applies it after copying, so re-vendoring replays it
+instead of silently reverting it, and `tests/bochs_patches.rs` fails if it ever
+stops taking effect — on both the masked and unmasked encodings, with the
+non-truncating twins asserted alongside so that binding *everything* to the
+truncating handler cannot pass either. zens' `test_fp16_cvt_directed` and the
+FP16 template sweep cover it downstream, but that is the consumer's suite; it
+does not protect this vendored tree.
+
+One sibling shape is deliberately left alone. The AVX10.2 saturating fp8
+converts (`VCVTPH2BF8S`, `VCVT2PH2BF8S`, `VCVTBIASPH2BF8S` and their `HF8`
+counterparts) are also bound to their non-saturating handlers — but that is
+upstream incompleteness rather than a mis-binding: Bochs defines no saturating
+handler at all, so there is nothing to point them at. `BX_ISA_AVX10_2` is not
+in `sapphire_rapids` either (§2), so this backend cannot reach them. A CPU
+model with AVX10.2 would make them reachable and wrong; noted here so that is
+not rediscovered from scratch.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

@@ -1,0 +1,59 @@
+VCVTTPH2{,U}DQ / VCVTTPH2{,U}QQ: dispatch to the truncating handlers
+
+The eight packed fp16-to-dword and fp16-to-qword *truncating* rows in the EVEX
+opcode table name the truncating instruction but bind the non-truncating
+execute method: BX_IA_EVEX_VCVTTPH2DQ_VdqWph points at VCVTPH2DQ_VdqWphR, and
+so on through the UDQ, QQ and UQQ forms and each one's _Kmask twin. So
+`vcvttph2dq` rounds by the current rounding mode instead of toward zero:
+of -367.5 it returns RN's -368, not truncation's -367.
+
+The truncating methods exist and are correct — avx512_cvt16.cc defines all
+eight, keyed on f16_to_{i32,ui32,i64,ui64}_round_to_zero — they were simply
+never referenced. Nothing else was wrong with the rows: the load functions,
+operand kinds, ISA gate and EVEX attributes already match their non-truncating
+siblings, and the sibling families that were bound correctly (VCVTTPH2{,U}W,
+the scalar VCVTTSH2{,U}SI) show what these should have looked like. A
+copy-paste slip in the table, nothing deeper.
+
+The disassembly strings were copied along with the handler, so both of each
+row's mnemonics also read "vcvtph2dq". That is why Bochs' own internal disasm
+agreed with the wrong result, and it is fixed here too.
+
+Found by this crate's differential suite; see docs/backend-differences.md §4i.
+Still present on upstream master as of 2026-08-21 (7cf9830).
+
+The hunks below are deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/decoder/ia_opcodes_evex.def
++++ b/cpu/decoder/ia_opcodes_evex.def
+@@ -1419,10 +1419,10 @@
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2DQ_VdqWph_Kmask, "vcvtph2dq", "vcvtph2dq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTPH2DQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2UDQ_VdqWph, "vcvtph2udq", "vcvtph2udq", &BX_CPU_C::LOAD_BROADCAST_Half_VectorW, &BX_CPU_C::VCVTPH2UDQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2UDQ_VdqWph_Kmask, "vcvtph2udq", "vcvtph2udq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTPH2UDQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2DQ_VdqWph, "vcvtph2dq", "vcvtph2dq", &BX_CPU_C::LOAD_BROADCAST_Half_VectorW, &BX_CPU_C::VCVTPH2DQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2DQ_VdqWph_Kmask, "vcvtph2dq", "vcvtph2dq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTPH2DQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2UDQ_VdqWph, "vcvtph2udq", "vcvtph2udq", &BX_CPU_C::LOAD_BROADCAST_Half_VectorW, &BX_CPU_C::VCVTPH2UDQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2UDQ_VdqWph_Kmask, "vcvtph2udq", "vcvtph2udq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTPH2UDQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2DQ_VdqWph, "vcvttph2dq", "vcvttph2dq", &BX_CPU_C::LOAD_BROADCAST_Half_VectorW, &BX_CPU_C::VCVTTPH2DQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2DQ_VdqWph_Kmask, "vcvttph2dq", "vcvttph2dq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTTPH2DQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2UDQ_VdqWph, "vcvttph2udq", "vcvttph2udq", &BX_CPU_C::LOAD_BROADCAST_Half_VectorW, &BX_CPU_C::VCVTTPH2UDQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2UDQ_VdqWph_Kmask, "vcvttph2udq", "vcvttph2udq", &BX_CPU_C::LOAD_BROADCAST_MASK_Half_VectorW, &BX_CPU_C::VCVTTPH2UDQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vdq, OP_mVHVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ 
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2PD_VpdWph, "vcvtph2pd", "vcvtph2pd", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTPH2PD_VpdWphR, BX_ISA_AVX512_FP16, OP_Vpd, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2PD_VpdWph_Kmask, "vcvtph2pd", "vcvtph2pd", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTPH2PD_MASK_VpdWphR, BX_ISA_AVX512_FP16, OP_Vpd, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+@@ -1430,10 +1430,10 @@
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2QQ_VdqWph_Kmask, "vcvtph2qq", "vcvtph2qq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTPH2QQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2UQQ_VdqWph, "vcvtph2uqq", "vcvtph2uqq", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTPH2UQQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPH2UQQ_VdqWph_Kmask, "vcvtph2uqq", "vcvtph2uqq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTPH2UQQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2QQ_VdqWph, "vcvtph2qq", "vcvtph2qq", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTPH2QQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2QQ_VdqWph_Kmask, "vcvtph2qq", "vcvtph2qq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTPH2QQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2UQQ_VdqWph, "vcvtph2uqq", "vcvtph2uqq", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTPH2UQQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+-bx_define_opcode(BX_IA_EVEX_VCVTTPH2UQQ_VdqWph_Kmask, "vcvtph2uqq", "vcvtph2uqq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTPH2UQQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2QQ_VdqWph, "vcvttph2qq", "vcvttph2qq", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTTPH2QQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2QQ_VdqWph_Kmask, "vcvttph2qq", "vcvttph2qq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTTPH2QQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2UQQ_VdqWph, "vcvttph2uqq", "vcvttph2uqq", &BX_CPU_C::LOAD_BROADCAST_Quarter_VectorW, &BX_CPU_C::VCVTTPH2UQQ_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
++bx_define_opcode(BX_IA_EVEX_VCVTTPH2UQQ_VdqWph_Kmask, "vcvttph2uqq", "vcvttph2uqq", &BX_CPU_C::LOAD_BROADCAST_MASK_Quarter_VectorW, &BX_CPU_C::VCVTTPH2UQQ_MASK_VdqWphR, BX_ISA_AVX512_FP16, OP_Vqq, OP_mVQVw, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ 
+ bx_define_opcode(BX_IA_EVEX_VCVTPS2PHX_VphWdq, "vcvtps2phx", "vcvtps2phx", &BX_CPU_C::LOAD_BROADCAST_VectorD, &BX_CPU_C::VCVTPS2PHX_VphWpsR, BX_ISA_AVX512_FP16, OP_Vph, OP_mVps, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
+ bx_define_opcode(BX_IA_EVEX_VCVTPS2PHX_VphWdq_Kmask, "vcvtps2phx", "vcvtps2phx", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorD, &BX_CPU_C::VCVTPS2PHX_MASK_VphWpsR, BX_ISA_AVX512_FP16, OP_Vph, OP_mVps, OP_NONE, OP_NONE, BX_PREPARE_EVEX)
