@@ -1152,8 +1152,8 @@ void BX_CPU_C::xsave_tilecfg_state(bxInstruction_c *i, bx_address offset)
     tilecfg.vmmubyte(1) = BX_CPU_THIS_PTR amx->start_row;
 
     for (unsigned n=0; n < 8; n++) {
-      tilecfg.vmm16u(8+n)    = BX_CPU_THIS_PTR amx->tilecfg[n].rows;
-      tilecfg.vmmubyte(48+n) = BX_CPU_THIS_PTR amx->tilecfg[n].bytes_per_row;
+      tilecfg.vmm16u(8+n)    = BX_CPU_THIS_PTR amx->tilecfg[n].bytes_per_row;
+      tilecfg.vmmubyte(48+n) = BX_CPU_THIS_PTR amx->tilecfg[n].rows;
     }
   }
 
@@ -1185,7 +1185,7 @@ void BX_CPU_C::xsave_tiledata_state(bxInstruction_c *i, bx_address offset)
   bx_address asize_mask = i->asize_mask();
 
   for (unsigned tile=0; tile < BX_TILE_REGISTERS; tile++) {
-    for (unsigned row=0; row < BX_TILE_REGISTERS; row++) {
+    for (unsigned row=0; row < BX_TILE_MAX_ROWS; row++) {
       write_virtual_zmmword(i->seg(), (offset+(tile*BX_TILE_MAX_ROWS+row)*64) & asize_mask, &(BX_CPU_THIS_PTR amx->tile[tile].row[row]));
     }
   }
@@ -1196,7 +1196,7 @@ void BX_CPU_C::xrstor_tiledata_state(bxInstruction_c *i, bx_address offset)
   bx_address asize_mask = i->asize_mask();
 
   for (unsigned tile=0; tile < BX_TILE_REGISTERS; tile++) {
-    for (unsigned row=0; row < BX_TILE_REGISTERS; row++) {
+    for (unsigned row=0; row < BX_TILE_MAX_ROWS; row++) {
       read_virtual_zmmword(i->seg(), (offset+(tile*BX_TILE_MAX_ROWS+row)*64) & asize_mask, &(BX_CPU_THIS_PTR amx->tile[tile].row[row]));
     }
     BX_CPU_THIS_PTR amx->set_tile_used(tile);
@@ -1213,7 +1213,7 @@ void BX_CPU_C::xrstor_init_tiledata_state(void)
 
 bool BX_CPU_C::xsave_tiledata_state_xinuse(void)
 {
-  return (BX_CPU_THIS_PTR amx->tile_use_tracker == 0);  // all tiles are zero
+  return (BX_CPU_THIS_PTR amx->tile_use_tracker != 0);
 }
 
 #endif

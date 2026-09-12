@@ -30,6 +30,9 @@
 #include "bochs.h"
 #include "param_names.h"
 #include "cpu/cpu.h"
+#if BX_SUPPORT_AMX
+#include "cpu/avx/amx.h"
+#endif
 /* pageWriteStampTable (see invalidate_decoded). Bochs 3.0.5 made the icache a
  * dynamic object specifically so that cpu.h would stop including this. */
 #include "cpu/icache.h"
@@ -610,7 +613,7 @@ void enter_long_mode() {
     bx_cpu.cr4.set(0x0004'0220); // PAE OSFXSR OSXSAVE
     bx_cpu.cr3 = PT_PML4;
     bx_cpu.efer.set32(0x0000'0D00); // LME LMA NXE
-    bx_cpu.xcr0.set32(0xE7);        // x87 SSE AVX opmask zmm_hi256 hi16_zmm
+    bx_cpu.xcr0.set32(0x600E7);     // x87 SSE AVX opmask zmm_hi256 hi16_zmm tilecfg tiledata
 
     load_segment(&bx_cpu.sregs[BX_SEG_REG_CS], 0x10, ATTR_CODE64);
     for (unsigned s : {BX_SEG_REG_SS, BX_SEG_REG_DS, BX_SEG_REG_ES, BX_SEG_REG_FS,
@@ -633,6 +636,17 @@ void enter_long_mode() {
             bx_cpu.vmm[r].vmm64u(q) = 0;
         }
     }
+#if BX_SUPPORT_AMX
+    /* Bochs' reset() never touches the AMX unit (cpu/init.cc has no
+     * amx->clear()), so a tile configuration, tile data and the in-use tracker
+     * — hence XSTATE_BV[17:18] — would survive from the previous oracle instance
+     * on this singleton core. Real hardware leaves RESET with AMX in its init
+     * state, which is exactly what TILERELEASE produces. `amx` is NULL when the
+     * selected CPU model does not advertise AMX. */
+    if (bx_cpu.amx != nullptr) {
+        bx_cpu.amx->clear();
+    }
+#endif
     bx_cpu.invalidate_prefetch_q();
 
     /* CRITICAL: cpu_mode is derived state. Writing cr0/cr4/efer only changes the

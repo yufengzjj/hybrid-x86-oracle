@@ -1,0 +1,50 @@
+AMX-INT8: honor the byte signedness in DPBDSS / DPBDSU / DPBDUS
+
+The four dot-product helpers behind TDPBSSD/TDPBSUD/TDPBUSD/TDPBUUD unpack
+each dword into a `const Bit8u xbyte[4]` / `ybyte[4]` and then form the
+products as Bit32s(xbyte[i]) * Bit32s(ybyte[i]). Converting an UNSIGNED byte
+to Bit32s yields 0..255, so the sign extension the S variants exist for never
+happened: all four instructions computed the unsigned-by-unsigned product,
+and TDPBSSD/TDPBSUD/TDPBUSD were wrong for every input byte >= 0x80.
+
+Declaring the signed side's array as Bit8s makes the existing Bit32s(...)
+conversions sign-extend; DPBDUU is untouched.
+
+Found by this crate's differential suite the day AMX was first compiled into
+the vendored core; see docs/backend-differences.md §4n. Still present on
+upstream master as of 2026-09-12.
+
+The hunks below are deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/avx/amx.cc
++++ b/cpu/avx/amx.cc
+@@ -279,8 +279,8 @@ void BX_CPU_C::check_tiles(bxInstruction_c *i, unsigned tile_dst, unsigned tile_
+
+ BX_CPP_INLINE Bit32u DPBDSS(Bit32u x, Bit32u y)
+ {
+-  const Bit8u xbyte[4] = { Bit8u(x & 0xff), Bit8u((x >> 8) & 0xff), Bit8u((x >> 16) & 0xff), Bit8u(x >> 24) };
+-  const Bit8u ybyte[4] = { Bit8u(y & 0xff), Bit8u((y >> 8) & 0xff), Bit8u((y >> 16) & 0xff), Bit8u(y >> 24) };
++  const Bit8s xbyte[4] = { Bit8s(x & 0xff), Bit8s((x >> 8) & 0xff), Bit8s((x >> 16) & 0xff), Bit8s(x >> 24) };
++  const Bit8s ybyte[4] = { Bit8s(y & 0xff), Bit8s((y >> 8) & 0xff), Bit8s((y >> 16) & 0xff), Bit8s(y >> 24) };
+
+   Bit32s p0dword = Bit32s(xbyte[0]) * Bit32s(ybyte[0]);
+   Bit32s p1dword = Bit32s(xbyte[1]) * Bit32s(ybyte[1]);
+@@ -292,7 +292,7 @@ BX_CPP_INLINE Bit32u DPBDSS(Bit32u x, Bit32u y)
+
+ BX_CPP_INLINE Bit32u DPBDSU(Bit32u x, Bit32u y)
+ {
+-  const Bit8u xbyte[4] = { Bit8u(x & 0xff), Bit8u((x >> 8) & 0xff), Bit8u((x >> 16) & 0xff), Bit8u(x >> 24) };
++  const Bit8s xbyte[4] = { Bit8s(x & 0xff), Bit8s((x >> 8) & 0xff), Bit8s((x >> 16) & 0xff), Bit8s(x >> 24) };
+   const Bit8u ybyte[4] = { Bit8u(y & 0xff), Bit8u((y >> 8) & 0xff), Bit8u((y >> 16) & 0xff), Bit8u(y >> 24) };
+
+   Bit32s p0dword = Bit32s(xbyte[0]) * Bit32u(ybyte[0]);
+@@ -306,7 +306,7 @@ BX_CPP_INLINE Bit32u DPBDSU(Bit32u x, Bit32u y)
+ BX_CPP_INLINE Bit32u DPBDUS(Bit32u x, Bit32u y)
+ {
+   const Bit8u xbyte[4] = { Bit8u(x & 0xff), Bit8u((x >> 8) & 0xff), Bit8u((x >> 16) & 0xff), Bit8u(x >> 24) };
+-  const Bit8u ybyte[4] = { Bit8u(y & 0xff), Bit8u((y >> 8) & 0xff), Bit8u((y >> 16) & 0xff), Bit8u(y >> 24) };
++  const Bit8s ybyte[4] = { Bit8s(y & 0xff), Bit8s((y >> 8) & 0xff), Bit8s((y >> 16) & 0xff), Bit8s(y >> 24) };
+
+   Bit32s p0dword = Bit32u(xbyte[0]) * Bit32s(ybyte[0]);
+   Bit32s p1dword = Bit32u(xbyte[1]) * Bit32s(ybyte[1]);

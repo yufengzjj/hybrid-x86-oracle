@@ -426,6 +426,130 @@ that zeroed the *whole* register cannot pass either; the ymm-index form is
 asserted alongside as the boundary the fix must not move. zens'
 `test_gather_directed` / `test_gather_templates` cover it downstream.
 
+## 4k–4o. AMX — enabled 2026-09-12, and five Bochs bugs that surfaced at once
+
+Until 2026-09-12 the vendored core was configured WITHOUT AMX (`config.h`
+had `BX_SUPPORT_AMX 0`, so `cpu/avx/amx.cc` compiled to nothing and the
+sapphire_rapids model did not advertise the feature) and the shim's XCR0 left
+bits 17/18 (XTILECFG/XTILEDATA) clear, so every AMX instruction was #UD on the
+Bochs backend the same way it is on a host without AMX. `configure` now runs
+with `--enable-amx` (`scripts/vendor-bochs.sh`, PROVENANCE), `config.h`
+carries `BX_SUPPORT_AMX 1`, and `csrc/bochs_shim.cpp` starts the vCPU with
+XCR0 = 0x600E7. That lights up AMX-TILE, AMX-INT8 and AMX-BF16 — the subset
+Sapphire Rapids has (no AMX-FP16/FP8/COMPLEX: those stay #UD, as on the
+hardware). The XSAVE layout is unchanged for the components that existed
+before; TILECFG lands at offset 2752 and TILEDATA at 2816 (`cpu/crregs.h`,
+the Intel layout this core already used for opmask@1088 … PKRU@2688).
+
+Running the zens AMX suite against the freshly enabled core found five bugs in
+the vendored AMX code — all in code that had never executed in this crate
+before, and all still present on upstream master as of 2026-09-12. Each is
+carried as a patch under `patches/bochs/`, applied by `scripts/vendor-bochs.sh`
+like its siblings.
+
+### 4k. `STTILECFG` decoded at VEX.W1 — patched (Bochs)
+
+`BxOpcodeGroup_VEX_0F3849` bound `BX_IA_STTILECFG` to `ATTR_VEX_W1`. The
+instruction is VEX.128.66.0F38.**W0** 49 /0 (SDM), which is what LLVM and GNU
+as emit, so the real encoding matched nothing and raised #UD unconditionally
+while `ldtilecfg`/`tilerelease`/`tilezero` in the same group correctly asked
+for W0.
+[`patches/bochs/0004-sttilecfg-vex-w0.patch`](../patches/bochs/0004-sttilecfg-vex-w0.patch).
+
+### 4l. `xsave_tilecfg_state` swapped rows and bytes_per_row — patched (Bochs)
+
+The routine behind `STTILECFG` and XSAVE component 17 wrote `tilecfg[n].rows`
+into the 16-bit colsb slots (bytes 16..31) and `bytes_per_row` into the row
+bytes (48..55) — the reverse of the architectural image and of
+`configure_tiles`' own read side. A configuration therefore did not round-trip:
+`ldtilecfg` of `{rows 2, colsb 12}` followed by `sttilecfg` stored `{colsb 2,
+rows 12}`, and an XSAVE/XRSTOR pair reconfigured every tile transposed.
+
+### 4m. TILEDATA save/restore covered 8 of 16 rows — patched (Bochs)
+
+`xsave_tiledata_state` / `xrstor_tiledata_state` looped `row <
+BX_TILE_REGISTERS` (8) instead of `BX_TILE_MAX_ROWS` (16), so only the first
+4 KiB of the 8 KiB component moved; rows 8..15 of every tile stayed stale in
+the save area on XSAVE and in the registers on XRSTOR.
+
+### 4n. AMX-INT8 dot products ignored byte signedness — patched (Bochs)
+
+`DPBDSS`/`DPBDSU`/`DPBDUS` unpacked each dword into a `const Bit8u` array and
+formed the products as `Bit32s(xbyte[i]) * Bit32s(ybyte[i])`; converting an
+unsigned byte to `Bit32s` gives 0..255, so no sign extension ever happened and
+all four `TDPB??D` instructions computed the unsigned×unsigned product:
+`tdpbssd` on the byte pair `0xFF · 0x01` accumulated 255 where −1 was due, so
+every INT8 GEMM with a byte ≥ 0x80 on a signed side was wrong (only `tdpbuud`
+was correct).
+[`patches/bochs/0006-amx-int8-byte-signedness.patch`](../patches/bochs/0006-amx-int8-byte-signedness.patch).
+
+### 4o. TILEDATA XINUSE inverted — patched (Bochs)
+
+`xsave_tiledata_state_xinuse` returned `tile_use_tracker == 0`, i.e. "in use"
+exactly when no tile had been touched. XSTATE_BV[18] was therefore 0 after a
+`tileloadd` and 1 on a fresh machine, and XSAVEOPT/XSAVEC would skip live tile
+data while saving empty tiles.
+
+4l, 4m and 4o are one patch,
+[`patches/bochs/0005-amx-xsave-tilecfg-tiledata.patch`](../patches/bochs/0005-amx-xsave-tilecfg-tiledata.patch).
+Downstream, zens' `test_tilecfg` (the LDTILECFG/STTILECFG round trip — 4k and
+4l), `test_amx_int8` / `test_amx_int8_random` (all four INT8 variants against a
+reference GEMM — 4n) and `test_amx_fp16_bf16` diff against this backend and
+agree bit for bit with the patches in place. 4m and 4o were observed through
+XSAVE with RFBM = bits 17+18 (XSTATE_BV[18] came out 0 after a `tileloadd`,
+and tile rows 8..15 never reached the area); zens keeps that case engine-only
+because its model uses the MPX-less component offsets, so the regression for
+those two lives in `tests/bochs_patches.rs` here. That file pins all five
+against the SDM and fails if any of 0004–0006 stops taking effect: the
+LDTILECFG→STTILECFG round trip with rows ≠ colsb on every tile (4k, 4l), XSAVE
+of a freshly `tileloadd`ed 16-row tile into a stale-filled area checking
+XSTATE_BV[18] and all 16 rows (4m, 4o), XSAVE on the AMX init state checking
+XSTATE_BV[18] = 0 (4o), XRSTOR of a hand-built image followed by `tilestored`
+(4m), and the four `tdpb??d` variants on a byte quadruple that gives each
+signedness combination its own answer (4n; `tdpbuud` is the control).
+
+Enabling AMX also exposed a reset gap: Bochs' `reset(BX_RESET_HARDWARE)`
+clears the x87, MXCSR, zmm and opmask state but never touches the AMX unit
+(`cpu/init.cc` has no `amx->clear()`), so on this crate's singleton core a
+tile configuration, tile data and the in-use tracker — hence XSTATE_BV[17:18]
+— survived from one `BochsOracle` into the next. Real hardware leaves RESET
+with AMX in its init state. `csrc/bochs_shim.cpp`'s `enter_long_mode` now
+calls `amx->clear()` alongside its own register zeroing, and
+`tests/bochs_patches.rs` loads a tile in one instance and checks the next one
+reads an all-zero `sttilecfg` image and XSTATE_BV[17:18] = 0. This is a shim
+fix, not a patch: it is about the oracle's fresh-instance contract, which
+upstream has no equivalent of.
+
+### 4p. Stale traces after a store into executed code once XCR0 has AMX bits — patched (Bochs)
+
+The second thing XCR0 = 0x600E7 broke was not AMX at all: three x87 cases in
+`tests/bochs_embedding.rs` began reading back the state of the *previous*
+instruction. `step_bytes` writes the instruction at RIP, steps, and writes a
+different instruction at the same RIP — and with the tile bits enabled Bochs
+kept executing the first one. The trace cache indexes an entry by
+`(pAddr & (entries-1)) ^ fetchModeMask` (`cpu/icache.h`, `hash`), and the
+self-modifying-code path `handleSMC` finds the traces a store may have touched
+by walking, per 128-byte page line the store hit, the 128 entries that line's
+instructions hash to. That is only complete while `fetchModeMask < 0x80`;
+`BX_FETCH_MODE_AMX_OK` is bit 7, so the moment `handleAvxModeChange` sets it
+every trace lands in the neighbouring line's entries and the walk misses it.
+Nothing else invalidates — the shim stamps host writes exactly as guest stores
+are stamped (`invalidate_decoded`), and it was that path that stopped working,
+not the shim. Any guest OS that enables AMX and then patches code it has
+already run would hit the same thing on upstream Bochs.
+
+The hash is deliberately left as it is: nothing flushes the icache when XCR0 or
+CR4.OSXSAVE changes, so the mode bits in the index are what keeps a trace
+decoded with AMX_OK clear (its AMX instructions bound to `BxNoAMX`) from being
+executed after it is set. Instead `handleSMC` walks up to the line an entry can
+be displaced into,
+[`patches/bochs/0007-icache-smc-walk-fetchmode-bit7.patch`](../patches/bochs/0007-icache-smc-walk-fetchmode-bit7.patch);
+the per-entry `traceMask` test is unchanged, so this looks at more entries and
+flushes nothing it did not flush before. `tests/bochs_patches.rs` pins it
+directly — step one `mov`, overwrite it in place with another, step again — and
+the `bochs_embedding.rs` x87 cases are back to green. Still present on upstream
+master as of 2026-09-12.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

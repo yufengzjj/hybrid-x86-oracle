@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i and §4j are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4p are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -9,7 +9,7 @@
 //! One `BochsOracle` per test: the core is a process-wide singleton.
 #![cfg(feature = "bochs")]
 
-use x86_oracle::{BochsOracle, X86Oracle, ZMM_CHUNKS, RAX, RBX, RCX, RDX};
+use x86_oracle::{BochsOracle, X86Oracle, ZMM_CHUNKS, RAX, RBX, RCX, RDI, RDX, RSI};
 
 const CODE: u64 = 0x10_0000;
 
@@ -319,5 +319,351 @@ fn q_index_d_element_gathers_zero_above_128_with_ymm_index() {
         );
         assert_eq!(&zmm1[2..], &[0; 6], "{name} ymm-index: bits 128..511 of {zmm1:x?}");
         assert_eq!(k7, 0, "{name}: k7 is cleared once every lane is done");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4k–§4o: AMX, enabled 2026-09-12, and the five upstream bugs that surfaced.
+//
+// Every test here starts with `tilerelease`, the architectural AMX init state.
+// It is what a fresh machine presents anyway — the shim's reset clears the AMX
+// unit, and the last section of this file pins that — but these tests are about
+// the instructions, not the reset path, so they do not lean on it.
+//
+// Encodings are what GNU as 2.45 emits for the Intel-syntax mnemonic in the
+// comment; all are VEX.128.0F38 with W0, so a decoder that asked for W1 on any
+// of them (§4k) faults instead of retiring.
+
+/// `sttilecfg` / `ldtilecfg` images, `tileloadd` sources and `tilestored`
+/// destinations. Distinct 64 KiB windows so a stray write to one cannot be
+/// mistaken for the expected write to another.
+const CFG_IN: u64 = 0x21_0000;
+const CFG_OUT: u64 = 0x21_1000;
+const TILE_A: u64 = 0x22_0000;
+const TILE_B: u64 = 0x23_0000;
+const TILE_OUT: u64 = 0x24_0000;
+/// XSAVE area: 64-byte aligned (XSAVE/XRSTOR #GP otherwise) and large enough
+/// for the standard-format layout up to and including TILEDATA.
+const XSAVE_AREA: u64 = 0x30_0000;
+const XSAVE_AREA_LEN: usize = XSAVE_TILEDATA + 8192;
+/// Standard-format offsets (`cpu/crregs.h`): XSTATE_BV in the header, then the
+/// two AMX components after PKRU. The shim's XCR0 is 0x600E7, so RFBM = bits
+/// 17 + 18 selects exactly these two.
+const XSAVE_XSTATE_BV: usize = 512;
+const XSAVE_TILECFG: usize = 2752;
+const XSAVE_TILEDATA: usize = 2816;
+const XCR0_TILECFG: u64 = 1 << 17;
+const XCR0_TILEDATA: u64 = 1 << 18;
+const RFBM_TILES: u64 = XCR0_TILECFG | XCR0_TILEDATA;
+
+const TILERELEASE: [u8; 5] = [0xC4, 0xE2, 0x78, 0x49, 0xC0];
+const LDTILECFG_RBX: [u8; 5] = [0xC4, 0xE2, 0x78, 0x49, 0x03]; // ldtilecfg [rbx]
+const STTILECFG_RCX: [u8; 5] = [0xC4, 0xE2, 0x79, 0x49, 0x01]; // sttilecfg [rcx]
+const TILEZERO_TMM0: [u8; 5] = [0xC4, 0xE2, 0x7B, 0x49, 0xC0];
+const TILELOADD_TMM0_RDI_RSI: [u8; 6] = [0xC4, 0xE2, 0x7B, 0x4B, 0x04, 0x37]; // tileloadd tmm0, [rdi+rsi*1]
+const TILELOADD_TMM1_RDI_RSI: [u8; 6] = [0xC4, 0xE2, 0x7B, 0x4B, 0x0C, 0x37]; // tileloadd tmm1, [rdi+rsi*1]
+const TILELOADD_TMM2_RDX_RSI: [u8; 6] = [0xC4, 0xE2, 0x7B, 0x4B, 0x14, 0x32]; // tileloadd tmm2, [rdx+rsi*1]
+const TILESTORED_RCX_RSI_TMM0: [u8; 6] = [0xC4, 0xE2, 0x7A, 0x4B, 0x04, 0x31]; // tilestored [rcx+rsi*1], tmm0
+const TILESTORED_RDI_RSI_TMM0: [u8; 6] = [0xC4, 0xE2, 0x7A, 0x4B, 0x04, 0x37]; // tilestored [rdi+rsi*1], tmm0
+const XSAVE_RCX: [u8; 3] = [0x0F, 0xAE, 0x21]; // xsave [rcx]
+const XRSTOR_RCX: [u8; 3] = [0x0F, 0xAE, 0x29]; // xrstor [rcx]
+
+/// A palette-1 TILECFG image: `tiles[n]` is `(rows, colsb)` for tmm`n`, the
+/// rest unconfigured. Bytes 16..31 hold the eight 16-bit colsb, 48..55 the
+/// eight row counts — the layout `ldtilecfg` reads and `sttilecfg` must write.
+fn tilecfg(tiles: &[(u8, u16)]) -> [u8; 64] {
+    let mut cfg = [0u8; 64];
+    cfg[0] = 1; // palette_id
+    for (n, (rows, colsb)) in tiles.iter().enumerate() {
+        cfg[16 + 2 * n..16 + 2 * n + 2].copy_from_slice(&colsb.to_le_bytes());
+        cfg[48 + n] = *rows;
+    }
+    cfg
+}
+
+/// A full 16×64-byte tile whose every dword names its own row and column, so a
+/// row that was skipped, or landed in the wrong place, reads differently from
+/// every other row and from the `STALE` fill.
+fn tile_pattern() -> Vec<u8> {
+    (0..16u32)
+        .flat_map(|row| (0..16u32).map(move |col| 0x5000_0000 | row << 8 | col))
+        .flat_map(u32::to_le_bytes)
+        .collect()
+}
+
+fn read_bytes(cpu: &BochsOracle, addr: u64, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    cpu.read_mem(addr, &mut buf);
+    buf
+}
+
+/// §4k + §4l: what `ldtilecfg` loaded, `sttilecfg` must store back verbatim.
+/// Upstream decoded `sttilecfg` at VEX.W1, so the real (W0) encoding raised #UD
+/// — the `run` assertion; and its writer had rows and colsb swapped, so a
+/// configuration that did decode came back transposed — the byte comparison.
+/// Every configured tile has rows ≠ colsb so a swap cannot hide.
+/// `patches/bochs/0004-sttilecfg-vex-w0.patch` and `0005-amx-xsave-tilecfg-tiledata.patch`.
+#[test]
+fn sttilecfg_stores_what_ldtilecfg_loaded() {
+    let mut cpu = BochsOracle::new();
+    let cfg = tilecfg(&[(2, 12), (16, 64), (5, 20), (1, 4)]);
+    cpu.write_mem(CFG_IN, &cfg);
+    cpu.write_mem(CFG_OUT, &[STALE as u8; 64]);
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RCX, CFG_OUT);
+    let code = [TILERELEASE.as_slice(), &LDTILECFG_RBX, &STTILECFG_RCX].concat();
+    run(&mut cpu, &code, 3);
+    let got = read_bytes(&cpu, CFG_OUT, 64);
+    assert_eq!(got, cfg, "sttilecfg image differs from the ldtilecfg one");
+}
+
+/// The other half of the image writer: with no configuration loaded (palette
+/// 0) `sttilecfg` stores 64 zero bytes, not the stale memory and not a palette
+/// byte with garbage after it.
+#[test]
+fn sttilecfg_after_tilerelease_stores_zeroes() {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_OUT, &[STALE as u8; 64]);
+    cpu.set_gpr(RCX, CFG_OUT);
+    let code = [TILERELEASE.as_slice(), &STTILECFG_RCX].concat();
+    run(&mut cpu, &code, 2);
+    assert_eq!(read_bytes(&cpu, CFG_OUT, 64), [0u8; 64], "init-state sttilecfg");
+}
+
+/// §4m (save side) + §4o: a `tileloadd` into a 16-row tile followed by
+/// `xsave` with RFBM = TILECFG|TILEDATA. Upstream's saver looped over 8 rows
+/// (`BX_TILE_REGISTERS` where `BX_TILE_MAX_ROWS` was meant), so rows 8..15 of
+/// the save area kept their `STALE` fill; and its XINUSE test was inverted, so
+/// XSTATE_BV[18] read 0 for a tile that had just been loaded.
+/// `patches/bochs/0005-amx-xsave-tilecfg-tiledata.patch`.
+#[test]
+fn xsave_tiledata_saves_all_sixteen_rows_and_marks_tiles_in_use() {
+    let mut cpu = BochsOracle::new();
+    let pattern = tile_pattern();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(16, 64)]));
+    cpu.write_mem(TILE_A, &pattern);
+    cpu.write_mem(XSAVE_AREA, &vec![STALE as u8; XSAVE_AREA_LEN]);
+    // Header: XSAVE merges XSTATE_BV bits outside RFBM from memory, so give
+    // it a clean one rather than 0xAA..AA.
+    cpu.write_mem(XSAVE_AREA + XSAVE_XSTATE_BV as u64, &[0u8; 64]);
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RSI, 64); // tileloadd stride
+    cpu.set_gpr(RCX, XSAVE_AREA);
+    cpu.set_gpr(RAX, RFBM_TILES);
+    cpu.set_gpr(RDX, 0);
+    let code = [TILERELEASE.as_slice(), &LDTILECFG_RBX, &TILELOADD_TMM0_RDI_RSI, &XSAVE_RCX].concat();
+    run(&mut cpu, &code, 4);
+
+    let xstate_bv = cpu.read_mem_u64(XSAVE_AREA + XSAVE_XSTATE_BV as u64);
+    assert_eq!(xstate_bv & XCR0_TILECFG, XCR0_TILECFG, "XSTATE_BV[17] after ldtilecfg: {xstate_bv:#x}");
+    assert_eq!(xstate_bv & XCR0_TILEDATA, XCR0_TILEDATA, "XSTATE_BV[18] after tileloadd: {xstate_bv:#x}");
+
+    let tile0 = read_bytes(&cpu, XSAVE_AREA + XSAVE_TILEDATA as u64, 1024);
+    for row in 0..16 {
+        assert_eq!(
+            &tile0[row * 64..row * 64 + 64],
+            &pattern[row * 64..row * 64 + 64],
+            "tmm0 row {row} in the save area (rows 8..15 are the bug)"
+        );
+    }
+    // tmm1..tmm7 are zero after tilerelease and must have been written as such
+    // — all 16 rows of each, not just the first 8.
+    let rest = read_bytes(&cpu, XSAVE_AREA + XSAVE_TILEDATA as u64 + 1024, 7 * 1024);
+    assert!(rest.iter().all(|b| *b == 0), "tmm1..tmm7 must be saved as zeroes, not left stale");
+}
+
+/// §4o, the other direction: nothing loaded, so TILEDATA is not in use and
+/// XSTATE_BV[18] must be 0. Upstream returned `tile_use_tracker == 0` here,
+/// i.e. reported 1 on exactly this machine. TILECFG likewise.
+#[test]
+fn xsave_marks_tiledata_unused_after_tilerelease() {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(XSAVE_AREA, &vec![0u8; XSAVE_AREA_LEN]);
+    cpu.set_gpr(RCX, XSAVE_AREA);
+    cpu.set_gpr(RAX, RFBM_TILES);
+    cpu.set_gpr(RDX, 0);
+    let code = [TILERELEASE.as_slice(), &XSAVE_RCX].concat();
+    run(&mut cpu, &code, 2);
+    let xstate_bv = cpu.read_mem_u64(XSAVE_AREA + XSAVE_XSTATE_BV as u64);
+    assert_eq!(xstate_bv & RFBM_TILES, 0, "XSTATE_BV[17:18] on an AMX init state: {xstate_bv:#x}");
+}
+
+/// §4m (restore side): a hand-built standard-format image with XSTATE_BV =
+/// TILECFG|TILEDATA, a 16×64 tmm0 configuration and the full 1 KiB of tmm0
+/// data. After `xrstor`, `tilestored` must write back all 16 rows; upstream's
+/// restorer stopped at row 8, leaving rows 8..15 as `tilerelease` had them.
+#[test]
+fn xrstor_tiledata_restores_all_sixteen_rows() {
+    let mut cpu = BochsOracle::new();
+    let pattern = tile_pattern();
+    let mut image = vec![0u8; XSAVE_AREA_LEN];
+    image[XSAVE_XSTATE_BV..XSAVE_XSTATE_BV + 8].copy_from_slice(&RFBM_TILES.to_le_bytes());
+    image[XSAVE_TILECFG..XSAVE_TILECFG + 64].copy_from_slice(&tilecfg(&[(16, 64)]));
+    image[XSAVE_TILEDATA..XSAVE_TILEDATA + 1024].copy_from_slice(&pattern);
+    cpu.write_mem(XSAVE_AREA, &image);
+    cpu.write_mem(TILE_OUT, &vec![STALE as u8; 1024]);
+    cpu.set_gpr(RCX, XSAVE_AREA);
+    cpu.set_gpr(RAX, RFBM_TILES);
+    cpu.set_gpr(RDX, 0);
+    cpu.set_gpr(RDI, TILE_OUT);
+    cpu.set_gpr(RSI, 64);
+    let code = [TILERELEASE.as_slice(), &XRSTOR_RCX, &TILESTORED_RDI_RSI_TMM0].concat();
+    run(&mut cpu, &code, 3);
+    let got = read_bytes(&cpu, TILE_OUT, 1024);
+    for row in 0..16 {
+        assert_eq!(
+            &got[row * 64..row * 64 + 64],
+            &pattern[row * 64..row * 64 + 64],
+            "tmm0 row {row} after xrstor (rows 8..15 are the bug)"
+        );
+    }
+}
+
+/// The byte quadruples for the INT8 dot products, chosen so each signedness
+/// combination has its own answer. Read as signed: A = [-1, -128, 2, 127],
+/// B = [1, 2, -2, -128]; as unsigned: A = [255, 128, 2, 127], B = [1, 2, 254, 128].
+const INT8_A: [u8; 4] = [0xFF, 0x80, 0x02, 0x7F];
+const INT8_B: [u8; 4] = [0x01, 0x02, 0xFE, 0x80];
+
+/// `(mnemonic, VEX pp byte, expected dot product)` for `tdpb??d tmm0, tmm1, tmm2`.
+/// The pp byte selects the variant: F2 = ssd, F3 = sud, 66 = usd, none = uud.
+/// Upstream sign-extended nothing, so all four returned the `uud` value 17275.
+const INT8_DOT_PRODUCTS: &[(&str, u8, i32)] = &[
+    ("tdpbssd", 0x6B, -16517), // (-1)(1) + (-128)(2) + (2)(-2) + (127)(-128)
+    ("tdpbsud", 0x6A, 16507),  // (-1)(1) + (-128)(2) + (2)(254) + (127)(128)
+    ("tdpbusd", 0x69, -15749), // (255)(1) + (128)(2) + (2)(-2) + (127)(-128)
+    ("tdpbuud", 0x68, 17275),  // (255)(1) + (128)(2) + (2)(254) + (127)(128)
+];
+
+/// §4n: 1×1 tiles with K = 4 bytes, so tmm0 ends up holding exactly one
+/// dword: the dot product of `INT8_A` and `INT8_B` under the instruction's
+/// signedness. `patches/bochs/0006-amx-int8-byte-signedness.patch` is what
+/// makes the three signed rows pass; `tdpbuud` is the control that was right
+/// all along and must stay so.
+#[test]
+fn int8_dot_products_honor_byte_signedness() {
+    for (name, pp, want) in INT8_DOT_PRODUCTS {
+        let mut cpu = BochsOracle::new();
+        // C = tmm0 (1 row × 4 bytes), A = tmm1 (1 × 4), B = tmm2 (1 row × 4 bytes)
+        cpu.write_mem(CFG_IN, &tilecfg(&[(1, 4), (1, 4), (1, 4)]));
+        cpu.write_mem(TILE_A, &INT8_A);
+        cpu.write_mem(TILE_B, &INT8_B);
+        cpu.write_mem(TILE_OUT, &(STALE as u32).to_le_bytes());
+        cpu.set_gpr(RBX, CFG_IN);
+        cpu.set_gpr(RDI, TILE_A);
+        cpu.set_gpr(RDX, TILE_B);
+        cpu.set_gpr(RCX, TILE_OUT);
+        cpu.set_gpr(RSI, 64);
+        let code = [
+            TILERELEASE.as_slice(),
+            &LDTILECFG_RBX,
+            &TILEZERO_TMM0,
+            &TILELOADD_TMM1_RDI_RSI,
+            &TILELOADD_TMM2_RDX_RSI,
+            &[0xC4, 0xE2, *pp, 0x5E, 0xC1], // tdpb??d tmm0, tmm1, tmm2
+            &TILESTORED_RCX_RSI_TMM0,
+        ]
+        .concat();
+        run(&mut cpu, &code, 7);
+        let got = cpu.read_mem_u64(TILE_OUT) as u32 as i32;
+        assert_eq!(got, *want, "{name} of A={INT8_A:02x?} · B={INT8_B:02x?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The reset contract across instances.
+//
+// `BochsOracle::new()` promises a fresh machine, but the core is a singleton,
+// so everything `reset(BX_RESET_HARDWARE)` does not reset survives from the
+// previous instance. Bochs resets x87, MXCSR, the zmm file and the opmask file
+// (`cpu/init.cc`) but not the AMX unit, so the shim's `enter_long_mode` calls
+// `amx->clear()` itself. These tests load state into one instance, drop it,
+// and read it back from the next — a shim that stopped clearing, or a
+// re-vendor that added a register file nobody resets, shows up as the previous
+// test's data.
+
+/// A `tileloadd`ed tile and its configuration must not survive into the next
+/// oracle: `sttilecfg` reads 64 zero bytes and XSAVE says neither AMX component
+/// is in use. No `tilerelease` here on purpose — that is what the tests above
+/// use to protect themselves from exactly this leak.
+#[test]
+fn a_fresh_oracle_has_no_amx_state_from_its_predecessor() {
+    {
+        let mut cpu = BochsOracle::new();
+        cpu.write_mem(CFG_IN, &tilecfg(&[(16, 64)]));
+        cpu.write_mem(TILE_A, &tile_pattern());
+        cpu.set_gpr(RBX, CFG_IN);
+        cpu.set_gpr(RDI, TILE_A);
+        cpu.set_gpr(RSI, 64);
+        let code = [LDTILECFG_RBX.as_slice(), &TILELOADD_TMM0_RDI_RSI].concat();
+        run(&mut cpu, &code, 2);
+    }
+
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_OUT, &[STALE as u8; 64]);
+    cpu.write_mem(XSAVE_AREA, &vec![0u8; XSAVE_AREA_LEN]);
+    cpu.set_gpr(RCX, CFG_OUT);
+    run(&mut cpu, &STTILECFG_RCX, 1);
+    assert_eq!(read_bytes(&cpu, CFG_OUT, 64), [0u8; 64], "tile configuration leaked");
+
+    cpu.set_gpr(RCX, XSAVE_AREA);
+    cpu.set_gpr(RAX, RFBM_TILES);
+    cpu.set_gpr(RDX, 0);
+    run(&mut cpu, &XSAVE_RCX, 1);
+    let xstate_bv = cpu.read_mem_u64(XSAVE_AREA + XSAVE_XSTATE_BV as u64);
+    assert_eq!(xstate_bv & RFBM_TILES, 0, "tile data leaked: XSTATE_BV = {xstate_bv:#x}");
+}
+
+/// The control: the opmask file *is* reset by Bochs, so this passes without
+/// any help from the shim and pins that a re-vendor keeps it that way.
+#[test]
+fn a_fresh_oracle_has_no_opmask_state_from_its_predecessor() {
+    {
+        let mut cpu = BochsOracle::new();
+        cpu.set_gpr(RCX, 0xFFFF);
+        run(&mut cpu, &[0xC5, 0xF8, 0x92, 0xF9], 1); // kmovw k7, ecx
+    }
+    let mut cpu = BochsOracle::new();
+    run(&mut cpu, &[0xC5, 0xF8, 0x93, 0xC7], 1); // kmovw eax, k7
+    assert_eq!(cpu.get_gpr(RAX), 0, "k7 leaked from the previous oracle");
+}
+
+// ---------------------------------------------------------------------------
+// §4p: a store into code that already executed must retire the cached trace.
+//
+// Trace-cache entries are indexed by `pAddr ^ fetchModeMask`, and upstream's
+// `handleSMC` only walked the 128 entries of the written 128-byte line, which
+// is complete only while `fetchModeMask < 0x80`. `BX_FETCH_MODE_AMX_OK` is bit
+// 7, so with XCR0's tile bits set every trace sat one line over and survived
+// the store; `step_bytes`-style "rewrite the instruction at RIP" then replayed
+// the old instruction. `patches/bochs/0007-icache-smc-walk-fetchmode-bit7.patch`
+// is what makes this pass. It needs no AMX instruction at all — only XCR0 with
+// the tile bits, which the shim sets for every instance.
+
+/// Two `mov rax, imm32` at the same address, one step each. Without the patch
+/// the second step re-executes the first instruction and RAX stays 1.
+#[test]
+fn rewriting_code_at_the_same_address_replaces_the_cached_trace() {
+    let mut cpu = BochsOracle::new();
+    run(&mut cpu, &[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00], 1); // mov rax, 1
+    assert_eq!(cpu.get_gpr(RAX), 1);
+    run(&mut cpu, &[0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00], 1); // mov rax, 2
+    assert_eq!(cpu.get_gpr(RAX), 2, "the trace decoded from the first write was replayed");
+}
+
+/// The same, one instruction into the page: the written line is not line 0,
+/// so the fix's upper bound (`mask << 1`) rather than any incidental walk from
+/// line 0 is what covers the displaced entry.
+#[test]
+fn rewriting_code_in_a_later_page_line_replaces_the_cached_trace() {
+    let mut cpu = BochsOracle::new();
+    let addr = CODE + 0x300; // line 6 of the page
+    for imm in [1u8, 2] {
+        cpu.set_rip(addr);
+        cpu.write_mem(addr, &[0x48, 0xC7, 0xC0, imm, 0x00, 0x00, 0x00]); // mov rax, imm
+        let out = cpu.step();
+        assert!(out.is_retired(), "mov rax, {imm}: {out:?}");
+        assert_eq!(cpu.get_gpr(RAX), u64::from(imm), "line-6 trace was replayed");
     }
 }

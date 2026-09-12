@@ -137,6 +137,13 @@ public:
 public:
   bxICache_c() { flushICacheEntries(); }
 
+  // fetchModeMask is folded into the entry index. Its bits 0..6 keep an entry
+  // within the 128 entries that belong to its own 128-byte page line, but
+  // every bit from bit 7 up (BX_FETCH_MODE_AMX_OK) moves the entry into the
+  // entries of line (n ^ (fetchModeMask >> 7)). handleSMC() has to walk that
+  // far when it looks for the traces a store may have modified.
+#define BX_ICACHE_FETCH_MODE_LINE_SPREAD 1  // (highest fetchModeMask bit) >> 7
+
   BX_CPP_INLINE static unsigned hash(bx_phy_address pAddr, unsigned fetchModeMask)
   {
 //  return ((pAddr + (pAddr << 2) + (pAddr>>6)) & (BxICacheEntries-1)) ^ fetchModeMask;
@@ -252,10 +259,14 @@ BX_CPP_INLINE void bxICache_c::handleSMC(bx_phy_address pAddr, Bit32u mask)
 
   bxICacheEntry_c *e = get_entry(LPFOf(pAddr), 0);
 
+  // entries of a trace starting in line n may sit in the entries of a line up
+  // to BX_ICACHE_FETCH_MODE_LINE_SPREAD above it, see hash()
+  Bit32u walk_mask = mask | (mask << BX_ICACHE_FETCH_MODE_LINE_SPREAD);
+
   // go over 32 "cache lines" of 128 byte each
   for (unsigned n=0; n < 32; n++) {
     Bit32u line_mask = (1 << n);
-    if (line_mask > mask) break;
+    if (line_mask > walk_mask) break;
     for (unsigned index=0; index < 128; index++, e++) {
       if (pAddrIndex == bxPageWriteStampTable::hash(e->pAddr) && (e->traceMask & mask) != 0) {
         flushSMC(e);

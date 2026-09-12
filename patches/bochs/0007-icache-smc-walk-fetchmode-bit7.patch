@@ -1,0 +1,81 @@
+icache: handleSMC must walk the entries a fetchModeMask >= 0x80 hashes a trace into
+
+Trace cache entries are indexed by hash(pAddr, fetchModeMask) =
+(pAddr & (BxICacheEntries-1)) ^ fetchModeMask, and handleSMC() finds the
+traces a store may have modified by walking, for every 128-byte page line the
+store touched, the 128 entries that line's instructions hash to. That walk
+assumed fetchModeMask < 0x80: XOR-ing a value below 128 into the index keeps
+an entry inside its own line's 128 entries. BX_FETCH_MODE_AMX_OK is bit 7
+(0x80), so as soon as XCR0 enables XTILECFG|XTILEDATA every trace lands in
+the entries of the neighbouring line, the walk never reaches it, and a store
+into code that already executed leaves the stale trace in place: the CPU
+keeps executing the old bytes while memory holds the new ones. Any
+self-modifying code under an AMX-enabled OS hits this; this crate hit it the
+moment the shim set XCR0 = 0x600E7, because its step-by-step harness rewrites
+the instruction at RIP between steps (x87 FXRSTOR/FNSTSW sequences read back
+the state of the previously executed instruction).
+
+Extend the walk over the lines an instruction's entry can be displaced into
+(n ^ (fetchModeMask >> 7)); the per-entry traceMask test is unchanged, so
+this only adds entries to look at, never flushes more than before. The hash
+itself is left alone on purpose: nothing flushes the icache when XCR0 or
+CR4.OSXSAVE change, so the mode bits in the index are what keeps a trace
+decoded with AMX_OK clear from being executed once it is set.
+
+Found by this crate's differential suite the day AMX was first compiled into
+the vendored core; see docs/backend-differences.md §4p. Still present on
+upstream master as of 2026-09-12.
+
+The cpu.h hunk only fixes the fetchModeMask bit table in the comment above the
+enum, which listed a non-existent OPMASK_OK and put EVEX_OK/AMX_OK one bit too
+high (bits 7/8; the enum has them at 6/7).
+
+The hunks below are deliberately comment-light, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/icache.h
++++ b/cpu/icache.h
+@@ -137,6 +137,13 @@
+ public:
+   bxICache_c() { flushICacheEntries(); }
+ 
++  // fetchModeMask is folded into the entry index. Its bits 0..6 keep an entry
++  // within the 128 entries that belong to its own 128-byte page line, but
++  // every bit from bit 7 up (BX_FETCH_MODE_AMX_OK) moves the entry into the
++  // entries of line (n ^ (fetchModeMask >> 7)). handleSMC() has to walk that
++  // far when it looks for the traces a store may have modified.
++#define BX_ICACHE_FETCH_MODE_LINE_SPREAD 1  // (highest fetchModeMask bit) >> 7
++
+   BX_CPP_INLINE static unsigned hash(bx_phy_address pAddr, unsigned fetchModeMask)
+   {
+ //  return ((pAddr + (pAddr << 2) + (pAddr>>6)) & (BxICacheEntries-1)) ^ fetchModeMask;
+@@ -252,10 +259,14 @@
+ 
+   bxICacheEntry_c *e = get_entry(LPFOf(pAddr), 0);
+ 
++  // entries of a trace starting in line n may sit in the entries of a line up
++  // to BX_ICACHE_FETCH_MODE_LINE_SPREAD above it, see hash()
++  Bit32u walk_mask = mask | (mask << BX_ICACHE_FETCH_MODE_LINE_SPREAD);
++
+   // go over 32 "cache lines" of 128 byte each
+   for (unsigned n=0; n < 32; n++) {
+     Bit32u line_mask = (1 << n);
+-    if (line_mask > mask) break;
++    if (line_mask > walk_mask) break;
+     for (unsigned index=0; index < 128; index++, e++) {
+       if (pAddrIndex == bxPageWriteStampTable::hash(e->pAddr) && (e->traceMask & mask) != 0) {
+         flushSMC(e);
+--- a/cpu/cpu.h
++++ b/cpu/cpu.h
+@@ -5542,9 +5542,8 @@
+ // bit 3 - FPU and MMX OK
+ // bit 4 - SSE_OK
+ // bit 5 - AVX_OK
+-// bit 6 - OPMASK_OK
+-// bit 7 - EVEX_OK
+-// bit 8 - AMX_OK
++// bit 6 - EVEX_OK
++// bit 7 - AMX_OK
+ //
+ 
+ enum {

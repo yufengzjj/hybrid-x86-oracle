@@ -634,7 +634,7 @@ typedef Bit32u bx_phy_address;
 #define BX_SUPPORT_VMX 2
 #define BX_SUPPORT_AVX 1
 #define BX_SUPPORT_EVEX 1
-#define BX_SUPPORT_AMX 0
+#define BX_SUPPORT_AMX 1
 
 #if BX_SUPPORT_UINTR && BX_SUPPORT_X86_64 == 0
   #error "UINTR require x86-64 support"

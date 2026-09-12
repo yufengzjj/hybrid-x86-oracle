@@ -1,0 +1,26 @@
+STTILECFG: decode at VEX.W0, not VEX.W1
+
+STTILECFG is VEX.128.66.0F38.W0 49 !(11):000:bbb (SDM Vol. 2, and what
+every assembler emits — LLVM/GNU as encode W0). The VEX 0F38 49 opcode group
+bound BX_IA_STTILECFG to ATTR_VEX_W1, so the real instruction never matched
+and raised #UD unconditionally, while LDTILECFG/TILERELEASE/TILEZERO in the
+same group correctly asked for W0.
+
+Found by this crate's differential suite the day AMX was first compiled into
+the vendored core (BX_SUPPORT_AMX had been 0); see docs/backend-differences.md
+§4k. Still present on upstream master as of 2026-09-12.
+
+The hunk below is deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/decoder/fetchdecode_opmap_avx.cc
++++ b/cpu/decoder/fetchdecode_opmap_avx.cc
+@@ -1003,7 +1003,7 @@ static const Bit64u BxOpcodeGroup_VEX_0F3847[] = {
+ static const Bit64u BxOpcodeGroup_VEX_0F3849[] = {
+   form_opcode(ATTR_SSE_NO_PREFIX | ATTR_VEX_W0 | ATTR_VL128 | ATTR_NNN0 | ATTR_RRR0 | ATTR_MODC0 | ATTR_IS64, BX_IA_TILERELEASE),
+   form_opcode(ATTR_SSE_NO_PREFIX | ATTR_VEX_W0 | ATTR_VL128 | ATTR_MOD_MEM | ATTR_IS64, BX_IA_LDTILECFG),
+-  form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W1 | ATTR_VL128 | ATTR_MOD_MEM | ATTR_IS64, BX_IA_STTILECFG),
++  form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W0 | ATTR_VL128 | ATTR_MOD_MEM | ATTR_IS64, BX_IA_STTILECFG),
+   last_opcode(ATTR_SSE_PREFIX_F2 | ATTR_VEX_W0 | ATTR_VL128 | ATTR_RRR0 | ATTR_MODC0 | ATTR_IS64, BX_IA_TILEZERO_Tnnn)
+ };
+

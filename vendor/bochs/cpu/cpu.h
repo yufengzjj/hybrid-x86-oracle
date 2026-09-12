@@ -5542,9 +5542,8 @@ BX_CPP_INLINE Bit32u BX_CPP_AttrRegparmN(1) BX_CPU_C::BxResolve32(bxInstruction_
 // bit 3 - FPU and MMX OK
 // bit 4 - SSE_OK
 // bit 5 - AVX_OK
-// bit 6 - OPMASK_OK
-// bit 7 - EVEX_OK
-// bit 8 - AMX_OK
+// bit 6 - EVEX_OK
+// bit 7 - AMX_OK
 //
 
 enum {
