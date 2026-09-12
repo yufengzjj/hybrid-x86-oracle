@@ -1,0 +1,33 @@
+VPGATHERQD / VGATHERQPS: clear the ymm destination above VL/2 at a zmm index
+
+The q-index d-element gathers return a result half the index width, so the
+EVEX handler VGATHERQPS_MASK_VpsVSib (shared by vpgatherqd) has to zero the
+destination above 256 bits for a zmm index and above 128 for a ymm index
+(SDM: DEST[MAXVL-1:VL/2] := 0). It derived that clear length as `len--`,
+which happens to be right for VL256 (2 -> 1 = BX_VL128) but gives 3 for
+VL512 — a value BX_CLEAR_AVX_REGZ compares against neither BX_VL256 nor
+BX_VL128, so it cleared nothing and bits 256..511 of the ymm destination
+kept whatever the register held before. `len >>= 1` is the intended
+arithmetic (4 -> 2 = BX_VL256, 2 -> 1 = BX_VL128).
+
+The VEX form (VGATHERQPS_VpsHps) is unaffected: its result never exceeds
+xmm and it clears above 128 unconditionally. The d-index and q-element EVEX
+gathers produce full-width results and were correct as well.
+
+Found by this crate's differential suite; see docs/backend-differences.md §4j.
+Still present on upstream master as of 2026-09-12.
+
+The hunk below is deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/avx/gather.cc
++++ b/cpu/avx/gather.cc
+@@ -334,7 +334,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VGATHERQPS_MASK_VpsVSib(bxInstruction_c *i
+ 
+   // ensure correct upper part clearing of the destination register
+   if (len == BX_VL128) dest->vmm64u(1) = 0;
+-  else len--;
++  else len >>= 1;
+ 
+   BX_WRITE_OPMASK(i->opmask(), 0);
+   BX_CLEAR_AVX_REGZ(i->dst(), len);

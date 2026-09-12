@@ -398,6 +398,34 @@ in `sapphire_rapids` either (§2), so this backend cannot reach them. A CPU
 model with AVX10.2 would make them reachable and wrong; noted here so that is
 not rediscovered from scratch.
 
+## 4j. `VPGATHERQD` / `VGATHERQPS` with a zmm index left the ymm destination's upper 256 bits stale — patched (Bochs)
+
+Found by the zens gather/scatter differential suite the day the group landed.
+The q-index d-element gathers produce a result half the index width, so the
+EVEX handler `VGATHERQPS_MASK_VpsVSib` (shared by `vpgatherqd`) must zero the
+destination above 256 bits for a zmm index and above 128 for a ymm index (SDM:
+`DEST[MAXVL-1:VL/2] := 0`). The code derived the clear length as `len--`, which
+is right for VL256 (2 → 1 = BX_VL128) but yields 3 at VL512 — a value
+`BX_CLEAR_AVX_REGZ` matches against neither BX_VL256 nor BX_VL128, so it cleared
+NOTHING and bits 256..511 of the ymm destination kept whatever the register
+held. `len >>= 1` is the intended arithmetic (4 → 2 = BX_VL256).
+
+The VEX form (`VGATHERQPS_VpsHps`) was already correct — its result never
+exceeds xmm and it clears above 128 unconditionally — as were the d-index and
+q-element EVEX gathers, whose results are full width. Only the one VL512
+q-index d-element shape was affected, on both `vpgatherqd` and `vgatherqps`.
+
+Still present on upstream master as of 2026-09-12, so this crate carries the
+fix itself, as
+[`patches/bochs/0003-vpgatherqd-zmm-index-upper-clear.patch`](../patches/bochs/0003-vpgatherqd-zmm-index-upper-clear.patch),
+applied by `scripts/vendor-bochs.sh` like its siblings, and
+`tests/bochs_patches.rs` fails if it ever stops taking effect — on both
+`vpgatherqd` and `vgatherqps` with a zmm index, seeding the destination with
+stale bits so "cleared nothing" is visible, and with a partial mask so a fix
+that zeroed the *whole* register cannot pass either; the ymm-index form is
+asserted alongside as the boundary the fix must not move. zens'
+`test_gather_directed` / `test_gather_templates` cover it downstream.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

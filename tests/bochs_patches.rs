@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g and §4i are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i and §4j are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -232,5 +232,92 @@ fn fp16_truncation_is_toward_zero() {
         // sign-extends only within its own lane.
         let got = if dword { raw as u32 as i32 as i64 } else { raw as i64 };
         assert_eq!(got, -367, "{name} of -367.5 (floor and RN both give -368)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4j: the q-index d-element gathers must zero the destination above VL/2.
+//
+// `vpgatherqd` / `vgatherqps` return a result half the index width, so with a
+// zmm index the destination is a ymm and bits 256..511 must read as zero
+// (SDM: `DEST[MAXVL-1:VL/2] := 0`). Upstream derived that clear length with
+// `len--`, which happens to work for a ymm index (VL256 → VL128) but yields
+// a value `BX_CLEAR_AVX_REGZ` ignores for a zmm index, so the upper half kept
+// whatever the register held. `patches/bochs/0003-vpgatherqd-zmm-index-upper-clear.patch`
+// is what makes `q_index_d_element_gathers_zero_above_vl_half` pass.
+
+const DATA: u64 = 0x20_0000;
+
+/// Stale contents seeded into every chunk of the destination before the gather,
+/// so "nothing was cleared" and "was cleared" read differently.
+const STALE: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+
+/// EVEX.66.0F38.W0 `op` /r with a VSIB of `[rbx + zmm2*4]` (or `ymm2` at
+/// VL256), destination register 1, mask k7. Only the L'L bits change between
+/// the two vector lengths, so the encoding is assembled here rather than copied
+/// from a disassembler for each form.
+fn q_index_gather(op: u8, vl512: bool) -> [u8; 7] {
+    // P2: z=0, L'L, b=0, V'=1 (index bit 4 clear), aaa=111 (k7).
+    let p2 = if vl512 { 0x4F } else { 0x2F };
+    // ModRM 0x0C: mod=00, reg=001, rm=100 (SIB). SIB 0x93: scale=4, index=2, base=rbx.
+    [0x62, 0xF2, 0x7D, p2, op, 0x0C, 0x93]
+}
+
+/// Run one q-index gather: dword `n` of the window at `DATA` holds `0x1000 + n`,
+/// index lane `n` of zmm2 is `n`, zmm1 starts as [`STALE`; 8] and k7 as `mask`.
+/// Returns the final zmm1 and the final k7 (via `kmovw eax, k7`).
+fn run_q_index_gather(op: u8, vl512: bool, mask: u16) -> ([u64; ZMM_CHUNKS], u64) {
+    let mut cpu = BochsOracle::new();
+    let window: Vec<u8> = (0..16u32).flat_map(|n| (0x1000 + n).to_le_bytes()).collect();
+    cpu.write_mem(DATA, &window);
+    cpu.set_gpr(RBX, DATA);
+    cpu.set_gpr(RCX, u64::from(mask));
+    cpu.set_zmm(1, &[STALE; ZMM_CHUNKS]);
+    let index: [u64; ZMM_CHUNKS] = core::array::from_fn(|n| n as u64);
+    cpu.set_zmm(2, &index);
+    let insn = q_index_gather(op, vl512);
+    let mut code = vec![0xC5, 0xF8, 0x92, 0xF9]; // kmovw k7, ecx
+    code.extend_from_slice(&insn);
+    code.extend_from_slice(&[0xC5, 0xF8, 0x93, 0xC7]); // kmovw eax, k7
+    run(&mut cpu, &code, 3);
+    (cpu.get_zmm(1), cpu.get_gpr(RAX))
+}
+
+/// The two rows that share `VGATHERQPS_MASK_VpsVSib`: `(mnemonic, opcode)`.
+const Q_INDEX_D_ELEMENT: &[(&str, u8)] = &[("vpgatherqd", 0x91), ("vgatherqps", 0x93)];
+
+/// §4j proper: with a zmm index the eight gathered dwords fill bits 0..255 and
+/// the stale upper half must be gone. The mask leaves lanes 1 and 6 unselected
+/// so the merge into the *live* half is checked in the same breath — a fix
+/// that zeroed the whole register would fail here too.
+#[test]
+fn q_index_d_element_gathers_zero_above_vl_half() {
+    for (name, op) in Q_INDEX_D_ELEMENT {
+        let mask = 0b1011_1101u16;
+        let (zmm1, k7) = run_q_index_gather(*op, true, mask);
+        let lane = |n: usize| (zmm1[n / 2] >> (32 * (n % 2))) as u32;
+        for n in 0..8 {
+            let want = if mask & (1 << n) != 0 { 0x1000 + n as u32 } else { STALE as u32 };
+            assert_eq!(lane(n), want, "{name} zmm-index: dword lane {n} of {zmm1:x?}");
+        }
+        assert_eq!(&zmm1[4..], &[0; 4], "{name} zmm-index: bits 256..511 of {zmm1:x?}");
+        assert_eq!(k7, 0, "{name}: k7 is cleared once every lane is done");
+    }
+}
+
+/// The length the fix must NOT break: a ymm index gives an xmm result, and
+/// upstream's arithmetic was right there. `len >>= 1` and `len--` agree at
+/// VL256, so this only guards the boundary; the test above is the bug.
+#[test]
+fn q_index_d_element_gathers_zero_above_128_with_ymm_index() {
+    for (name, op) in Q_INDEX_D_ELEMENT {
+        let (zmm1, k7) = run_q_index_gather(*op, false, 0b1111);
+        assert_eq!(
+            &zmm1[..2],
+            &[0x0000_1001_0000_1000, 0x0000_1003_0000_1002],
+            "{name} ymm-index: gathered lanes of {zmm1:x?}"
+        );
+        assert_eq!(&zmm1[2..], &[0; 6], "{name} ymm-index: bits 128..511 of {zmm1:x?}");
+        assert_eq!(k7, 0, "{name}: k7 is cleared once every lane is done");
     }
 }
