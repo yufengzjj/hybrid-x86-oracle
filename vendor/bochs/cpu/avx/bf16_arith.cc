@@ -68,7 +68,11 @@ int bf16_compare(bfloat16 a, bfloat16 b) {
 }
 
 bfloat16 bf16_mulAdd(bfloat16 a, bfloat16 b, bfloat16 c, uint8_t op) {
-  return convert_ne_fp32_to_bfloat16(f32_mulAdd(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), convert_bfloat16_to_fp32(c), op, &tmp_status));
+  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
+  status.softfloat_roundingMode = softfloat_round_to_zero;
+  float32 r = f32_mulAdd(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), convert_bfloat16_to_fp32(c), op, &status);
+  if (status.softfloat_exceptionFlags & softfloat_flag_inexact) r |= 1; // raw: the ne status suppresses every flag from getExceptionFlags
+  return convert_ne_fp32_to_bfloat16(r);
 }
 
 bfloat16 bf16_getExp(bfloat16 a) {

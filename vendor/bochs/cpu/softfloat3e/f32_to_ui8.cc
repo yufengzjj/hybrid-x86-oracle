@@ -54,18 +54,10 @@ uint8_t f32_to_ui8(float32 a, uint8_t roundingMode, bool exact, bool saturate, s
     sig  = fracF32UI(a);
     /*------------------------------------------------------------------------
     *------------------------------------------------------------------------*/
-#if (ui32_fromNaN != ui32_fromPosOverflow) || (ui32_fromNaN != ui32_fromNegOverflow)
     if ((exp == 0xFF) && sig) {
-#if (ui32_fromNaN == ui32_fromPosOverflow)
-        sign = 0;
-#elif (ui32_fromNaN == ui32_fromNegOverflow)
-        sign = 1;
-#else
         softfloat_raiseFlags(status, softfloat_flag_invalid);
         return saturate ? 0 : ui8_fromNaN;
-#endif
     }
-#endif
     /*------------------------------------------------------------------------
     *------------------------------------------------------------------------*/
     shiftDist = 0x8E - exp;

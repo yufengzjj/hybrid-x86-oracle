@@ -165,7 +165,7 @@ float16 f16_minmax(float16 a, float16 b, int op_select, int sign_ctrl, bool prop
     if (! f16_isNaN(z)) {
         switch(sign_ctrl) {
         case 0:
-            z = (z & ~0x8000) | (a & 0x8000); // keep sign of a
+            if (! aIsNaN) z = (z & ~0x8000) | (a & 0x8000); // keep sign of a (not of a NaN a)
             break;
         case 1:
             break; // preserve sign of compare result

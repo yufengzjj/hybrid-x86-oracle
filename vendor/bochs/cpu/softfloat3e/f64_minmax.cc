@@ -165,7 +165,7 @@ float64 f64_minmax(float64 a, float64 b, int op_select, int sign_ctrl, bool prop
     if (! f64_isNaN(z)) {
         switch(sign_ctrl) {
         case 0:
-            z = (z & ~UINT64_C(0x8000000000000000)) | (a & UINT64_C(0x8000000000000000)); // keep sign of a
+            if (! aIsNaN) z = (z & ~UINT64_C(0x8000000000000000)) | (a & UINT64_C(0x8000000000000000)); // keep sign of a (not of a NaN a)
             break;
         case 1:
             break; // preserve sign of compare result

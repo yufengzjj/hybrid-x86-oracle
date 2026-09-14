@@ -204,6 +204,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCOMISBF16_VshWshR(bxInstruction_c *i)
   BX_NEXT_INSTR(i);
 }
 
+static BX_CPP_INLINE Bit16u bf16_to_i8_saturate_zx(bfloat16 a) { return (Bit8u) bf16_to_i8_saturate(a); }
+static BX_CPP_INLINE Bit16u bf16_to_i8_round_to_zero_saturate_zx(bfloat16 a) { return (Bit8u) bf16_to_i8_round_to_zero_saturate(a); }
+
 #define AVX10_CVT_NE_16_TO_16(HANDLER, func)                                                \
   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
   {                                                                                         \
@@ -220,9 +223,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCOMISBF16_VshWshR(bxInstruction_c *i)
 
 AVX10_CVT_NE_16_TO_16(VRCPPBF16_VphWphR, bfloat16_approximate_rcp14) // AVX 10.2
 AVX10_CVT_NE_16_TO_16(VRSQRTPBF16_VphWphR, bfloat16_approximate_rsqrt14) // AVX 10.2
-AVX10_CVT_NE_16_TO_16(VCVTBF162IBS_V8bWphR, bf16_to_i8_saturate) // AVX 10.2
+AVX10_CVT_NE_16_TO_16(VCVTBF162IBS_V8bWphR, bf16_to_i8_saturate_zx) // AVX 10.2
 AVX10_CVT_NE_16_TO_16(VCVTBF162IUBS_V8bWphR, bf16_to_ui8_saturate) // AVX 10.2
-AVX10_CVT_NE_16_TO_16(VCVTTBF162IBS_V8bWphR, bf16_to_i8_round_to_zero_saturate) // AVX 10.2
+AVX10_CVT_NE_16_TO_16(VCVTTBF162IBS_V8bWphR, bf16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
 AVX10_CVT_NE_16_TO_16(VCVTTBF162IUBS_V8bWphR, bf16_to_ui8_round_to_zero_saturate) // AVX 10.2
 
 #define AVX10_CVT_NE_16_TO_16_MASK(HANDLER, func)                                           \
@@ -253,9 +256,9 @@ AVX10_CVT_NE_16_TO_16(VCVTTBF162IUBS_V8bWphR, bf16_to_ui8_round_to_zero_saturate
 
 AVX10_CVT_NE_16_TO_16_MASK(VRCPPBF16_MASK_VphWphR, bfloat16_approximate_rcp14) // AVX 10.2
 AVX10_CVT_NE_16_TO_16_MASK(VRSQRTPBF16_MASK_VphWphR, bfloat16_approximate_rsqrt14) // AVX 10.2
-AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IBS_MASK_V8bWphR, bf16_to_i8_saturate) // AVX 10.2
+AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IBS_MASK_V8bWphR, bf16_to_i8_saturate_zx) // AVX 10.2
 AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IUBS_MASK_V8bWphR, bf16_to_ui8_saturate) // AVX 10.2
-AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IBS_MASK_V8bWphR, bf16_to_i8_round_to_zero_saturate) // AVX 10.2
+AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IBS_MASK_V8bWphR, bf16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
 AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IUBS_MASK_V8bWphR, bf16_to_ui8_round_to_zero_saturate) // AVX 10.2
 
 #endif

@@ -1,0 +1,512 @@
+AVX10.2: saturating byte converts (NaN response and element zero-extension), VMINMAX sign control on a NaN src1, BF16 FMA (single rounding, operand roles), VCOMXSS/VCOMXSD opmap swap, VCVT2PH2{B,H}F8 upper-half mask, VMOVRS mask rows
+
+Eight defects found while diffing an independent model of the AVX10.2 group
+against the emulator; each is pinned by the Intel AVX10.2 Architecture
+Specification (361050-007) text quoted below.
+
+1. VCVT[T]{PS,PH,BF16}2IBS wrote the converted signed byte SIGN-extended into
+   its 32/16-bit element: the handler macros assign the int8_t result of
+   f32_to_i8_saturate / f16_to_i8_saturate / bf16_to_i8_saturate to a Bit32u /
+   Bit16u lane. The spec: "The downconverted 8-bit result is written in place
+   at the lower 8-bit of the corresponding 32-bit element. The upper 3 bytes
+   are zeroed" (and "The upper byte is zeroed" for the 16-bit forms). Every
+   negative result was wrong (-1 became 0xFFFFFFFF instead of 0x000000FF).
+   Fixed with zero-extending wrappers bound to the twelve signed handlers; the
+   unsigned forms already returned a uint8_t.
+
+2. f32_to_i8 / f32_to_ui8 (the ROUNDING converts behind VCVTPS2I[U]BS and
+   VCVTBF162I[U]BS) skipped their NaN check entirely: the guard was written
+   against the i32_/ui32_ specialize constants, which are all equal, so the
+   whole #if block compiled out and a NaN fell through to the overflow path,
+   returning +127/-128 (0xFF/0) by sign. The spec: "For NaN, (0) is returned"
+   - as the truncating _r_minMag siblings and the f16 versions already do.
+   Fixed by making the check unconditional like f16_to_i8.
+
+3. f{16,32,64}_minmax with sign control 0b00 (take the sign of src1) copied
+   src1's sign onto a NUMBER result when src1 was the NaN and the operation was
+   a *Number variant (the NaN is discarded, the other operand returned). The
+   spec: "The sign control indication ignores NAN signs: it does not manipulate
+   the sign if the result is a NAN, and does not copy the sign of SRC1 (for
+   sign control=0b00) if SRC1 is a NAN" (table 11.4: qNaN1/sNaN1 with Norm2 ->
+   Norm2, "Imm8[3:2]==0b00 ignored"). Fixed by skipping case 0 when a is NaN.
+
+4. bf16_mulAdd (all twelve VF[N]M{ADD,SUB}{132,213,231}BF16) rounded twice:
+   f32_mulAdd rounded the exact a*b+c to 24 bits, convert_ne_fp32_to_bfloat16
+   rounded again to 8. When the 16-bit exact product sits on a bf16 midpoint
+   and the addend is smaller than half an f32 ulp of it, the first rounding
+   loses the addend and the second rounds the tie to even where the true
+   result was strictly above/below the midpoint. The spec describes the
+   operation on "the negated infinite precision intermediate product" with
+   RNE - one rounding. The other bf16 helpers are safe (an 8x8-bit product is
+   exact in f32; a sum, quotient or square root of 8-bit operands can never
+   land within f32 rounding distance of a bf16 midpoint), so only the FMA is
+   changed: f32_mulAdd under round-to-zero with the inexact flag jammed into
+   the result's LSB (round-to-odd at 24 bits), then the existing RNE narrowing
+   - the classic exact double-rounding-free construction since 24 >= 8 + 2.
+
+5. The twenty-four VF[N]M{ADD,SUB}{132,213,231}BF16 rows (plain and masked)
+   were bound to HANDLE_AVX_3OP / HANDLE_AVX512_3OP_WORD_EL_MASK, the
+   ACCUMULATE-shaped templates whose first lane operand is the DESTINATION
+   register and which never read src3. The rows list their operands in the
+   FMA3 role order the fp16 rows use (dst, src1, src2, src3), so every form
+   computed the wrong product: 132 gave dst*dst+rm, 213 gave dst*vvvv+dst,
+   231 gave dst*vvvv+rm (probe: dst=2, vvvv=3, rm=5 -> 9/8/11 instead of
+   13/11/17). New HANDLE_AVX_3SRC / HANDLE_AVX512_3SRC_WORD_EL_MASK templates
+   read src1/src2/src3 like HANDLE_AVX_PFP_3OP does, and the rows are rebound.
+
+6. The EVEX 0F 2E / 0F 2F opmap rows swapped the two scalar-size AVX10.2
+   compares: F3.W0 (the spec's VCOMXSS / VUCOMXSS encoding) dispatched
+   VCOMXSD / VUCOMXSD and F2.W1 (VCOMXSD / VUCOMXSD) dispatched VCOMXSS /
+   VUCOMXSS, so a `vcomxss` compared the low QWORDS as doubles: NaN vs 1.0
+   came out "greater" (all flags clear) because 0x7FC00000 and 0x3F800000 are
+   both tiny positive doubles. The IA names are swapped back; the handlers and
+   the ia_opcodes_evex.def rows were already right.
+
+7. VCVT2PH2BF8[S] / VCVT2PH2HF8[S] walk their 2*KL byte lanes with a Bit32u
+   lane bit and a 32-bit opmask read. At VL512 there are 64 lanes: the lane
+   bit shifts out after 32 iterations, so the upper half - every byte that
+   comes from src1 - was never written and the destination kept its old
+   bytes, masked or not. Bit64u and the 64-bit opmask read fix it.
+
+8. The MAP5 6F opmap group (VMOVRS{B,W,D,Q}) carries ATTR_MASK_K0 on its
+   _Kmask rows and no mask attribute on the plain rows - the reverse of every
+   other group (ATTR_MASK_K0 marks the row that matches an ABSENT mask). A
+   masked vmovrs therefore matched the plain row and ran the unmasked loader:
+   `vmovrsd xmm1 {k7}, [mem]` with k7 = 0b0101 loaded all four dwords, {z}
+   forms zeroed nothing. The attributes are moved to the plain rows.
+
+Found 2026-09-14 by the hybrid-x86-oracle differential harness diffing the
+zens model of the AVX10.2 group. All eight are present on upstream master as
+of 2026-09-14.
+
+The hunks below are deliberately comment-free apart from one-line notes, so
+that this file can be sent upstream as-is.
+
+diff --git a/cpu/avx/avx10_2_bf16.cc b/cpu/avx/avx10_2_bf16.cc
+index 6b401be..abe3da2 100644
+--- a/cpu/avx/avx10_2_bf16.cc
++++ b/cpu/avx/avx10_2_bf16.cc
+@@ -204,6 +204,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCOMISBF16_VshWshR(bxInstruction_c *i)
+   BX_NEXT_INSTR(i);
+ }
+ 
++static BX_CPP_INLINE Bit16u bf16_to_i8_saturate_zx(bfloat16 a) { return (Bit8u) bf16_to_i8_saturate(a); }
++static BX_CPP_INLINE Bit16u bf16_to_i8_round_to_zero_saturate_zx(bfloat16 a) { return (Bit8u) bf16_to_i8_round_to_zero_saturate(a); }
++
+ #define AVX10_CVT_NE_16_TO_16(HANDLER, func)                                                \
+   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
+   {                                                                                         \
+@@ -220,9 +223,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCOMISBF16_VshWshR(bxInstruction_c *i)
+ 
+ AVX10_CVT_NE_16_TO_16(VRCPPBF16_VphWphR, bfloat16_approximate_rcp14) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16(VRSQRTPBF16_VphWphR, bfloat16_approximate_rsqrt14) // AVX 10.2
+-AVX10_CVT_NE_16_TO_16(VCVTBF162IBS_V8bWphR, bf16_to_i8_saturate) // AVX 10.2
++AVX10_CVT_NE_16_TO_16(VCVTBF162IBS_V8bWphR, bf16_to_i8_saturate_zx) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16(VCVTBF162IUBS_V8bWphR, bf16_to_ui8_saturate) // AVX 10.2
+-AVX10_CVT_NE_16_TO_16(VCVTTBF162IBS_V8bWphR, bf16_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX10_CVT_NE_16_TO_16(VCVTTBF162IBS_V8bWphR, bf16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16(VCVTTBF162IUBS_V8bWphR, bf16_to_ui8_round_to_zero_saturate) // AVX 10.2
+ 
+ #define AVX10_CVT_NE_16_TO_16_MASK(HANDLER, func)                                           \
+@@ -253,9 +256,9 @@ AVX10_CVT_NE_16_TO_16(VCVTTBF162IUBS_V8bWphR, bf16_to_ui8_round_to_zero_saturate
+ 
+ AVX10_CVT_NE_16_TO_16_MASK(VRCPPBF16_MASK_VphWphR, bfloat16_approximate_rcp14) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16_MASK(VRSQRTPBF16_MASK_VphWphR, bfloat16_approximate_rsqrt14) // AVX 10.2
+-AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IBS_MASK_V8bWphR, bf16_to_i8_saturate) // AVX 10.2
++AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IBS_MASK_V8bWphR, bf16_to_i8_saturate_zx) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16_MASK(VCVTBF162IUBS_MASK_V8bWphR, bf16_to_ui8_saturate) // AVX 10.2
+-AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IBS_MASK_V8bWphR, bf16_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IBS_MASK_V8bWphR, bf16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX10_CVT_NE_16_TO_16_MASK(VCVTTBF162IUBS_MASK_V8bWphR, bf16_to_ui8_round_to_zero_saturate) // AVX 10.2
+ 
+ #endif
+diff --git a/cpu/avx/avx10_2_cvt_fp8.cc b/cpu/avx/avx10_2_cvt_fp8.cc
+index b77fad0..0a41f86 100644
+--- a/cpu/avx/avx10_2_cvt_fp8.cc
++++ b/cpu/avx/avx10_2_cvt_fp8.cc
+@@ -72,7 +72,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2BF8_Vf8HdqWphR(bxInstruction_c *i)
+   bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8S_Vf8HdqWph_Kmask);
+   unsigned n = 0;
+ 
+-  Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
++  Bit64u mask, opmask = i->opmask() ? BX_READ_OPMASK(i->opmask()) : (Bit64u) -1; // 64 byte lanes at VL512
+ 
+   // first half of the elements come from src2
+   for (mask = 0x1; n < num_elements_from_source; n++, mask <<= 1) {
+@@ -152,7 +152,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2HF8_Vf8HdqWphR(bxInstruction_c *i)
+   bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8S_Vf8HdqWph_Kmask);
+   unsigned n = 0;
+ 
+-  Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
++  Bit64u mask, opmask = i->opmask() ? BX_READ_OPMASK(i->opmask()) : (Bit64u) -1; // 64 byte lanes at VL512
+ 
+   // first half of the elements come from src2
+   for (mask = 0x1; n < num_elements_from_source; n++, mask <<= 1) {
+diff --git a/cpu/avx/avx512_cvt.cc b/cpu/avx/avx512_cvt.cc
+index 93e3b9f..ba69971 100644
+--- a/cpu/avx/avx512_cvt.cc
++++ b/cpu/avx/avx512_cvt.cc
+@@ -272,6 +272,9 @@ AVX512_CVT64_TO_32_MASK(VCVTTPD2UDQS_MASK_VdqWpdR, f64_to_ui32_round_to_zero_sat
+ AVX512_CVT64_TO_32_MASK(VCVTQQ2PS_MASK_VpsWdqR, i64_to_f32)
+ AVX512_CVT64_TO_32_MASK(VCVTUQQ2PS_MASK_VpsWdqR, ui64_to_f32)
+ 
++static BX_CPP_INLINE Bit32u f32_to_i8_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_saturate(a, status); }
++static BX_CPP_INLINE Bit32u f32_to_i8_round_to_zero_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_round_to_zero_saturate(a, status); }
++
+ #define AVX512_CVT32_TO_32_MASK(HANDLER, func)                                              \
+   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
+   {                                                                                         \
+@@ -311,9 +314,9 @@ AVX512_CVT32_TO_32_MASK(VCVTTPS2UDQ_MASK_VdqWpsR, f32_to_ui32_round_to_zero)
+ AVX512_CVT32_TO_32_MASK(VCVTTPS2UDQS_MASK_VdqWpsR, f32_to_ui32_round_to_zero_saturate) // AVX 10.2
+ AVX512_CVT32_TO_32_MASK(VCVTDQ2PS_MASK_VpsWdqR, i32_to_f32)
+ AVX512_CVT32_TO_32_MASK(VCVTUDQ2PS_MASK_VpsWdqR, ui32_to_f32)
+-AVX512_CVT32_TO_32_MASK(VCVTPS2IBS_MASK_V8bWpsR, f32_to_i8_saturate) // AVX 10.2
++AVX512_CVT32_TO_32_MASK(VCVTPS2IBS_MASK_V8bWpsR, f32_to_i8_saturate_zx) // AVX 10.2
+ AVX512_CVT32_TO_32_MASK(VCVTPS2IUBS_MASK_V8bWpsR, f32_to_ui8_saturate) // AVX 10.2
+-AVX512_CVT32_TO_32_MASK(VCVTTPS2IBS_MASK_V8bWpsR, f32_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX512_CVT32_TO_32_MASK(VCVTTPS2IBS_MASK_V8bWpsR, f32_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX512_CVT32_TO_32_MASK(VCVTTPS2IUBS_MASK_V8bWpsR, f32_to_ui8_round_to_zero_saturate) // AVX 10.2
+ 
+ #define AVX512_CVT64_TO_64(HANDLER, func)                                                   \
+diff --git a/cpu/avx/avx512_cvt16.cc b/cpu/avx/avx512_cvt16.cc
+index c9f057a..d2025d4 100644
+--- a/cpu/avx/avx512_cvt16.cc
++++ b/cpu/avx/avx512_cvt16.cc
+@@ -463,6 +463,9 @@ AVX512_CVT32_TO_16_MASK(VCVTPS2PHX_MASK_VphWpsR, f32_to_f16)
+ AVX512_CVT32_TO_16_MASK(VCVTDQ2PH_MASK_VphWdqR, i32_to_f16)
+ AVX512_CVT32_TO_16_MASK(VCVTUDQ2PH_MASK_VphWdqR, ui32_to_f16)
+ 
++static BX_CPP_INLINE Bit16u f16_to_i8_saturate_zx(float16 a, softfloat_status_t *status) { return (Bit8u) f16_to_i8_saturate(a, status); }
++static BX_CPP_INLINE Bit16u f16_to_i8_round_to_zero_saturate_zx(float16 a, softfloat_status_t *status) { return (Bit8u) f16_to_i8_round_to_zero_saturate(a, status); }
++
+ #define AVX512_CVT16_TO_16(HANDLER, func)                                                   \
+   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
+   {                                                                                         \
+@@ -487,9 +490,9 @@ AVX512_CVT16_TO_16(VCVTTPH2UW_VdqWphR, f16_to_ui16_round_to_zero)
+ AVX512_CVT16_TO_16(VCVTTPH2W_VdqWphR, f16_to_i16_round_to_zero)
+ AVX512_CVT16_TO_16(VCVTUW2PH_VphWdqR, ui16_to_f16)
+ AVX512_CVT16_TO_16(VCVTW2PH_VphWdqR, i16_to_f16)
+-AVX512_CVT16_TO_16(VCVTPH2IBS_V8bWphR, f16_to_i8_saturate) // AVX 10.2
++AVX512_CVT16_TO_16(VCVTPH2IBS_V8bWphR, f16_to_i8_saturate_zx) // AVX 10.2
+ AVX512_CVT16_TO_16(VCVTPH2IUBS_V8bWphR, f16_to_ui8_saturate) // AVX 10.2
+-AVX512_CVT16_TO_16(VCVTTPH2IBS_V8bWphR, f16_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX512_CVT16_TO_16(VCVTTPH2IBS_V8bWphR, f16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX512_CVT16_TO_16(VCVTTPH2IUBS_V8bWphR, f16_to_ui8_round_to_zero_saturate) // AVX 10.2
+ 
+ #define AVX512_CVT16_TO_16_MASK(HANDLER, func)                                              \
+@@ -529,9 +532,9 @@ AVX512_CVT16_TO_16_MASK(VCVTTPH2UW_MASK_VdqWphR, f16_to_ui16_round_to_zero)
+ AVX512_CVT16_TO_16_MASK(VCVTTPH2W_MASK_VdqWphR, f16_to_i16_round_to_zero)
+ AVX512_CVT16_TO_16_MASK(VCVTUW2PH_MASK_VphWdqR, ui16_to_f16)
+ AVX512_CVT16_TO_16_MASK(VCVTW2PH_MASK_VphWdqR, i16_to_f16)
+-AVX512_CVT16_TO_16_MASK(VCVTPH2IBS_MASK_V8bWphR, f16_to_i8_saturate) // AVX 10.2
++AVX512_CVT16_TO_16_MASK(VCVTPH2IBS_MASK_V8bWphR, f16_to_i8_saturate_zx) // AVX 10.2
+ AVX512_CVT16_TO_16_MASK(VCVTPH2IUBS_MASK_V8bWphR, f16_to_ui8_saturate) // AVX 10.2
+-AVX512_CVT16_TO_16_MASK(VCVTTPH2IBS_MASK_V8bWphR, f16_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX512_CVT16_TO_16_MASK(VCVTTPH2IBS_MASK_V8bWphR, f16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX512_CVT16_TO_16_MASK(VCVTTPH2IUBS_MASK_V8bWphR, f16_to_ui8_round_to_zero_saturate) // AVX 10.2
+ 
+ #define AVX512_CVT16_TO_32(HANDLER, func)                                                   \
+diff --git a/cpu/avx/avx_cvt.cc b/cpu/avx/avx_cvt.cc
+index c2dc502..6579e4d 100644
+--- a/cpu/avx/avx_cvt.cc
++++ b/cpu/avx/avx_cvt.cc
+@@ -158,6 +158,9 @@ AVX_CVT64_TO_32(VCVTQQ2PS_VpsWdqR, i64_to_f32)
+ AVX_CVT64_TO_32(VCVTUQQ2PS_VpsWdqR, ui64_to_f32)
+ #endif
+ 
++static BX_CPP_INLINE Bit32u f32_to_i8_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_saturate(a, status); }
++static BX_CPP_INLINE Bit32u f32_to_i8_round_to_zero_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_round_to_zero_saturate(a, status); }
++
+ #define AVX_CVT32_TO_32(HANDLER, func)                                                      \
+   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
+   {                                                                                         \
+@@ -185,9 +188,9 @@ AVX_CVT32_TO_32(VCVTPS2UDQ_VdqWpsR, f32_to_ui32)
+ AVX_CVT32_TO_32(VCVTTPS2UDQ_VdqWpsR, f32_to_ui32_round_to_zero)
+ AVX_CVT32_TO_32(VCVTTPS2UDQS_VdqWpsR, f32_to_ui32_round_to_zero_saturate) // AVX 10.2
+ AVX_CVT32_TO_32(VCVTUDQ2PS_VpsWdqR, ui32_to_f32)
+-AVX_CVT32_TO_32(VCVTPS2IBS_V8bWpsR, f32_to_i8_saturate) // AVX 10.2
++AVX_CVT32_TO_32(VCVTPS2IBS_V8bWpsR, f32_to_i8_saturate_zx) // AVX 10.2
+ AVX_CVT32_TO_32(VCVTPS2IUBS_V8bWpsR, f32_to_ui8_saturate) // AVX 10.2
+-AVX_CVT32_TO_32(VCVTTPS2IBS_V8bWpsR, f32_to_i8_round_to_zero_saturate) // AVX 10.2
++AVX_CVT32_TO_32(VCVTTPS2IBS_V8bWpsR, f32_to_i8_round_to_zero_saturate_zx) // AVX 10.2
+ AVX_CVT32_TO_32(VCVTTPS2IUBS_V8bWpsR, f32_to_ui8_round_to_zero_saturate) // AVX 10.2
+ #endif
+ 
+diff --git a/cpu/avx/bf16_arith.cc b/cpu/avx/bf16_arith.cc
+index 4e5e621..c6ee45e 100644
+--- a/cpu/avx/bf16_arith.cc
++++ b/cpu/avx/bf16_arith.cc
+@@ -68,7 +68,11 @@ int bf16_compare(bfloat16 a, bfloat16 b) {
+ }
+ 
+ bfloat16 bf16_mulAdd(bfloat16 a, bfloat16 b, bfloat16 c, uint8_t op) {
+-  return convert_ne_fp32_to_bfloat16(f32_mulAdd(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), convert_bfloat16_to_fp32(c), op, &tmp_status));
++  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
++  status.softfloat_roundingMode = softfloat_round_to_zero;
++  float32 r = f32_mulAdd(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), convert_bfloat16_to_fp32(c), op, &status);
++  if (status.softfloat_exceptionFlags & softfloat_flag_inexact) r |= 1; // raw: the ne status suppresses every flag from getExceptionFlags
++  return convert_ne_fp32_to_bfloat16(r);
+ }
+ 
+ bfloat16 bf16_getExp(bfloat16 a) {
+diff --git a/cpu/cpu.h b/cpu/cpu.h
+index 027d696..89e7c88 100644
+--- a/cpu/cpu.h
++++ b/cpu/cpu.h
+@@ -2759,6 +2759,8 @@ public: // for now...
+   BX_SMF void HANDLE_AVX_2OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+   template <simd_xmm_3op func>
+   BX_SMF void HANDLE_AVX_3OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
++  template <simd_xmm_3op func>
++  BX_SMF void HANDLE_AVX_3SRC(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+ 
+   template <xmm_pfp_1op func>
+   BX_SMF void HANDLE_AVX_PFP_1OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+@@ -3215,6 +3217,8 @@ public: // for now...
+   BX_SMF void HANDLE_AVX512_3OP_DWORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+   template <simd_xmm_3op func>
+   BX_SMF void HANDLE_AVX512_3OP_WORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
++  template <simd_xmm_3op func>
++  BX_SMF void HANDLE_AVX512_3SRC_WORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+ 
+   template <simd_xmm_shift func>
+   BX_SMF void HANDLE_AVX512_PSHIFT_QWORD_EL_MASK(bxInstruction_c *i) BX_CPP_AttrRegparmN(1);
+diff --git a/cpu/cpu_templates.h b/cpu/cpu_templates.h
+index a1d54a1..847ad76 100644
+--- a/cpu/cpu_templates.h
++++ b/cpu/cpu_templates.h
+@@ -114,6 +114,20 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_3OP(bxInstruction_c *i)
+   BX_NEXT_INSTR(i);
+ }
+ 
++template <simd_xmm_3op func>
++void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_3SRC(bxInstruction_c *i)
++{
++  /* AVX instruction with three SOURCE operands (the FMA3 layout: op1 is src1, not the destination) */
++  BxPackedAvxRegister op1 = BX_READ_AVX_REG(i->src1());
++  unsigned len = i->getVL(), src2 = i->src2(), src3 = i->src3();
++
++  for (unsigned n=0; n < len; n++)
++    (func)(&op1.vmm128(n), &BX_READ_AVX_REG_LANE(src2, n), &BX_READ_AVX_REG_LANE(src3, n));
++
++  BX_WRITE_AVX_REGZ(i->dst(), op1, len);
++  BX_NEXT_INSTR(i);
++}
++
+ template <simd_xmm_shift func>
+ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_SHIFT_IMM(bxInstruction_c *i)
+ {
+@@ -255,6 +269,20 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK(bxInstructi
+   BX_NEXT_INSTR(i);
+ }
+ 
++template <simd_xmm_3op func>
++void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK(bxInstruction_c *i)
++{
++  /* AVX-512 instruction with three SOURCE operands working on WORD elements (the FMA3 layout) */
++  BxPackedAvxRegister op1 = BX_READ_AVX_REG(i->src1());
++  unsigned len = i->getVL(), src2 = i->src2(), src3 = i->src3();
++
++  for (unsigned n=0; n < len; n++)
++    (func)(&op1.vmm128(n), &BX_READ_AVX_REG_LANE(src2, n), &BX_READ_AVX_REG_LANE(src3, n));
++
++  avx512_write_regw_masked(i, &op1, len, BX_READ_32BIT_OPMASK(i->opmask()));
++  BX_NEXT_INSTR(i);
++}
++
+ template <simd_xmm_shift func>
+ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_SHIFT_IMM_WORD_EL_MASK(bxInstruction_c *i)
+ {
+diff --git a/cpu/decoder/fetchdecode_opmap_evex.cc b/cpu/decoder/fetchdecode_opmap_evex.cc
+index 2717c77..b7aac0c 100644
+--- a/cpu/decoder/fetchdecode_opmap_evex.cc
++++ b/cpu/decoder/fetchdecode_opmap_evex.cc
+@@ -148,15 +148,15 @@ static const Bit64u BxOpcodeGroup_EVEX_0F2D[] = {
+ static const Bit64u BxOpcodeGroup_EVEX_0F2E[] = {
+   form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_NO_PREFIX, BX_IA_EVEX_VUCOMISS_VssWss),
+   form_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_66, BX_IA_EVEX_VUCOMISD_VsdWsd),
+-  form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F3, BX_IA_EVEX_VUCOMXSD_VsdWsd),
+-  last_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F2, BX_IA_EVEX_VUCOMXSS_VssWss)
++  form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F3, BX_IA_EVEX_VUCOMXSS_VssWss),
++  last_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F2, BX_IA_EVEX_VUCOMXSD_VsdWsd)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_EVEX_0F2F[] = {
+   form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_NO_PREFIX, BX_IA_EVEX_VCOMISS_VssWss),
+   form_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_66, BX_IA_EVEX_VCOMISD_VsdWsd),
+-  form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F3, BX_IA_EVEX_VCOMXSD_VsdWsd),
+-  last_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F2, BX_IA_EVEX_VCOMXSS_VssWss)
++  form_opcode(ATTR_VEX_W0 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F3, BX_IA_EVEX_VCOMXSS_VssWss),
++  last_opcode(ATTR_VEX_W1 | ATTR_MASK_K0 | ATTR_SSE_PREFIX_F2, BX_IA_EVEX_VCOMXSD_VsdWsd)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_EVEX_0F51[] = {
+@@ -2150,14 +2150,14 @@ static const Bit64u BxOpcodeGroup_EVEX_MAP5_6E[] = {
+ };
+ 
+ static const Bit64u BxOpcodeGroup_EVEX_MAP5_6F[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3,                BX_IA_EVEX_VMOVRSD_VdqWdq),
+-  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSD_VdqWdq_Kmask),
+-  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3,                BX_IA_EVEX_VMOVRSQ_VdqWdq),
+-  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSQ_VdqWdq_Kmask),
+-  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2,                BX_IA_EVEX_VMOVRSB_VdqWdq),
+-  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSB_VdqWdq_Kmask),
+-  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2,                BX_IA_EVEX_VMOVRSW_VdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSW_VdqWdq_Kmask)
++  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSD_VdqWdq),
++  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3,                BX_IA_EVEX_VMOVRSD_VdqWdq_Kmask),
++  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSQ_VdqWdq),
++  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F3,                BX_IA_EVEX_VMOVRSQ_VdqWdq_Kmask),
++  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSB_VdqWdq),
++  form_opcode(ATTR_VEX_W0 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2,                BX_IA_EVEX_VMOVRSB_VdqWdq_Kmask),
++  form_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2 | ATTR_MASK_K0, BX_IA_EVEX_VMOVRSW_VdqWdq),
++  last_opcode(ATTR_VEX_W1 | ATTR_MOD_MEM | ATTR_SSE_PREFIX_F2,                BX_IA_EVEX_VMOVRSW_VdqWdq_Kmask)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_EVEX_MAP5_74[] = {
+diff --git a/cpu/decoder/ia_opcodes_evex.def b/cpu/decoder/ia_opcodes_evex.def
+index 3dd1f29..0976098 100644
+--- a/cpu/decoder/ia_opcodes_evex.def
++++ b/cpu/decoder/ia_opcodes_evex.def
+@@ -1574,31 +1574,31 @@ bx_define_opcode(BX_IA_EVEX_VSQRTBF16_VphWph_Kmask, "vsqrtbf16", "vsqrtbf16", &B
+ bx_define_opcode(BX_IA_EVEX_VGETEXPPBF16_VphWph, "vgetexppbf16", "vgetexppbf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_1OP<xmm_getexpbf16>, BX_ISA_AVX10_2, OP_Vph, OP_mVph, OP_NONE, OP_NONE, BX_PREPARE_EVEX_NO_SAE)
+ bx_define_opcode(BX_IA_EVEX_VGETEXPPBF16_VphWph_Kmask, "vgetexppbf16", "vgetexppbf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_1OP_WORD_EL_MASK<xmm_getexpbf16>, BX_ISA_AVX10_2, OP_Vph, OP_mVph, OP_NONE, OP_NONE, BX_PREPARE_EVEX_NO_SAE)
+ 
+-bx_define_opcode(BX_IA_EVEX_VFMADD132BF16_VphHphWph, "vfmadd132bf16", "vfmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMADD132BF16_VphHphWph_Kmask, "vfmadd132bf16", "vfmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMADD213BF16_VphHphWph, "vfmadd213bf16", "vfmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMADD213BF16_VphHphWph_Kmask, "vfmadd213bf16", "vfmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMADD231BF16_VphHphWph, "vfmadd231bf16", "vfmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMADD231BF16_VphHphWph_Kmask, "vfmadd231bf16", "vfmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB132BF16_VphHphWph, "vfmsub132bf16", "vfmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB132BF16_VphHphWph_Kmask, "vfmsub132bf16", "vfmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB213BF16_VphHphWph, "vfmsub213bf16", "vfmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB213BF16_VphHphWph_Kmask, "vfmsub213bf16", "vfmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB231BF16_VphHphWph, "vfmsub231bf16", "vfmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFMSUB231BF16_VphHphWph_Kmask, "vfmsub231bf16", "vfmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-
+-bx_define_opcode(BX_IA_EVEX_VFNMADD132BF16_VphHphWph, "vfnmadd132bf16", "vfnmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMADD132BF16_VphHphWph_Kmask, "vfnmadd132bf16", "vfnmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMADD213BF16_VphHphWph, "vfnmadd213bf16", "vfnmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMADD213BF16_VphHphWph_Kmask, "vfnmadd213bf16", "vfnmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMADD231BF16_VphHphWph, "vfnmadd231bf16", "vfnmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMADD231BF16_VphHphWph_Kmask, "vfnmadd231bf16", "vfnmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB132BF16_VphHphWph, "vfnmsub132bf16", "vfnmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB132BF16_VphHphWph_Kmask, "vfnmsub132bf16", "vfnmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB213BF16_VphHphWph, "vfnmsub213bf16", "vfnmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB213BF16_VphHphWph_Kmask, "vfnmsub213bf16", "vfnmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB231BF16_VphHphWph, "vfnmsub231bf16", "vfnmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3OP<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+-bx_define_opcode(BX_IA_EVEX_VFNMSUB231BF16_VphHphWph_Kmask, "vfnmsub231bf16", "vfnmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3OP_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD132BF16_VphHphWph, "vfmadd132bf16", "vfmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD132BF16_VphHphWph_Kmask, "vfmadd132bf16", "vfmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD213BF16_VphHphWph, "vfmadd213bf16", "vfmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD213BF16_VphHphWph_Kmask, "vfmadd213bf16", "vfmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD231BF16_VphHphWph, "vfmadd231bf16", "vfmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMADD231BF16_VphHphWph_Kmask, "vfmadd231bf16", "vfmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB132BF16_VphHphWph, "vfmsub132bf16", "vfmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB132BF16_VphHphWph_Kmask, "vfmsub132bf16", "vfmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB213BF16_VphHphWph, "vfmsub213bf16", "vfmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB213BF16_VphHphWph_Kmask, "vfmsub213bf16", "vfmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB231BF16_VphHphWph, "vfmsub231bf16", "vfmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFMSUB231BF16_VphHphWph_Kmask, "vfmsub231bf16", "vfmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++
++bx_define_opcode(BX_IA_EVEX_VFNMADD132BF16_VphHphWph, "vfnmadd132bf16", "vfnmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMADD132BF16_VphHphWph_Kmask, "vfnmadd132bf16", "vfnmadd132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMADD213BF16_VphHphWph, "vfnmadd213bf16", "vfnmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMADD213BF16_VphHphWph_Kmask, "vfnmadd213bf16", "vfnmadd213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMADD231BF16_VphHphWph, "vfnmadd231bf16", "vfnmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMADD231BF16_VphHphWph_Kmask, "vfnmadd231bf16", "vfnmadd231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmaddbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB132BF16_VphHphWph, "vfnmsub132bf16", "vfnmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB132BF16_VphHphWph_Kmask, "vfnmsub132bf16", "vfnmsub132bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Vph, OP_mVph, OP_Hph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB213BF16_VphHphWph, "vfnmsub213bf16", "vfnmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB213BF16_VphHphWph_Kmask, "vfnmsub213bf16", "vfnmsub213bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_Vph, OP_mVph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB231BF16_VphHphWph, "vfnmsub231bf16", "vfnmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_VectorW, &BX_CPU_C::HANDLE_AVX_3SRC<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
++bx_define_opcode(BX_IA_EVEX_VFNMSUB231BF16_VphHphWph_Kmask, "vfnmsub231bf16", "vfnmsub231bf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::HANDLE_AVX512_3SRC_WORD_EL_MASK<xmm_fnmsubbf16>, BX_ISA_AVX10_2, OP_Vph, OP_Hph, OP_mVph, OP_Vph, BX_PREPARE_EVEX_NO_SAE)
+ 
+ bx_define_opcode(BX_IA_EVEX_VFPCLASSPBF16_KGdWphIb_Kmask, "vfpclasspbf16", "vfpclasspbf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::VFPCLASSPBF16_MASK_KGdWphIbR, BX_ISA_AVX10_2, OP_KGd, OP_mVph, OP_Ib, OP_NONE, BX_PREPARE_EVEX_NO_SAE)
+ bx_define_opcode(BX_IA_EVEX_VCMPPBF16_KGdHphWphIb, "vcmppbf16", "vcmppbf16", &BX_CPU_C::LOAD_BROADCAST_MASK_VectorW, &BX_CPU_C::VCMPPBF16_MASK_KGdHphWphIbR, BX_ISA_AVX10_2, OP_KGd, OP_Hph, OP_mVph, OP_Ib, BX_PREPARE_EVEX_NO_SAE)
+diff --git a/cpu/softfloat3e/f16_minmax.cc b/cpu/softfloat3e/f16_minmax.cc
+index cf1495c..80904e8 100644
+--- a/cpu/softfloat3e/f16_minmax.cc
++++ b/cpu/softfloat3e/f16_minmax.cc
+@@ -165,7 +165,7 @@ float16 f16_minmax(float16 a, float16 b, int op_select, int sign_ctrl, bool prop
+     if (! f16_isNaN(z)) {
+         switch(sign_ctrl) {
+         case 0:
+-            z = (z & ~0x8000) | (a & 0x8000); // keep sign of a
++            if (! aIsNaN) z = (z & ~0x8000) | (a & 0x8000); // keep sign of a (not of a NaN a)
+             break;
+         case 1:
+             break; // preserve sign of compare result
+diff --git a/cpu/softfloat3e/f32_minmax.cc b/cpu/softfloat3e/f32_minmax.cc
+index 9dcd2a4..7cb975d 100644
+--- a/cpu/softfloat3e/f32_minmax.cc
++++ b/cpu/softfloat3e/f32_minmax.cc
+@@ -165,7 +165,7 @@ float32 f32_minmax(float32 a, float32 b, int op_select, int sign_ctrl, bool prop
+     if (! f32_isNaN(z)) {
+         switch(sign_ctrl) {
+         case 0:
+-            z = (z & ~0x80000000) | (a & 0x80000000); // keep sign of a
++            if (! aIsNaN) z = (z & ~0x80000000) | (a & 0x80000000); // keep sign of a (not of a NaN a)
+             break;
+         case 1:
+             break; // preserve sign of compare result
+diff --git a/cpu/softfloat3e/f32_to_i8.cc b/cpu/softfloat3e/f32_to_i8.cc
+index e53e864..5bb0d77 100644
+--- a/cpu/softfloat3e/f32_to_i8.cc
++++ b/cpu/softfloat3e/f32_to_i8.cc
+@@ -54,18 +54,10 @@ int8_t f32_to_i8(float32 a, uint8_t roundingMode, bool exact, bool saturate, str
+     sig  = fracF32UI(a);
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-#if (i32_fromNaN != i32_fromPosOverflow) || (i32_fromNaN != i32_fromNegOverflow)
+     if ((exp == 0xFF) && sig) {
+-#if (i32_fromNaN == i32_fromPosOverflow)
+-        sign = 0;
+-#elif (i32_fromNaN == i32_fromNegOverflow)
+-        sign = 1;
+-#else
+         softfloat_raiseFlags(status, softfloat_flag_invalid);
+         return saturate ? 0 : i8_fromNaN;
+-#endif
+     }
+-#endif
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+     shiftDist = 0x8E - exp;
+diff --git a/cpu/softfloat3e/f32_to_ui8.cc b/cpu/softfloat3e/f32_to_ui8.cc
+index 4322281..c609f08 100644
+--- a/cpu/softfloat3e/f32_to_ui8.cc
++++ b/cpu/softfloat3e/f32_to_ui8.cc
+@@ -54,18 +54,10 @@ uint8_t f32_to_ui8(float32 a, uint8_t roundingMode, bool exact, bool saturate, s
+     sig  = fracF32UI(a);
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-#if (ui32_fromNaN != ui32_fromPosOverflow) || (ui32_fromNaN != ui32_fromNegOverflow)
+     if ((exp == 0xFF) && sig) {
+-#if (ui32_fromNaN == ui32_fromPosOverflow)
+-        sign = 0;
+-#elif (ui32_fromNaN == ui32_fromNegOverflow)
+-        sign = 1;
+-#else
+         softfloat_raiseFlags(status, softfloat_flag_invalid);
+         return saturate ? 0 : ui8_fromNaN;
+-#endif
+     }
+-#endif
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+     shiftDist = 0x8E - exp;
+diff --git a/cpu/softfloat3e/f64_minmax.cc b/cpu/softfloat3e/f64_minmax.cc
+index f28bbee..23ff0c2 100644
+--- a/cpu/softfloat3e/f64_minmax.cc
++++ b/cpu/softfloat3e/f64_minmax.cc
+@@ -165,7 +165,7 @@ float64 f64_minmax(float64 a, float64 b, int op_select, int sign_ctrl, bool prop
+     if (! f64_isNaN(z)) {
+         switch(sign_ctrl) {
+         case 0:
+-            z = (z & ~UINT64_C(0x8000000000000000)) | (a & UINT64_C(0x8000000000000000)); // keep sign of a
++            if (! aIsNaN) z = (z & ~UINT64_C(0x8000000000000000)) | (a & UINT64_C(0x8000000000000000)); // keep sign of a (not of a NaN a)
+             break;
+         case 1:
+             break; // preserve sign of compare result

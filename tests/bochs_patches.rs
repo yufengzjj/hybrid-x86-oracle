@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4s are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4t are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -9,7 +9,10 @@
 //! One `BochsOracle` per test: the core is a process-wide singleton.
 #![cfg(feature = "bochs")]
 
-use x86_oracle::{BochsOracle, X86Oracle, ZMM_CHUNKS, RAX, RBX, RCX, RDI, RDX, RSI};
+use x86_oracle::{
+    BochsOracle, X86Oracle, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, ZMM_CHUNKS, RAX, RBX,
+    RCX, RDI, RDX, RSI,
+};
 
 const CODE: u64 = 0x10_0000;
 
@@ -1017,5 +1020,458 @@ fn vcvtne2ps2bf16_takes_its_high_half_from_the_low_dwords_of_src1() {
             };
             assert_eq!(word(&zmm0, n), want, "{name} sources: word {n} of {zmm0:x?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4t: the AVX10.2 group — eight defects, one patch
+// (`patches/bochs/0010-avx10-2-ibs-zero-extend-nan-minmax-sign-bf16-fma.patch`).
+// No silicon with AVX10.2 exists to differ against, so every expectation here
+// is the Intel AVX10.2 Architecture Specification's (361050-007) text.
+
+/// A register image whose `bits`-wide lanes hold `vals` in order, zero above.
+fn lanes(bits: u32, vals: &[u64]) -> [u64; ZMM_CHUNKS] {
+    let mut z = [0u64; ZMM_CHUNKS];
+    for (n, v) in vals.iter().enumerate() {
+        let bit = n as u32 * bits;
+        z[(bit / 64) as usize] |= v << (bit % 64);
+    }
+    z
+}
+
+/// Lane `n` of width `bits` of a register image.
+fn lane(z: &[u64; ZMM_CHUNKS], bits: u32, n: usize) -> u64 {
+    let bit = n as u32 * bits;
+    (z[(bit / 64) as usize] >> (bit % 64)) & (u64::MAX >> (64 - bits))
+}
+
+/// The 64 bytes of a register image, lane 0 first.
+fn bytes(z: &[u64; ZMM_CHUNKS]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for (n, q) in z.iter().enumerate() {
+        out[8 * n..8 * n + 8].copy_from_slice(&q.to_le_bytes());
+    }
+    out
+}
+
+// --- §4t.1 / §4t.2: VCVT[T]{PS,PH,BF16}2I[U]BS ------------------------------
+//
+// All twelve are EVEX.128.MAP5.W0 `op xmm0, xmm1`; the source format is the
+// SSE prefix (66 = fp32, NP = fp16, F2 = bf16) and the opcode selects
+// truncating/rounding × signed/unsigned. The spec: "The downconverted 8-bit
+// result is written in place at the lower 8-bit of the corresponding 32-bit
+// element. The upper 3 bytes are zeroed" (upper byte, for the 16-bit forms),
+// and "For NaN, (0) is returned".
+
+/// `(mnemonic, EVEX P1, opcode, lane bits, signed)`.
+const IBS_FORMS: &[(&str, u8, u8, u32, bool)] = &[
+    ("vcvtps2ibs", 0x7D, 0x69, 32, true),
+    ("vcvttps2ibs", 0x7D, 0x68, 32, true),
+    ("vcvtps2iubs", 0x7D, 0x6B, 32, false),
+    ("vcvttps2iubs", 0x7D, 0x6A, 32, false),
+    ("vcvtph2ibs", 0x7C, 0x69, 16, true),
+    ("vcvttph2ibs", 0x7C, 0x68, 16, true),
+    ("vcvtph2iubs", 0x7C, 0x6B, 16, false),
+    ("vcvttph2iubs", 0x7C, 0x6A, 16, false),
+    ("vcvtbf162ibs", 0x7F, 0x69, 16, true),
+    ("vcvttbf162ibs", 0x7F, 0x68, 16, true),
+    ("vcvtbf162iubs", 0x7F, 0x6B, 16, false),
+    ("vcvttbf162iubs", 0x7F, 0x6A, 16, false),
+];
+
+/// [-1.0, 2.0, qNaN, -300.0] in each source format: a negative in range (the
+/// sign-extension bug), an in-range positive control, a NaN (the compiled-out
+/// NaN check) and a negative overflow (saturates to -128 = 0x80, which also
+/// sign-extended wrongly).
+fn ibs_source(p1: u8) -> [u64; ZMM_CHUNKS] {
+    match p1 {
+        0x7D => lanes(32, &[0xBF80_0000, 0x4000_0000, 0x7FC0_0000, 0xC396_0000]),
+        0x7C => lanes(16, &[0xBC00, 0x4000, 0x7E00, 0xDCB0]),
+        _ => lanes(16, &[0xBF80, 0x4000, 0x7FC0, 0xC396]),
+    }
+}
+
+/// §4t.1 and §4t.2 together: the signed byte lands zero-extended in its lane
+/// and a NaN converts to 0, for the unmasked and the `{k7}` (merge) rows —
+/// those are separate handlers, and the fix touched twelve of them.
+#[test]
+fn byte_saturating_converts_zero_extend_and_send_nan_to_zero() {
+    for (name, p1, op, bits, signed) in IBS_FORMS {
+        let want: [u64; 4] = if *signed { [0xFF, 2, 0, 0x80] } else { [0, 2, 0, 0] };
+        for masked in [false, true] {
+            let mut cpu = BochsOracle::new();
+            cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+            cpu.set_zmm(1, &ibs_source(*p1));
+            cpu.set_gpr(RCX, 0xE); // lanes 0 and 4.. are merge holes when masked
+            let p2 = if masked { 0x0F } else { 0x08 };
+            run(
+                &mut cpu,
+                &[
+                    0xC5, 0xF8, 0x92, 0xF9, // kmovw k7, ecx
+                    0x62, 0xF5, *p1, p2, *op, 0xC1, // op xmm0 {k7}, xmm1
+                ],
+                2,
+            );
+            let zmm0 = cpu.get_zmm(0);
+            let count = 128 / *bits as usize;
+            for n in 0..(512 / *bits as usize) {
+                let expect = if n >= count {
+                    0
+                } else if masked && (0xE >> n) & 1 == 0 {
+                    STALE & (u64::MAX >> (64 - bits))
+                } else if n < 4 {
+                    want[n]
+                } else {
+                    0
+                };
+                assert_eq!(
+                    lane(&zmm0, *bits, n),
+                    expect,
+                    "{name}{}: lane {n} of {zmm0:x?}",
+                    if masked { " {k7}" } else { "" }
+                );
+            }
+        }
+    }
+}
+
+// --- §4t.3: VMINMAX sign control with a NaN src1 -----------------------------
+//
+// EVEX.128.0F3A.W0/W1 52 /r ib `vminmaxp* xmm0, xmm1, xmm2, imm8`. imm8[1:0]
+// selects min/max, imm8[3:2] the sign control (00 = sign of src1), imm8[4]
+// the NaN handling (0 = propagate, 1 = the *Number variant that discards a
+// single NaN). Spec table 11.4: with sign control 00 the result "does not copy
+// the sign of SRC1 ... if SRC1 is a NAN".
+
+/// `(mnemonic, EVEX P1, lane bits, [qNaN, -qNaN, -2.0, +2.0, -3.0, +3.0, -5.0])`.
+const MINMAX_FORMS: &[(&str, u8, u32, [u64; 7])] = &[
+    ("vminmaxps", 0x75, 32, [0x7FC0_0000, 0xFFC0_0000, 0xC000_0000, 0x4000_0000, 0xC040_0000, 0x4040_0000, 0xC0A0_0000]),
+    ("vminmaxpd", 0xF5, 64, [
+        0x7FF8_0000_0000_0000, 0xFFF8_0000_0000_0000, 0xC000_0000_0000_0000, 0x4000_0000_0000_0000,
+        0xC008_0000_0000_0000, 0x4008_0000_0000_0000, 0xC014_0000_0000_0000,
+    ]),
+    ("vminmaxph", 0x74, 16, [0x7E00, 0xFE00, 0xC000, 0x4000, 0xC200, 0x4200, 0xC500]),
+    ("vminmaxbf16", 0x77, 16, [0x7FC0, 0xFFC0, 0xC000, 0x4000, 0xC040, 0x4040, 0xC0A0]),
+];
+
+/// Run `vminmaxp* xmm0, xmm1, xmm2, imm8` with xmm1 = [NaN, -NaN, -3, +3] and
+/// xmm2 = [-2, +2, +2, -5]; returns lanes 0..3 of xmm0 — for the two-lane
+/// `pd` form lanes 2 and 3 are above VL and read as 0, so `want` is trimmed
+/// to the same shape before comparing.
+fn run_minmax(name: &str, p1: u8, bits: u32, v: &[u64; 7], imm: u8, mut want: [u64; 4]) {
+    let [nan, neg_nan, m2, p2, m3, p3, m5] = *v;
+    let mut cpu = BochsOracle::new();
+    cpu.set_zmm(1, &lanes(bits, &[nan, neg_nan, m3, p3]));
+    cpu.set_zmm(2, &lanes(bits, &[m2, p2, p2, m5]));
+    run(&mut cpu, &[0x62, 0xF3, p1, 0x08, 0x52, 0xC2, imm], 1);
+    let zmm0 = cpu.get_zmm(0);
+    let got: [u64; 4] = core::array::from_fn(|n| lane(&zmm0, bits, n));
+    for w in want.iter_mut().skip((128 / bits) as usize) {
+        *w = 0;
+    }
+    assert_eq!(&zmm0[2..], &[0; 6], "{name}, imm8 = {imm:#x}: bits 128..511 of {zmm0:x?}");
+    assert_eq!(got, want, "{name}, imm8 = {imm:#x}");
+}
+
+/// §4t.3 proper: maxNumber with "sign of src1" (imm8 = 0x11). Lanes 0 and 1
+/// have the NaN in src1, so the numeric src2 comes back with ITS sign; lanes
+/// 2 and 3 are the ordinary case where src1's sign is copied (max(-3, 2) = 2
+/// carrying the minus of src1) or already agrees.
+#[test]
+fn minmax_number_ignores_the_sign_control_when_src1_is_nan() {
+    for (name, p1, bits, v) in MINMAX_FORMS {
+        let [_, _, m2, p2, _, p3, _] = *v;
+        run_minmax(name, *p1, *bits, v, 0x11, [m2, p2, m2, p3]);
+    }
+}
+
+/// The control: the NaN-propagating variant (imm8 = 0x01) returns the quiet
+/// NaN of src1 untouched, sign included — the spec's "does not manipulate the
+/// sign if the result is a NAN" — and the numeric lanes match the test above.
+#[test]
+fn minmax_propagate_returns_the_nan_unsigned_by_the_control() {
+    for (name, p1, bits, v) in MINMAX_FORMS {
+        let [nan, neg_nan, m2, _, _, p3, _] = *v;
+        run_minmax(name, *p1, *bits, v, 0x01, [nan, neg_nan, m2, p3]);
+    }
+}
+
+// --- §4t.4 / §4t.5: the BF16 FMA family ---------------------------------------
+//
+// EVEX.128.NP.MAP6.W0 `op xmm_dst, xmm_vvvv, xmm_rm`; the opcode is 98/A8/B8
+// for the 132/213/231 forms of VFMADD, +2 for VFMSUB, +4 for VFNMADD, +6 for
+// VFNMSUB. The `_Kmask` rows are separate handlers (a second template), so the
+// merge case is run as well.
+
+/// `(mnemonic, opcode)` for the twelve register forms.
+const BF16_FMA: &[(&str, u8)] = &[
+    ("vfmadd132bf16", 0x98), ("vfmadd213bf16", 0xA8), ("vfmadd231bf16", 0xB8),
+    ("vfmsub132bf16", 0x9A), ("vfmsub213bf16", 0xAA), ("vfmsub231bf16", 0xBA),
+    ("vfnmadd132bf16", 0x9C), ("vfnmadd213bf16", 0xAC), ("vfnmadd231bf16", 0xBC),
+    ("vfnmsub132bf16", 0x9E), ("vfnmsub213bf16", 0xAE), ("vfnmsub231bf16", 0xBE),
+];
+
+/// What `op xmm2, xmm3, xmm5` must produce with every lane of xmm2/xmm3/xmm5
+/// holding 2/3/5: the 132 form is dst·rm ± vvvv, 213 is vvvv·dst ± rm, 231 is
+/// vvvv·rm ± dst, negated for the N forms.
+fn bf16_fma_expected(op: u8) -> f32 {
+    let (product, addend) = match op & 0xF0 {
+        0x90 => (2.0 * 5.0, 3.0),
+        0xA0 => (3.0 * 2.0, 5.0),
+        _ => (3.0 * 5.0, 2.0),
+    };
+    let (product, addend) = match op & 0x0F {
+        0x8 => (product, addend),
+        0xA => (product, -addend),
+        0xC => (-product, addend),
+        _ => (-product, -addend),
+    };
+    product + addend
+}
+
+/// §4t.5 proper: the rows were bound to an accumulate-shaped template that
+/// read the destination as the first operand and never read src3, so every
+/// form multiplied the wrong pair (132/213/231 of 2, 3, 5 gave 9/8/11
+/// instead of 13/11/17).
+#[test]
+fn bf16_fma_forms_read_their_operands_in_fma3_role_order() {
+    for (name, op) in BF16_FMA {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(2, &[u64::from(bf16(2.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        cpu.set_zmm(3, &[u64::from(bf16(3.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        cpu.set_zmm(5, &[u64::from(bf16(5.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        // P1 0x64: W0, vvvv = ~3, NP. ModRM 0xD5: reg = xmm2, rm = xmm5.
+        run(&mut cpu, &[0x62, 0xF6, 0x64, 0x08, *op, 0xD5], 1);
+        let zmm2 = cpu.get_zmm(2);
+        let want = bf16(bf16_fma_expected(*op));
+        for n in 0..32 {
+            let expect = if n < 8 { want } else { 0 };
+            assert_eq!(word(&zmm2, n), expect, "{name} xmm2, xmm3, xmm5: word {n} of {zmm2:x?}");
+        }
+    }
+}
+
+/// The masked template: `{k7}` merge keeps the destination's 2.0 in the holes
+/// and computes the FMA3 result in the selected lanes.
+#[test]
+fn bf16_fma_masked_forms_read_their_operands_in_fma3_role_order() {
+    for (name, op) in BF16_FMA {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(2, &[u64::from(bf16(2.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        cpu.set_zmm(3, &[u64::from(bf16(3.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        cpu.set_zmm(5, &[u64::from(bf16(5.0)) * 0x0001_0001_0001_0001; ZMM_CHUNKS]);
+        cpu.set_gpr(RCX, 0x5A);
+        run(
+            &mut cpu,
+            &[
+                0xC5, 0xF8, 0x92, 0xF9, // kmovw k7, ecx
+                0x62, 0xF6, 0x64, 0x0F, *op, 0xD5, // op xmm2 {k7}, xmm3, xmm5
+            ],
+            2,
+        );
+        let zmm2 = cpu.get_zmm(2);
+        let want = bf16(bf16_fma_expected(*op));
+        for n in 0..32 {
+            let expect = if n >= 8 {
+                0
+            } else if 0x5A & (1 << n) != 0 {
+                want
+            } else {
+                bf16(2.0)
+            };
+            assert_eq!(word(&zmm2, n), expect, "{name} xmm2 {{k7}}, xmm3, xmm5: word {n} of {zmm2:x?}");
+        }
+    }
+}
+
+/// §4t.4 proper: 3.0 × (1 + 2⁻⁷) = 3.0234375 sits exactly on the midpoint
+/// between the bf16 neighbours 3.015625 and 3.03125. Adding −2⁻³⁰ puts the
+/// exact result below the midpoint, so a single RNE rounding gives 3.015625;
+/// rounding to fp32 first loses the addend (it is under half an fp32 ulp) and
+/// the second rounding breaks the tie to even, 3.03125. `vfmadd213bf16 xmm0,
+/// xmm1, xmm2` computes xmm1·xmm0 + xmm2.
+#[test]
+fn bf16_fma_rounds_once() {
+    let midpoint_case = |addend: f32| {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &lanes(16, &[u64::from(bf16(3.0))]));
+        cpu.set_zmm(1, &lanes(16, &[u64::from(bf16(1.0 + 1.0 / 128.0))]));
+        cpu.set_zmm(2, &lanes(16, &[u64::from(bf16(addend))]));
+        run(&mut cpu, &[0x62, 0xF6, 0x74, 0x08, 0xA8, 0xC2], 1);
+        word(&cpu.get_zmm(0), 0)
+    };
+    assert_eq!(midpoint_case(-(2f32.powi(-30))), bf16(3.015625), "just below the midpoint");
+    assert_eq!(midpoint_case(2f32.powi(-30)), bf16(3.03125), "just above the midpoint");
+    assert_eq!(midpoint_case(0.0), bf16(3.03125), "an exact tie rounds to even");
+}
+
+// --- §4t.6: VCOMXSS / VCOMXSD dispatch -----------------------------------------
+//
+// EVEX.LLIG.0F.W0/W1 2E/2F /r `v[u]comx{ss,sd} xmm1, xmm2`. The F3.W0 rows are
+// the single-precision forms and F2.W1 the double-precision ones; upstream
+// had the IA names crossed, so each encoding ran the other width's compare.
+// VCOMX flags: unordered = OF|SF|PF|CF, greater = none, less = OF|CF, equal =
+// OF|SF|ZF (`write_eflags_vcomx`).
+
+const VCOMX_FLAGS: u64 = FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF | FLAG_CF;
+const UNORDERED: u64 = FLAG_OF | FLAG_SF | FLAG_PF | FLAG_CF;
+
+/// `(mnemonic, encoding, xmm1 low qword, xmm2 low qword, expected flags)`.
+/// The NaN cases are the discriminators: as a double the fp32 NaN pattern is
+/// a tiny positive denormal, greater than the fp32 1.0 pattern (so the wrong
+/// width says "greater"), and the fp64 NaN's low dword is 0, equal to 1.0's
+/// (so the wrong width says "equal").
+const VCOMX_CASES: &[(&str, [u8; 6], u64, u64, u64)] = &[
+    ("vcomxss NaN, 1.0", [0x62, 0xF1, 0x7E, 0x08, 0x2F, 0xCA], 0x7FC0_0000, 0x3F80_0000, UNORDERED),
+    ("vucomxss NaN, 1.0", [0x62, 0xF1, 0x7E, 0x08, 0x2E, 0xCA], 0x7FC0_0000, 0x3F80_0000, UNORDERED),
+    ("vcomxsd NaN, 1.0", [0x62, 0xF1, 0xFF, 0x08, 0x2F, 0xCA], 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000, UNORDERED),
+    ("vucomxsd NaN, 1.0", [0x62, 0xF1, 0xFF, 0x08, 0x2E, 0xCA], 0x7FF8_0000_0000_0000, 0x3FF0_0000_0000_0000, UNORDERED),
+    ("vcomxss 1.0, 2.0", [0x62, 0xF1, 0x7E, 0x08, 0x2F, 0xCA], 0x3F80_0000, 0x4000_0000, FLAG_OF | FLAG_CF),
+    ("vcomxsd 2.0, 1.0", [0x62, 0xF1, 0xFF, 0x08, 0x2F, 0xCA], 0x4000_0000_0000_0000, 0x3FF0_0000_0000_0000, 0),
+    ("vucomxsd 1.0, 1.0", [0x62, 0xF1, 0xFF, 0x08, 0x2E, 0xCA], 0x3FF0_0000_0000_0000, 0x3FF0_0000_0000_0000, FLAG_OF | FLAG_SF | FLAG_ZF),
+];
+
+/// §4t.6 proper.
+#[test]
+fn vcomx_encodings_compare_at_their_own_width() {
+    for (name, code, a, b, want) in VCOMX_CASES {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(1, &lanes(64, &[*a]));
+        cpu.set_zmm(2, &lanes(64, &[*b]));
+        run(&mut cpu, code, 1);
+        let flags = cpu.get_rflags() & VCOMX_FLAGS;
+        assert_eq!(flags, *want, "{name}: flags {flags:#x}");
+    }
+}
+
+// --- §4t.7: VCVT2PH2{B,H}F8[S] at VL512 ------------------------------------------
+//
+// The same four encodings as §4r with L'L = 10: `op zmm0, zmm1, zmm2`. The 64
+// byte lanes need a 64-bit lane mask; upstream's was 32 bits wide, so bytes
+// 32..63 (the ones converted from src1) were never written.
+
+/// `(mnemonic, §4r encoding, bf8/hf8 of 1.0, bf8/hf8 of 2.0)`.
+const FP8_TWO_SOURCE_512: &[(&str, [u8; 6], u8, u8)] = &[
+    ("vcvt2ph2bf8", [0x62, 0xF2, 0x77, 0x48, 0x74, 0xC2], 0x3C, 0x40),
+    ("vcvt2ph2bf8s", [0x62, 0xF5, 0x77, 0x48, 0x74, 0xC2], 0x3C, 0x40),
+    ("vcvt2ph2hf8", [0x62, 0xF5, 0x77, 0x48, 0x18, 0xC2], 0x38, 0x40),
+    ("vcvt2ph2hf8s", [0x62, 0xF5, 0x77, 0x48, 0x1B, 0xC2], 0x38, 0x40),
+];
+
+/// Run one form with every fp16 lane of zmm2 = 1.0, of zmm1 = 2.0, zmm0 =
+/// STALE and k7 = `mask` (via `kmovq`); `p2` selects unmasked/merge/zero.
+fn fp8_two_source_512(code: &[u8; 6], p2: u8, mask: u64) -> [u8; 64] {
+    let mut cpu = BochsOracle::new();
+    cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+    cpu.set_zmm(1, &[0x4000_4000_4000_4000; ZMM_CHUNKS]);
+    cpu.set_zmm(2, &[0x3C00_3C00_3C00_3C00; ZMM_CHUNKS]);
+    cpu.set_gpr(RCX, mask);
+    let mut insn = *code;
+    insn[3] = p2;
+    let mut program = vec![0xC4, 0xE1, 0xFB, 0x92, 0xF9]; // kmovq k7, rcx
+    program.extend_from_slice(&insn);
+    run(&mut cpu, &program, 2);
+    bytes(&cpu.get_zmm(0))
+}
+
+/// §4t.7 proper: unmasked, bytes 0..31 come from zmm2 and 32..63 from zmm1.
+#[test]
+fn two_source_fp8_converts_write_the_upper_half_at_vl512() {
+    for (name, code, one, two) in FP8_TWO_SOURCE_512 {
+        let got = fp8_two_source_512(code, 0x48, 0);
+        let want: [u8; 64] = core::array::from_fn(|n| if n < 32 { *one } else { *two });
+        assert_eq!(got, want, "{name} zmm0, zmm1, zmm2");
+    }
+}
+
+/// Mask bits 32..63 select bytes from src1: with k7 clearing bits 56..63 the
+/// merge keeps STALE and `{z}` writes 0 there, and bytes 32..55 convert.
+#[test]
+fn two_source_fp8_converts_honor_mask_bits_above_31() {
+    let mask = 0x00FF_FFFF_FFFF_FFFF;
+    for (name, code, one, two) in FP8_TWO_SOURCE_512 {
+        for (p2, hole) in [(0x4F, STALE as u8), (0xCF, 0)] {
+            let got = fp8_two_source_512(code, p2, mask);
+            let want: [u8; 64] =
+                core::array::from_fn(|n| if n < 32 { *one } else if n < 56 { *two } else { hole });
+            assert_eq!(got, want, "{name} zmm0 {{k7}}{}, zmm1, zmm2", if p2 & 0x80 != 0 { "{z}" } else { "" });
+        }
+    }
+}
+
+// --- §4t.8: VMOVRS with a mask -------------------------------------------------
+//
+// EVEX.128.MAP5 6F /r `vmovrs{b,w,d,q} xmm0 {k7}, [rbx]`: F2 selects the
+// byte/word forms (W0/W1), F3 the dword/qword ones. Upstream's opmap put
+// `ATTR_MASK_K0` — "this row is for an ABSENT mask" — on the `_Kmask` rows,
+// so a masked encoding dispatched the plain loader.
+
+/// `(mnemonic, EVEX P1, lane bits)`.
+const VMOVRS_FORMS: &[(&str, u8, u32)] = &[
+    ("vmovrsb", 0x7F, 8),
+    ("vmovrsw", 0xFF, 16),
+    ("vmovrsd", 0x7E, 32),
+    ("vmovrsq", 0xFE, 64),
+];
+
+/// Run `vmovrs* xmm0 {k7}, [rbx]` over the 16 bytes 0x10..0x1F with xmm0 =
+/// STALE and k7 = `mask`; `p2` selects unmasked/merge/zero.
+fn run_vmovrs(p1: u8, p2: u8, mask: u16) -> [u64; ZMM_CHUNKS] {
+    let mut cpu = BochsOracle::new();
+    let window: Vec<u8> = (0x10..0x20u8).collect();
+    cpu.write_mem(DATA, &window);
+    cpu.set_gpr(RBX, DATA);
+    cpu.set_gpr(RCX, u64::from(mask));
+    cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+    run(
+        &mut cpu,
+        &[
+            0xC5, 0xF8, 0x92, 0xF9, // kmovw k7, ecx
+            0x62, 0xF5, p1, p2, 0x6F, 0x03, // vmovrs* xmm0 {k7}, [rbx]
+        ],
+        2,
+    );
+    cpu.get_zmm(0)
+}
+
+/// §4t.8 proper: with k7 = 0x5555 the odd lanes are holes — kept under merge,
+/// zeroed under `{z}` — and only the even lanes load.
+#[test]
+fn vmovrs_with_a_mask_loads_only_the_selected_lanes() {
+    let mut loaded = [0u64; ZMM_CHUNKS];
+    loaded[0] = 0x1716_1514_1312_1110;
+    loaded[1] = 0x1F1E_1D1C_1B1A_1918;
+    for (name, p1, bits) in VMOVRS_FORMS {
+        for (p2, zeroing) in [(0x0F, false), (0x8F, true)] {
+            let zmm0 = run_vmovrs(*p1, p2, 0x5555);
+            for n in 0..(512 / *bits as usize) {
+                let want = if n >= 128 / *bits as usize {
+                    0
+                } else if n % 2 == 0 {
+                    lane(&loaded, *bits, n)
+                } else if zeroing {
+                    0
+                } else {
+                    STALE & (u64::MAX >> (64 - bits))
+                };
+                assert_eq!(
+                    lane(&zmm0, *bits, n),
+                    want,
+                    "{name} xmm0 {{k7}}{}, [rbx]: lane {n} of {zmm0:x?}",
+                    if zeroing { "{z}" } else { "" }
+                );
+            }
+        }
+    }
+}
+
+/// The control: the plain rows (no mask) still load everything, so the swap
+/// went the right way round.
+#[test]
+fn vmovrs_without_a_mask_still_loads_every_lane() {
+    for (name, p1, _) in VMOVRS_FORMS {
+        let zmm0 = run_vmovrs(*p1, 0x08, 0x5555);
+        assert_eq!(&zmm0[..2], &[0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918], "{name} xmm0, [rbx]: {zmm0:x?}");
+        assert_eq!(&zmm0[2..], &[0; 6], "{name} xmm0, [rbx]: bits 128..511 of {zmm0:x?}");
     }
 }

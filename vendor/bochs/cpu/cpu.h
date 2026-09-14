@@ -2759,6 +2759,8 @@ public: // for now...
   BX_SMF void HANDLE_AVX_2OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
   template <simd_xmm_3op func>
   BX_SMF void HANDLE_AVX_3OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+  template <simd_xmm_3op func>
+  BX_SMF void HANDLE_AVX_3SRC(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
 
   template <xmm_pfp_1op func>
   BX_SMF void HANDLE_AVX_PFP_1OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
@@ -3215,6 +3217,8 @@ public: // for now...
   BX_SMF void HANDLE_AVX512_3OP_DWORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
   template <simd_xmm_3op func>
   BX_SMF void HANDLE_AVX512_3OP_WORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+  template <simd_xmm_3op func>
+  BX_SMF void HANDLE_AVX512_3SRC_WORD_EL_MASK(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
 
   template <simd_xmm_shift func>
   BX_SMF void HANDLE_AVX512_PSHIFT_QWORD_EL_MASK(bxInstruction_c *i) BX_CPP_AttrRegparmN(1);

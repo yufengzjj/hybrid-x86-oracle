@@ -272,6 +272,9 @@ AVX512_CVT64_TO_32_MASK(VCVTTPD2UDQS_MASK_VdqWpdR, f64_to_ui32_round_to_zero_sat
 AVX512_CVT64_TO_32_MASK(VCVTQQ2PS_MASK_VpsWdqR, i64_to_f32)
 AVX512_CVT64_TO_32_MASK(VCVTUQQ2PS_MASK_VpsWdqR, ui64_to_f32)
 
+static BX_CPP_INLINE Bit32u f32_to_i8_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_saturate(a, status); }
+static BX_CPP_INLINE Bit32u f32_to_i8_round_to_zero_saturate_zx(float32 a, softfloat_status_t *status) { return (Bit8u) f32_to_i8_round_to_zero_saturate(a, status); }
+
 #define AVX512_CVT32_TO_32_MASK(HANDLER, func)                                              \
   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
   {                                                                                         \
@@ -311,9 +314,9 @@ AVX512_CVT32_TO_32_MASK(VCVTTPS2UDQ_MASK_VdqWpsR, f32_to_ui32_round_to_zero)
 AVX512_CVT32_TO_32_MASK(VCVTTPS2UDQS_MASK_VdqWpsR, f32_to_ui32_round_to_zero_saturate) // AVX 10.2
 AVX512_CVT32_TO_32_MASK(VCVTDQ2PS_MASK_VpsWdqR, i32_to_f32)
 AVX512_CVT32_TO_32_MASK(VCVTUDQ2PS_MASK_VpsWdqR, ui32_to_f32)
-AVX512_CVT32_TO_32_MASK(VCVTPS2IBS_MASK_V8bWpsR, f32_to_i8_saturate) // AVX 10.2
+AVX512_CVT32_TO_32_MASK(VCVTPS2IBS_MASK_V8bWpsR, f32_to_i8_saturate_zx) // AVX 10.2
 AVX512_CVT32_TO_32_MASK(VCVTPS2IUBS_MASK_V8bWpsR, f32_to_ui8_saturate) // AVX 10.2
-AVX512_CVT32_TO_32_MASK(VCVTTPS2IBS_MASK_V8bWpsR, f32_to_i8_round_to_zero_saturate) // AVX 10.2
+AVX512_CVT32_TO_32_MASK(VCVTTPS2IBS_MASK_V8bWpsR, f32_to_i8_round_to_zero_saturate_zx) // AVX 10.2
 AVX512_CVT32_TO_32_MASK(VCVTTPS2IUBS_MASK_V8bWpsR, f32_to_ui8_round_to_zero_saturate) // AVX 10.2
 
 #define AVX512_CVT64_TO_64(HANDLER, func)                                                   \

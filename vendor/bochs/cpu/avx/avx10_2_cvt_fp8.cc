@@ -72,7 +72,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2BF8_Vf8HdqWphR(bxInstruction_c *i)
   bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8S_Vf8HdqWph_Kmask);
   unsigned n = 0;
 
-  Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
+  Bit64u mask, opmask = i->opmask() ? BX_READ_OPMASK(i->opmask()) : (Bit64u) -1; // 64 byte lanes at VL512
 
   // first half of the elements come from src2
   for (mask = 0x1; n < num_elements_from_source; n++, mask <<= 1) {
@@ -152,7 +152,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2HF8_Vf8HdqWphR(bxInstruction_c *i)
   bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8S_Vf8HdqWph_Kmask);
   unsigned n = 0;
 
-  Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
+  Bit64u mask, opmask = i->opmask() ? BX_READ_OPMASK(i->opmask()) : (Bit64u) -1; // 64 byte lanes at VL512
 
   // first half of the elements come from src2
   for (mask = 0x1; n < num_elements_from_source; n++, mask <<= 1) {

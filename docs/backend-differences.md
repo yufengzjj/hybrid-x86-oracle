@@ -692,6 +692,75 @@ no `add_features` entry is involved; the VEX `vcvtneps2bf16` row
 (`avx_ne_convert`, `avx/avx_ne_convert.cc`) is a separate, unmasked handler and
 was correct.
 
+## 4t. AVX10.2: IBS converts sign-extended and mis-handled NaN, VMINMAX copied a NaN src1's sign, BF16 FMA rounded twice and multiplied the wrong operands, VCOMXSS/VCOMXSD swapped, VCVT2PH2{B,H}F8 lost its upper half at VL512, VMOVRS ignored its mask — patched (Bochs)
+
+Eight defects found 2026-09-14 by diffing an independent model of the AVX10.2
+group (the BF16 arithmetic family, VMINMAX, VCOMX, the saturating converts,
+VCVT2PS2PHX, VDPPHPS, the FP8 converts and VMOVRS); each pinned by the Intel
+AVX10.2 Architecture Specification (361050-007) text:
+
+- `VCVT[T]{PS,PH,BF16}2IBS` wrote the signed byte SIGN-extended into its
+  32/16-bit element (the handler macros assign an `int8_t` to a `Bit32u`/
+  `Bit16u` lane) where the spec zeroes the upper bytes: `vcvtps2ibs` of -1.0
+  gave 0xFFFFFFFF instead of 0x000000FF. Zero-extending wrappers are now bound
+  to the twelve signed handlers (`avx_cvt.cc`, `avx512_cvt.cc`,
+  `avx512_cvt16.cc`, `avx10_2_bf16.cc`); the unsigned forms were correct.
+- `f32_to_i8` / `f32_to_ui8` (the rounding converts behind `VCVTPS2I[U]BS` and
+  `VCVTBF162I[U]BS`) had their NaN check compiled out — the `#if` guard tests
+  the i32/ui32 specialize constants, which are all equal — so a NaN fell into
+  the overflow path and returned ±127/-128 (0xFF/0) by sign. The spec says
+  "For NaN, (0) is returned", as the truncating and f16 siblings already did.
+- `f{16,32,64}_minmax` with sign control 0b00 copied src1's sign onto a
+  NUMBER result when src1 was the NaN of a `*Number` operation; the spec's
+  table 11.4 says the sign control is ignored there ("does not copy the sign
+  of SRC1 ... if SRC1 is a NAN").
+- `bf16_mulAdd` (all twelve `VF[N]M{ADD,SUB}{132,213,231}BF16`) rounded the
+  exact `a*b+c` to f32 and then to bf16 — a double rounding that loses a tiny
+  addend against a product sitting on a bf16 midpoint. The spec's "infinite
+  precision intermediate product ... RNE" is one rounding; the fix computes
+  the f32 FMA under round-to-zero, jams the inexact flag into the LSB
+  (round-to-odd) and lets the existing RNE narrowing round once. The other
+  bf16 helpers are provably free of the problem (an 8×8-bit product is exact
+  in f32; sums/quotients/roots of 8-bit operands cannot land within f32
+  rounding distance of a bf16 midpoint), so they are unchanged.
+- The twenty-four `VF[N]M{ADD,SUB}{132,213,231}BF16` rows were bound to the
+  ACCUMULATE-shaped `HANDLE_AVX_3OP` / `HANDLE_AVX512_3OP_WORD_EL_MASK`
+  templates (first lane operand = the destination register, src3 never read)
+  although they list their operands in the fp16 rows' FMA3 role order, so
+  every form multiplied the wrong pair: with dst=2, vvvv=3, rm=5 the 132/213/
+  231 forms gave 9/8/11 instead of 13/11/17. New `HANDLE_AVX_3SRC` /
+  `HANDLE_AVX512_3SRC_WORD_EL_MASK` templates read src1/src2/src3 (the
+  `HANDLE_AVX_PFP_3OP` shape) and the rows are rebound.
+- The EVEX `0F 2E`/`0F 2F` opmap rows swapped the two scalar sizes: the
+  spec's `VCOMXSS`/`VUCOMXSS` encoding (F3.W0) dispatched the SD handler and
+  the `VCOMXSD`/`VUCOMXSD` encoding (F2.W1) the SS one, so `vcomxss` compared
+  the low QWORDS as doubles — NaN vs 1.0 came out "greater" (all flags clear;
+  both bit patterns are tiny positive doubles). The IA names are swapped
+  back (`fetchdecode_opmap_evex.cc`); handlers and `.def` rows were right.
+- `VCVT2PH2BF8[S]` / `VCVT2PH2HF8[S]` walk their 2·KL byte lanes with a
+  `Bit32u` lane bit and a 32-bit opmask read; at VL512 (64 lanes) the bit
+  shifts out after 32 iterations, so the upper half — every byte converted
+  from src1 — was never written and `zmm1` kept its old bytes. `Bit64u` and
+  `BX_READ_OPMASK` fix it (`avx10_2_cvt_fp8.cc`).
+- The MAP5 `6F` opmap group (`VMOVRS{B,W,D,Q}`) put `ATTR_MASK_K0` on its
+  `_Kmask` rows instead of the plain ones — the reverse of every other group
+  (the attribute marks the row that matches an ABSENT mask) — so a masked
+  `vmovrs` ran the unmasked loader: merge holes were overwritten, `{z}`
+  zeroed nothing. The attributes are moved to the plain rows.
+
+All eight are fixed by
+[`patches/bochs/0010-avx10-2-ibs-zero-extend-nan-minmax-sign-bf16-fma.patch`](../patches/bochs/0010-avx10-2-ibs-zero-extend-nan-minmax-sign-bf16-fma.patch),
+applied by `scripts/vendor-bochs.sh` like its siblings. `tests/bochs_patches.rs`
+pins each of the eight against the spec text: all twelve I[U]BS rows (masked
+and unmasked) with [-1, 2, NaN, -300]; the four packed VMINMAX formats under
+both NaN modes; all twelve BF16 FMA forms with 2/3/5 (plain and merge-masked)
+plus the midpoint case that separates one rounding from two; the four
+VCOMX encodings with a NaN whose other-width reading is ordered; the four
+two-source FP8 converts at VL512 with mask bits above 31; and the four VMOVRS
+widths under merge, zero and no mask. Still present on
+upstream master as of 2026-09-14. No silicon with AVX10.2 was available to
+adjudicate: the spec text is the authority for each item.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

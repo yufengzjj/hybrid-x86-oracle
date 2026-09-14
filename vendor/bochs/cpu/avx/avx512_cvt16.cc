@@ -463,6 +463,9 @@ AVX512_CVT32_TO_16_MASK(VCVTPS2PHX_MASK_VphWpsR, f32_to_f16)
 AVX512_CVT32_TO_16_MASK(VCVTDQ2PH_MASK_VphWdqR, i32_to_f16)
 AVX512_CVT32_TO_16_MASK(VCVTUDQ2PH_MASK_VphWdqR, ui32_to_f16)
 
+static BX_CPP_INLINE Bit16u f16_to_i8_saturate_zx(float16 a, softfloat_status_t *status) { return (Bit8u) f16_to_i8_saturate(a, status); }
+static BX_CPP_INLINE Bit16u f16_to_i8_round_to_zero_saturate_zx(float16 a, softfloat_status_t *status) { return (Bit8u) f16_to_i8_round_to_zero_saturate(a, status); }
+
 #define AVX512_CVT16_TO_16(HANDLER, func)                                                   \
   void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                       \
   {                                                                                         \
@@ -487,9 +490,9 @@ AVX512_CVT16_TO_16(VCVTTPH2UW_VdqWphR, f16_to_ui16_round_to_zero)
 AVX512_CVT16_TO_16(VCVTTPH2W_VdqWphR, f16_to_i16_round_to_zero)
 AVX512_CVT16_TO_16(VCVTUW2PH_VphWdqR, ui16_to_f16)
 AVX512_CVT16_TO_16(VCVTW2PH_VphWdqR, i16_to_f16)
-AVX512_CVT16_TO_16(VCVTPH2IBS_V8bWphR, f16_to_i8_saturate) // AVX 10.2
+AVX512_CVT16_TO_16(VCVTPH2IBS_V8bWphR, f16_to_i8_saturate_zx) // AVX 10.2
 AVX512_CVT16_TO_16(VCVTPH2IUBS_V8bWphR, f16_to_ui8_saturate) // AVX 10.2
-AVX512_CVT16_TO_16(VCVTTPH2IBS_V8bWphR, f16_to_i8_round_to_zero_saturate) // AVX 10.2
+AVX512_CVT16_TO_16(VCVTTPH2IBS_V8bWphR, f16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
 AVX512_CVT16_TO_16(VCVTTPH2IUBS_V8bWphR, f16_to_ui8_round_to_zero_saturate) // AVX 10.2
 
 #define AVX512_CVT16_TO_16_MASK(HANDLER, func)                                              \
@@ -529,9 +532,9 @@ AVX512_CVT16_TO_16_MASK(VCVTTPH2UW_MASK_VdqWphR, f16_to_ui16_round_to_zero)
 AVX512_CVT16_TO_16_MASK(VCVTTPH2W_MASK_VdqWphR, f16_to_i16_round_to_zero)
 AVX512_CVT16_TO_16_MASK(VCVTUW2PH_MASK_VphWdqR, ui16_to_f16)
 AVX512_CVT16_TO_16_MASK(VCVTW2PH_MASK_VphWdqR, i16_to_f16)
-AVX512_CVT16_TO_16_MASK(VCVTPH2IBS_MASK_V8bWphR, f16_to_i8_saturate) // AVX 10.2
+AVX512_CVT16_TO_16_MASK(VCVTPH2IBS_MASK_V8bWphR, f16_to_i8_saturate_zx) // AVX 10.2
 AVX512_CVT16_TO_16_MASK(VCVTPH2IUBS_MASK_V8bWphR, f16_to_ui8_saturate) // AVX 10.2
-AVX512_CVT16_TO_16_MASK(VCVTTPH2IBS_MASK_V8bWphR, f16_to_i8_round_to_zero_saturate) // AVX 10.2
+AVX512_CVT16_TO_16_MASK(VCVTTPH2IBS_MASK_V8bWphR, f16_to_i8_round_to_zero_saturate_zx) // AVX 10.2
 AVX512_CVT16_TO_16_MASK(VCVTTPH2IUBS_MASK_V8bWphR, f16_to_ui8_round_to_zero_saturate) // AVX 10.2
 
 #define AVX512_CVT16_TO_32(HANDLER, func)                                                   \
