@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4t are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4u are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -1473,5 +1473,80 @@ fn vmovrs_without_a_mask_still_loads_every_lane() {
         let zmm0 = run_vmovrs(*p1, 0x08, 0x5555);
         assert_eq!(&zmm0[..2], &[0x1716_1514_1312_1110, 0x1F1E_1D1C_1B1A_1918], "{name} xmm0, [rbx]: {zmm0:x?}");
         assert_eq!(&zmm0[2..], &[0; 6], "{name} xmm0, [rbx]: bits 128..511 of {zmm0:x?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4u: the AVX-NE-CONVERT broadcasts.
+//
+// `vbcstne{bf16,sh}2ps` load one 16-bit element, widen it to fp32 and
+// broadcast it to every dword lane (SDM: `dest.dword[i] = make_fp32(...)`).
+// Upstream broadcast the widened value with the WORD helper, which truncated
+// the fp32 to its low word and filled the word lanes with that, and its
+// `0F38 B1` opmap had the two prefixes crossed (the SDM has F3 = bf16 and
+// 66 = fp16, as the neighbouring `B0` group already does).
+// `patches/bochs/0011-avx-ne-convert-bcst-dword-and-opmap.patch` is what
+// makes these pass. All encodings are VEX `op xmm0/ymm0, [rbx]`: byte 2 is
+// W0 + vvvv=1111 + L + pp, so only that byte differs between the forms.
+
+/// `(mnemonic, VEX byte 2 at L=0, memory word, widened fp32)`. The values are
+/// chosen so that reading the word in the OTHER format gives a different
+/// fp32: bf16 1.0 read as fp16 is 1.875, fp16 1.0 read as bf16 is 2⁻⁷, and
+/// the fp16 denormal 2⁻²⁴ (exactly the normal fp32 0x33800000) read as bf16
+/// is an fp32 denormal.
+const BCST_CASES: &[(&str, u8, u16, u32)] = &[
+    ("vbcstnebf162ps", 0x7A, 0x3F80, 0x3F80_0000),
+    ("vbcstnebf162ps", 0x7A, 0xC0A0, 0xC0A0_0000),
+    ("vbcstnesh2ps", 0x79, 0x3C00, 0x3F80_0000),
+    ("vbcstnesh2ps", 0x79, 0x0001, 0x3380_0000),
+    ("vbcstnesh2ps", 0x79, 0xC500, 0xC0A0_0000),
+];
+
+/// §4u proper, both defects at once: every dword lane of the destination is
+/// the widened fp32 of the one word at [rbx] — for the ymm form (L=1) all
+/// eight lanes — and the lanes above VL are zero.
+#[test]
+fn ne_convert_broadcasts_widen_one_word_into_every_dword_lane() {
+    for (name, byte2, word, want) in BCST_CASES {
+        for (reg, l_bit) in [("xmm0", 0x00), ("ymm0", 0x04)] {
+            let mut cpu = BochsOracle::new();
+            cpu.write_mem(DATA, &word.to_le_bytes());
+            cpu.set_gpr(RBX, DATA);
+            cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+            run(&mut cpu, &[0xC4, 0xE2, byte2 | l_bit, 0xB1, 0x03], 1);
+            let zmm0 = cpu.get_zmm(0);
+            let count = if l_bit != 0 { 8 } else { 4 };
+            for n in 0..16 {
+                let expect = if n < count { u64::from(*want) } else { 0 };
+                assert_eq!(lane(&zmm0, 32, n), expect, "{name} {reg}, [rbx] = {word:#06x}: dword {n} of {zmm0:x?}");
+            }
+        }
+    }
+}
+
+/// The control: the `B0` group next door had F3 = bf16 / 66 = fp16 all along
+/// (NP/F2 are the odd-word forms), so a swap that went the wrong way round
+/// would fail here. Even words hold bf16 1.0, odd words fp16 1.0, so each of
+/// the four forms produces a different, recognisable fp32.
+#[test]
+fn ne_convert_even_odd_forms_keep_their_prefixes() {
+    const B0_FORMS: &[(&str, u8, u32)] = &[
+        ("vcvtneebf162ps", 0x7A, 0x3F80_0000), // F3, even words: bf16 1.0
+        ("vcvtneobf162ps", 0x7B, 0x3C00_0000), // F2, odd words: 0x3C00 as bf16 = 2⁻⁷
+        ("vcvtneeph2ps", 0x79, 0x3FF0_0000),   // 66, even words: 0x3F80 as fp16 = 1.875
+        ("vcvtneoph2ps", 0x78, 0x3F80_0000),   // NP, odd words: fp16 1.0
+    ];
+    let window: Vec<u8> = (0..16u16).flat_map(|n| if n % 2 == 0 { 0x3F80u16 } else { 0x3C00 }.to_le_bytes()).collect();
+    for (name, byte2, want) in B0_FORMS {
+        let mut cpu = BochsOracle::new();
+        cpu.write_mem(DATA, &window);
+        cpu.set_gpr(RBX, DATA);
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        run(&mut cpu, &[0xC4, 0xE2, byte2 | 0x04, 0xB0, 0x03], 1); // op ymm0, [rbx]
+        let zmm0 = cpu.get_zmm(0);
+        for n in 0..16 {
+            let expect = if n < 8 { u64::from(*want) } else { 0 };
+            assert_eq!(lane(&zmm0, 32, n), expect, "{name} ymm0, [rbx]: dword {n} of {zmm0:x?}");
+        }
     }
 }

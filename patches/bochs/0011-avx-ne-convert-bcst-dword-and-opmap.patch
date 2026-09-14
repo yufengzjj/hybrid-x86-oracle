@@ -1,0 +1,64 @@
+AVX-NE-CONVERT: VBCSTNEBF162PS / VBCSTNESH2PS broadcast a word instead of the widened dword, and their opmap prefixes are swapped
+
+Two defects found while diffing an independent model of the AVX-NE-CONVERT
+group (the six load-and-widen forms) against the emulator; the SDM (Vol. 2C,
+VBCSTNEBF162PS / VBCSTNESH2PS) is the authority for both.
+
+1. VBCSTNEBF162PS_VpsWwM and VBCSTNESH2PS_VpsWshM widen the one 16-bit memory
+   element to float32 and then replicate it with xmm_pbroadcastw(), whose
+   parameter is a Bit16u: the float32 is truncated to its LOW word and that
+   word is broadcast to all eight word lanes. For the bf16 form the low word
+   of the shifted value is always zero, so every result was +0.0; for the
+   fp16 form it was the low half of the converted mantissa in every word. The
+   SDM: "dest.dword[i] = make_fp32(TMP.dword[i].word[0])" /
+   "convert_fp16_to_fp32(...)" for i in range(KL) - one f32 per DWORD lane.
+   Fixed by broadcasting the dword (xmm_pbroadcastd).
+
+2. The VEX 0F38 B1 opmap group binds prefix 66 to VBCSTNEBF162PS and F3 to
+   VBCSTNESH2PS. The SDM encodings are the other way round: VBCSTNEBF162PS is
+   VEX.128/256.F3.0F38.W0 B1 and VBCSTNESH2PS is VEX.128/256.66.0F38.W0 B1
+   (the B0 group next to it already has F3 = bf16 / 66 = fp16). So a
+   vbcstnebf162ps executed the fp16 widen and vice versa. The IA names are
+   swapped back; handlers and .def rows were right.
+
+Found 2026-09-14 by the hybrid-x86-oracle differential harness diffing the
+zens model of the AVX-NE-CONVERT group. Both are present on upstream master as
+of 2026-09-14.
+
+diff --git a/cpu/avx/avx_ne_convert.cc b/cpu/avx/avx_ne_convert.cc
+index a3d2a7c..7776649 100644
+--- a/cpu/avx/avx_ne_convert.cc
++++ b/cpu/avx/avx_ne_convert.cc
+@@ -68,7 +68,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VBCSTNEBF162PS_VpsWwM(bxInstruction_c *i)
+   float32 op = convert_bfloat16_to_fp32(read_virtual_word(i->seg(), eaddr));
+ 
+   for (unsigned n=0; n < len; n++)
+-    xmm_pbroadcastw(&dst.vmm128(n), op);
++    xmm_pbroadcastd(&dst.vmm128(n), op); // op is the widened float32, not a word
+ 
+   BX_WRITE_AVX_REG(i->dst(), dst);
+   BX_NEXT_INSTR(i);
+@@ -84,7 +84,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VBCSTNESH2PS_VpsWshM(bxInstruction_c *i)
+   float32 op = convert_ne_fp16_to_fp32(read_virtual_word(i->seg(), eaddr));
+ 
+   for (unsigned n=0; n < len; n++)
+-    xmm_pbroadcastw(&dst.vmm128(n), op);
++    xmm_pbroadcastd(&dst.vmm128(n), op); // op is the widened float32, not a word
+ 
+   BX_WRITE_AVX_REG(i->dst(), dst);
+   BX_NEXT_INSTR(i);
+diff --git a/cpu/decoder/fetchdecode_opmap_avx.cc b/cpu/decoder/fetchdecode_opmap_avx.cc
+index a496458..fbc9862 100644
+--- a/cpu/decoder/fetchdecode_opmap_avx.cc
++++ b/cpu/decoder/fetchdecode_opmap_avx.cc
+@@ -1180,8 +1180,8 @@ static const Bit64u BxOpcodeGroup_VEX_0F38B0[] = {
+ };
+ 
+ static const Bit64u BxOpcodeGroup_VEX_0F38B1[] = {
+-  form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W0 | ATTR_MOD_MEM, BX_IA_VBCSTNEBF162PS_VpsWw),
+-  last_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_MOD_MEM, BX_IA_VBCSTNESH2PS_VpsWsh)
++  form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W0 | ATTR_MOD_MEM, BX_IA_VBCSTNESH2PS_VpsWsh),
++  last_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_MOD_MEM, BX_IA_VBCSTNEBF162PS_VpsWw)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_VEX_0F38B4[] = { last_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W1, BX_IA_VPMADD52LUQ_VdqHdqWdq) };

@@ -761,6 +761,32 @@ widths under merge, zero and no mask. Still present on
 upstream master as of 2026-09-14. No silicon with AVX10.2 was available to
 adjudicate: the spec text is the authority for each item.
 
+## 4u. AVX-NE-CONVERT: `VBCSTNEBF162PS` / `VBCSTNESH2PS` broadcast a word and had their prefixes swapped — patched (Bochs)
+
+Two defects found 2026-09-14 by diffing an independent model of the
+AVX-NE-CONVERT group (the six load-and-widen forms); the SDM Vol. 2C pages
+are the authority:
+
+- Both broadcast handlers widen the 16-bit memory element to float32 and then
+  replicate it with `xmm_pbroadcastw()`, whose parameter is a `Bit16u`: the
+  float32 was truncated to its low WORD and that word filled all eight word
+  lanes — every `vbcstnebf162ps` result was +0.0 (the shifted bf16's low word
+  is zero), every `vbcstnesh2ps` result the low half of the converted mantissa
+  repeated. The SDM writes one f32 per dword lane; `xmm_pbroadcastd` fixes it
+  (`avx_ne_convert.cc`).
+- The VEX `0F38 B1` opmap group bound prefix 66 to `VBCSTNEBF162PS` and F3 to
+  `VBCSTNESH2PS`, the reverse of the SDM encodings (F3 = bf16, 66 = fp16 —
+  as the neighbouring `B0` group already has), so each spelling executed the
+  other's widen. The IA names are swapped back (`fetchdecode_opmap_avx.cc`).
+
+Both are fixed by
+[`patches/bochs/0011-avx-ne-convert-bcst-dword-and-opmap.patch`](../patches/bochs/0011-avx-ne-convert-bcst-dword-and-opmap.patch),
+applied by `scripts/vendor-bochs.sh` like its siblings; `tests/bochs_patches.rs`
+pins both spellings at 128 and 256 bits against the SDM pseudocode (a bf16
+1.0 broadcasting to 0x3F800000, an fp16 denormal to its exact normal f32).
+Still present on upstream master as of 2026-09-14. No silicon with
+AVX-NE-CONVERT was available; the SDM text is the authority.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

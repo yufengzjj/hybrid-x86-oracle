@@ -68,7 +68,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VBCSTNEBF162PS_VpsWwM(bxInstruction_c *i)
   float32 op = convert_bfloat16_to_fp32(read_virtual_word(i->seg(), eaddr));
 
   for (unsigned n=0; n < len; n++)
-    xmm_pbroadcastw(&dst.vmm128(n), op);
+    xmm_pbroadcastd(&dst.vmm128(n), op); // op is the widened float32, not a word
 
   BX_WRITE_AVX_REG(i->dst(), dst);
   BX_NEXT_INSTR(i);
@@ -84,7 +84,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VBCSTNESH2PS_VpsWshM(bxInstruction_c *i)
   float32 op = convert_ne_fp16_to_fp32(read_virtual_word(i->seg(), eaddr));
 
   for (unsigned n=0; n < len; n++)
-    xmm_pbroadcastw(&dst.vmm128(n), op);
+    xmm_pbroadcastd(&dst.vmm128(n), op); // op is the widened float32, not a word
 
   BX_WRITE_AVX_REG(i->dst(), dst);
   BX_NEXT_INSTR(i);
