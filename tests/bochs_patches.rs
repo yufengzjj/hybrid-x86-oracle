@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4r are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4s are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -878,5 +878,144 @@ fn one_source_fp8_converts_still_saturate_on_the_s_spelling_only() {
     for (name, code, want) in FP8_ONE_SOURCE {
         let got = fp8_convert(code);
         assert_eq!(&got[..8], want, "{name} of xmm1 = [-max, +max, 1.0]");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4s: the two AVX512-BF16 converts.
+//
+// `vcvtneps2bf16 {k}` (merge) blended the converted words into the LIVE
+// destination and then wrote its zero-initialised local over it, so a merge
+// mask behaved like a zeroing one. `vcvtne2ps2bf16` indexed src1 with the
+// running word index instead of `n - KL/2`, so the high half of the result
+// came from src1's dwords ABOVE the vector length (and, at VL512, from past
+// the end of the local). `patches/bochs/0009-avx512-bf16-merge-mask-and-src1-index.patch`
+// is what makes these pass.
+//
+// Both instructions are EVEX.0F38.W0 72 /r; only the SSE prefix (F3 vs F2),
+// the vvvv field and P2 (L'L, z, aaa) differ between the cases below.
+
+/// bf16 word `n` of a register image.
+fn word(z: &[u64; ZMM_CHUNKS], n: usize) -> u16 {
+    (z[n / 4] >> (16 * (n % 4))) as u16
+}
+
+/// A register whose fp32 lane `n` holds `base + n`. `base` is a small integer,
+/// so every lane converts to bf16 exactly and no rounding is in play.
+fn f32_lanes(base: f32) -> [u64; ZMM_CHUNKS] {
+    core::array::from_fn(|c| {
+        let lo = (base + (2 * c) as f32).to_bits() as u64;
+        let hi = (base + (2 * c + 1) as f32).to_bits() as u64;
+        lo | hi << 32
+    })
+}
+
+/// The bf16 encoding of an fp32 value that needs no rounding.
+fn bf16(f: f32) -> u16 {
+    assert_eq!(f.to_bits() & 0xFFFF, 0, "{f} is not exactly representable in bf16");
+    (f.to_bits() >> 16) as u16
+}
+
+/// `vcvtneps2bf16 dst1 {k7}, src2` at the given VL, with `k7 = mask`; the
+/// destination starts as [`STALE`; 8] and the source as `f32_lanes(100.0)`.
+/// `p2` is EVEX P2 (z, L'L, aaa) so the caller chooses VL and merge/zero.
+fn run_vcvtneps2bf16(p2: u8, mask: u16) -> [u64; ZMM_CHUNKS] {
+    let mut cpu = BochsOracle::new();
+    cpu.set_zmm(1, &[STALE; ZMM_CHUNKS]);
+    cpu.set_zmm(2, &f32_lanes(100.0));
+    cpu.set_gpr(RCX, u64::from(mask));
+    run(
+        &mut cpu,
+        &[
+            0xC5, 0xF8, 0x92, 0xF9, // kmovw k7, ecx
+            0x62, 0xF2, 0x7E, p2, 0x72, 0xCA, // vcvtneps2bf16 xmm1/ymm1 {k7}, ymm2/zmm2
+        ],
+        2,
+    );
+    cpu.get_zmm(1)
+}
+
+/// `(VL, P2 with aaa=111, source dword count, mask)`; the mask has holes at
+/// both ends and in the middle so a fix that merged only some of the lanes
+/// would still fail.
+const VCVTNEPS2BF16_FORMS: &[(&str, u8, usize, u16)] = &[
+    ("ymm source", 0x2F, 8, 0x96),
+    ("zmm source", 0x4F, 16, 0x9696),
+];
+
+/// §4s proper: under a merge mask the unselected words keep the old
+/// destination, the selected ones are converted, and everything from the
+/// converted count up is zero — including the destination's own upper half
+/// (words `count..2*count`), which the source's width does not cover and
+/// which a blend-into-the-register fix would have left at `STALE`.
+#[test]
+fn vcvtneps2bf16_merge_mask_keeps_the_unselected_destination_words() {
+    for (name, p2, count, mask) in VCVTNEPS2BF16_FORMS {
+        let zmm1 = run_vcvtneps2bf16(*p2, *mask);
+        for n in 0..32 {
+            let want = if n >= *count {
+                0
+            } else if mask & (1 << n) != 0 {
+                bf16(100.0 + n as f32)
+            } else {
+                STALE as u16
+            };
+            assert_eq!(word(&zmm1, n), want, "{name}, merge mask {mask:#x}: word {n} of {zmm1:x?}");
+        }
+    }
+}
+
+/// The control: `{k7}{z}` zeroes the holes, and the unmasked form converts
+/// every lane. Both already worked and must keep working after the fix.
+#[test]
+fn vcvtneps2bf16_zero_mask_and_unmasked_forms_are_unchanged() {
+    for (name, p2, count, mask) in VCVTNEPS2BF16_FORMS {
+        let zmm1 = run_vcvtneps2bf16(*p2 | 0x80, *mask);
+        for n in 0..32 {
+            let want = if n < *count && mask & (1 << n) != 0 { bf16(100.0 + n as f32) } else { 0 };
+            assert_eq!(word(&zmm1, n), want, "{name}, zero mask {mask:#x}: word {n} of {zmm1:x?}");
+        }
+
+        let zmm1 = run_vcvtneps2bf16(*p2 & !0x07, *mask);
+        for n in 0..32 {
+            let want = if n < *count { bf16(100.0 + n as f32) } else { 0 };
+            assert_eq!(word(&zmm1, n), want, "{name}, unmasked: word {n} of {zmm1:x?}");
+        }
+    }
+}
+
+/// `(VL, P2 with aaa=000, dword count per source)`.
+const VCVTNE2PS2BF16_FORMS: &[(&str, u8, usize)] = &[
+    ("xmm", 0x08, 4),
+    ("ymm", 0x28, 8),
+    ("zmm", 0x48, 16),
+];
+
+/// §4s proper: `vcvtne2ps2bf16 dst0, src1, src2` fills the low half of the
+/// result from src2 and the high half from src1's dwords 0..KL/2 (SDM:
+/// `SRC1.fp32[j - KL/2]`). Every dword of both sources is distinct, so reading
+/// src1 at the unshifted index shows up as the wrong value at VL128/VL256; at
+/// VL512 that read was out of bounds, and this pins whatever it happened to
+/// return down to the architectural answer.
+#[test]
+fn vcvtne2ps2bf16_takes_its_high_half_from_the_low_dwords_of_src1() {
+    for (name, p2, count) in VCVTNE2PS2BF16_FORMS {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &f32_lanes(100.0));
+        cpu.set_zmm(2, &f32_lanes(200.0));
+        // vcvtne2ps2bf16 xmm0/ymm0/zmm0, xmm1/ymm1/zmm1, xmm2/ymm2/zmm2
+        run(&mut cpu, &[0x62, 0xF2, 0x77, *p2, 0x72, 0xC2], 1);
+        let zmm0 = cpu.get_zmm(0);
+        for n in 0..32 {
+            let want = if n < *count {
+                bf16(200.0 + n as f32)
+            } else if n < 2 * count {
+                bf16(100.0 + (n - count) as f32)
+            } else {
+                0
+            };
+            assert_eq!(word(&zmm0, n), want, "{name} sources: word {n} of {zmm0:x?}");
+        }
     }
 }

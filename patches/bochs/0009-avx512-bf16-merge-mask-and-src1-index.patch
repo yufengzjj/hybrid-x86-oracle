@@ -1,0 +1,54 @@
+AVX512-BF16: VCVTNEPS2BF16 merge-masking zeroed the holes; VCVTNE2PS2BF16 read src1 past the vector length
+
+Two defects in cpu/avx/avx512_bf16.cc, both in the one-instruction paths a
+differential run against an independent model hits at once.
+
+1. VCVTNEPS2BF16_MASK_VphWpsR with a merge mask ({k} without {z}) blended the
+   converted words into the LIVE destination register - simd_pblendw's first
+   argument is BX_READ_AVX_REG(i->dst()) - and then unconditionally wrote the
+   local `dst` (holes still zero from dst.clear()) over it with
+   BX_WRITE_AVX_REGZ. Merge masking therefore behaved exactly like zeroing
+   masking: every unselected bf16 lane came out 0 instead of keeping the old
+   destination value. The fix blends the OLD destination's words into the
+   local result for the unselected lanes (inverted mask) and keeps the
+   existing BX_WRITE_AVX_REGZ, which is what zeroes the words above the
+   converted count - the destination is half the source's width, so the
+   sibling handlers' blend-into-the-register + BX_CLEAR_AVX_REGZ(len) idiom
+   would leave the destination's upper half stale here.
+
+2. VCVTNE2PS2BF16_MASK_VphHpsWpsR fills the destination's low half from src2
+   and its high half from src1, but indexed src1 with the running WORD index
+   n in [DWORD_ELEMENTS(len), WORD_ELEMENTS(len)) instead of
+   n - DWORD_ELEMENTS(len). At VL128/VL256 that converts src1's dwords ABOVE
+   the vector length (bits 128..255 / 256..511 of the register) - wrong
+   values, and different from the SDM's SRC1.fp32[j - KL/2]; at VL512 it
+   reads past the 64-byte local altogether (undefined behaviour). Subtracting
+   the dword count is the whole fix.
+
+Found 2026-09-14 by the hybrid-x86-oracle differential harness diffing the
+zens model of the three AVX512-BF16 instructions (vdpbf16ps was clean).
+Both defects are present on upstream master as of 2026-09-14.
+
+The hunks below are deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/avx/avx512_bf16.cc
++++ b/cpu/avx/avx512_bf16.cc
+@@ -48,7 +48,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVTNEPS2BF16_MASK_VphWpsR(bxInstruction_c
+   }
+ 
+   if (! i->isZeroMasking()) {
+-    simd_pblendw(&BX_READ_AVX_REG(i->dst()), &dst, opmask, num_elements);
++    simd_pblendw(&dst, &BX_READ_AVX_REG(i->dst()), ~opmask, num_elements);
+   }
+ 
+   BX_WRITE_AVX_REGZ(i->dst(), dst, len);
+@@ -67,7 +67,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVTNE2PS2BF16_MASK_VphHpsWpsR(bxInstructi
+ 
+   // other half of the elements
+   for (;n < WORD_ELEMENTS(len); n++)
+-    dst.vmm16u(n) = convert_ne_fp32_to_bfloat16(op1.vmm32u(n));
++    dst.vmm16u(n) = convert_ne_fp32_to_bfloat16(op1.vmm32u(n - DWORD_ELEMENTS(len)));
+ 
+   if (i->opmask()) {
+     avx512_write_regw_masked(i, &dst, len, BX_READ_32BIT_OPMASK(i->opmask()));

@@ -653,6 +653,45 @@ handlers §4q was about to make reachable, not by a diff — which is also why
 path exists in `avx/bf8.h` / `avx/hf8.h`, it was only keyed wrongly for two of
 the six. Still present on upstream master as of 2026-09-14.
 
+## 4s. AVX512-BF16: `VCVTNEPS2BF16` merge mask zeroed, `VCVTNE2PS2BF16` read src1 above VL — patched (Bochs)
+
+Two defects in `avx/avx512_bf16.cc`, found 2026-09-14 by diffing an
+independent model of the three AVX512-BF16 instructions (`vdpbf16ps` was
+clean):
+
+- `VCVTNEPS2BF16_MASK_VphWpsR` under a MERGE mask (`{k}` without `{z}`)
+  blended the converted words into the live destination register and then
+  unconditionally wrote its local `dst` — holes still zero from `dst.clear()`
+  — over it with `BX_WRITE_AVX_REGZ`. Merge masking therefore behaved exactly
+  like zeroing masking: `vcvtneps2bf16 xmm1 {k7}, ymm2` with k7 = 0x96 left
+  words 0, 3, 5, 6 as 0 where hardware keeps the old xmm1 words. The fix
+  blends the OLD destination's words into the local result for the unselected
+  lanes (inverted mask) and keeps the existing `BX_WRITE_AVX_REGZ`, which is
+  what zeroes the words above the converted count — the destination is half
+  the source's width, so the sibling handlers' blend-into-the-register +
+  `BX_CLEAR_AVX_REGZ(len)` idiom (`avx512_cvt16.cc`) would leave the
+  destination's upper half stale here (the differential caught exactly that
+  on a first attempt).
+- `VCVTNE2PS2BF16_MASK_VphHpsWpsR` fills the low half of the destination from
+  src2 and the high half from src1, but indexed src1 with the running word
+  index `n` instead of `n - DWORD_ELEMENTS(len)`. At VL128/VL256 the high half
+  came from src1's dwords ABOVE the vector length (register bits 128..255 /
+  256..511 — wrong values, and different from the SDM's `SRC1.fp32[j - KL/2]`);
+  at VL512 it read past the 64-byte local (undefined behaviour — the
+  differential happened to pass there, which is what UB looks like).
+
+Both are fixed by
+[`patches/bochs/0009-avx512-bf16-merge-mask-and-src1-index.patch`](../patches/bochs/0009-avx512-bf16-merge-mask-and-src1-index.patch),
+applied by `scripts/vendor-bochs.sh` like its siblings. `tests/bochs_patches.rs`
+pins both — the merge case seeds every chunk of the destination and checks
+words above the converted count too, so the blend-into-the-register variant
+fails there, and the two-source case gives every dword of both sources a
+distinct value at all three vector lengths. Still present on
+upstream master as of 2026-09-14. Sapphire Rapids has AVX512-BF16 natively, so
+no `add_features` entry is involved; the VEX `vcvtneps2bf16` row
+(`avx_ne_convert`, `avx/avx_ne_convert.cc`) is a separate, unmasked handler and
+was correct.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

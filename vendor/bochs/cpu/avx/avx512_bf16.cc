@@ -48,7 +48,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVTNEPS2BF16_MASK_VphWpsR(bxInstruction_c
   }
 
   if (! i->isZeroMasking()) {
-    simd_pblendw(&BX_READ_AVX_REG(i->dst()), &dst, opmask, num_elements);
+    simd_pblendw(&dst, &BX_READ_AVX_REG(i->dst()), ~opmask, num_elements);
   }
 
   BX_WRITE_AVX_REGZ(i->dst(), dst, len);
@@ -67,7 +67,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVTNE2PS2BF16_MASK_VphHpsWpsR(bxInstructi
 
   // other half of the elements
   for (;n < WORD_ELEMENTS(len); n++)
-    dst.vmm16u(n) = convert_ne_fp32_to_bfloat16(op1.vmm32u(n));
+    dst.vmm16u(n) = convert_ne_fp32_to_bfloat16(op1.vmm32u(n - DWORD_ELEMENTS(len)));
 
   if (i->opmask()) {
     avx512_write_regw_masked(i, &dst, len, BX_READ_32BIT_OPMASK(i->opmask()));
