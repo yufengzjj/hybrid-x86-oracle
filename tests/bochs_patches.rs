@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4p are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4r are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -665,5 +665,218 @@ fn rewriting_code_in_a_later_page_line_replaces_the_cached_trace() {
         let out = cpu.step();
         assert!(out.is_retired(), "mov rax, {imm}: {out:?}");
         assert_eq!(cpu.get_gpr(RAX), u64::from(imm), "line-6 trace was replayed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4q: the extensions layered onto sapphire_rapids with `add_features`.
+//
+// The CPUID bit is what gates decoding, so the real pin is "the encoding
+// retires instead of #UD". One representative encoding per feature name in
+// `cpu_added_features`, in the shim's order; every byte string is what GNU as
+// 2.45 emits for the mnemonic in the comment. A name that fell out of the list
+// (or a re-vendor that lost a handler) shows up as an UndefinedOpcode here.
+
+/// Step one instruction at `CODE` and require it to retire; `rbx` points at
+/// `DATA` for the memory forms and `rsi` is a tile stride.
+#[track_caller]
+fn retires(cpu: &mut BochsOracle, name: &str, code: &[u8]) {
+    cpu.set_rip(CODE);
+    cpu.write_mem(CODE, code);
+    let out = cpu.step();
+    assert!(out.is_retired(), "{name}: {out:?} ({})", cpu.fault_msg());
+}
+
+/// `(feature name, mnemonic, encoding)` for everything but the AMX group,
+/// which needs a tile configuration first (below).
+const ADDED_FEATURE_PROBES: &[(&str, &str, &[u8])] = &[
+    ("avx10_2", "vminmaxps xmm0, xmm1, xmm2, 0", &[0x62, 0xF3, 0x75, 0x08, 0x52, 0xC2, 0x00]),
+    ("avx10_2_movrs", "vmovrsb zmm0, [rbx]", &[0x62, 0xF5, 0x7F, 0x48, 0x6F, 0x03]),
+    ("movrs", "movrs rax, [rbx]", &[0x48, 0x0F, 0x38, 0x8B, 0x03]),
+    ("avx_ne_convert", "vbcstnebf162ps xmm0, [rbx]", &[0xC4, 0xE2, 0x7A, 0xB1, 0x03]),
+    ("sha512", "vsha512msg1 ymm0, xmm1", &[0xC4, 0xE2, 0x7F, 0xCC, 0xC1]),
+    ("sm3", "vsm3msg1 xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0x70, 0xDA, 0xC2]),
+    ("sm4", "vsm4key4 xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0x72, 0xDA, 0xC2]),
+    ("avx_ifma", "{vex} vpmadd52luq xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0xF1, 0xB4, 0xC2]),
+    ("avx_vnni_int8", "vpdpbssd xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0x73, 0x50, 0xC2]),
+    ("avx_vnni_int16", "vpdpwsud xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0x72, 0xD2, 0xC2]),
+    ("cmpccxadd", "cmpoxadd [rbx], rax, rcx", &[0xC4, 0xE2, 0xF1, 0xE0, 0x03]),
+    ("avx512vp2intersect", "vp2intersectd k0, zmm0, zmm1", &[0x62, 0xF2, 0x7F, 0x48, 0x68, 0xC1]),
+    ("xop", "vpcomltb xmm0, xmm1, xmm2", &[0x8F, 0xE8, 0x70, 0xCC, 0xC2, 0x00]),
+    ("fma4", "vfmaddps xmm0, xmm1, xmm2, xmm3", &[0xC4, 0xE3, 0xF1, 0x68, 0xC3, 0x20]),
+    ("tbm", "bextr rax, rbx, 0x1234", &[0x8F, 0xEA, 0xF8, 0x10, 0xC3, 0x34, 0x12, 0x00, 0x00]),
+    ("sse4a", "extrq xmm0, 1, 2", &[0x66, 0x0F, 0x78, 0xC0, 0x01, 0x02]),
+    ("3dnow", "pfadd mm0, mm1", &[0x0F, 0x0F, 0xC1, 0x9E]),
+    ("3dnow_ext", "pswapd mm0, mm1", &[0x0F, 0x0F, 0xC1, 0xBB]),
+];
+
+/// §4q: every non-AMX feature in `cpu_added_features` decodes. `avx10_1` has
+/// no instruction of its own here (it re-labels AVX-512), so `avx10_2` stands
+/// for both.
+#[test]
+fn every_added_feature_decodes() {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(DATA, &[0u8; 64]);
+    cpu.set_gpr(RBX, DATA);
+    for (feature, mnemonic, code) in ADDED_FEATURE_PROBES {
+        retires(&mut cpu, &format!("{feature}: {mnemonic}"), code);
+    }
+}
+
+/// The AMX half of §4q, after a 16×64 configuration for tmm0..tmm2 (the
+/// TMUL shape checks need C = m×n, A = m×k, B = k×n; 16 rows × 16 dwords fits
+/// all three). `tcvtrowd2ps` reads row `eax` = 0 of tmm0.
+#[test]
+fn every_added_amx_feature_decodes() {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(16, 64), (16, 64), (16, 64)]));
+    cpu.write_mem(DATA, &[0u8; 1024]);
+    cpu.set_gpr(RBX, CFG_IN);
+    retires(&mut cpu, "ldtilecfg [rbx]", &LDTILECFG_RBX);
+    cpu.set_gpr(RBX, DATA);
+    cpu.set_gpr(RSI, 64);
+    cpu.set_gpr(RAX, 0);
+    for (feature, mnemonic, code) in [
+        ("amx_fp16", "tdpfp16ps tmm0, tmm1, tmm2", &[0xC4, 0xE2, 0x6B, 0x5C, 0xC1][..]),
+        ("amx_complex", "tcmmimfp16ps tmm0, tmm1, tmm2", &[0xC4, 0xE2, 0x69, 0x6C, 0xC1]),
+        ("amx_fp8", "tdpbf8ps tmm0, tmm1, tmm2", &[0xC4, 0xE5, 0x68, 0xFD, 0xC1]),
+        ("amx_avx512", "tcvtrowd2ps zmm0, tmm0, eax", &[0x62, 0xF2, 0x7E, 0x48, 0x4A, 0xC0]),
+        ("amx_movrs", "tileloaddrs tmm0, [rbx+rsi*1]", &[0xC4, 0xE2, 0x7B, 0x4A, 0x04, 0x33]),
+    ] {
+        retires(&mut cpu, &format!("{feature}: {mnemonic}"), code);
+    }
+    retires(&mut cpu, "tilerelease", &TILERELEASE);
+}
+
+/// The boundary §4q draws: what this Bochs revision has no handler for stays
+/// #UD, however the feature list grows. AVX512-ER (`vexp2ps`), Key Locker
+/// (`encodekey128`) and AVX512-4FMAPS (`vp4dpwssd`) are the three families the
+/// docs name as unenableable; a re-vendor that gains one of them should move
+/// it into `cpu_added_features` and out of here.
+#[test]
+fn features_without_handlers_still_raise_ud() {
+    use x86_oracle::FaultKind;
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(DATA, &[0u8; 64]);
+    cpu.set_gpr(RBX, DATA);
+    for (name, code) in [
+        ("avx512er vexp2ps zmm0, zmm1", &[0x62, 0xF2, 0x7D, 0x48, 0xC8, 0xC1][..]),
+        ("keylocker encodekey128 eax, ecx", &[0xF3, 0x0F, 0x38, 0xFA, 0xC1]),
+        ("avx512_4fmaps vp4dpwssd zmm0, zmm1, [rbx]", &[0x62, 0xF2, 0x77, 0x48, 0x52, 0x03]),
+    ] {
+        cpu.set_rip(CODE);
+        cpu.write_mem(CODE, code);
+        let out = cpu.step();
+        assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "{name}: {out:?}");
+    }
+}
+
+/// The CPUID side of §4q, for the leaves where the sapphire_rapids model
+/// derives its bits from the ISA set rather than hard-coding them: leaf 7.1
+/// EAX, leaf 7.0 EDX (VP2INTERSECT), leaf 0x80000001 ECX (the AMD VEX
+/// extensions) and leaf 0x1E.1 EAX (the AMX extensions). Leaf 7.1 EDX, leaf
+/// 0x24 and 0x80000001 EDX are hard-coded to zero in that model, so
+/// AVX10, AVX-VNNI-INT8/16, AVX-NE-CONVERT, AMX-COMPLEX and 3DNow! do not show
+/// in CPUID even though they decode — the tests above are the pin for those.
+#[test]
+fn the_cpu_model_reports_the_added_features_it_can() {
+    let mut cpu = BochsOracle::new();
+    let mut cpuid = |leaf: u64, subleaf: u64| {
+        cpu.set_gpr(RAX, leaf);
+        cpu.set_gpr(RCX, subleaf);
+        let out = cpu.step_bytes(&[0x0F, 0xA2]);
+        assert!(out.is_retired(), "cpuid {leaf:#x}.{subleaf}: {out:?}");
+        (cpu.get_gpr(RAX) as u32, cpu.get_gpr(RCX) as u32, cpu.get_gpr(RDX) as u32)
+    };
+    let (eax7_1, _, _) = cpuid(7, 1);
+    for (name, bit) in [("sha512", 0), ("sm3", 1), ("sm4", 2), ("cmpccxadd", 7), ("amx_fp16", 21), ("avx_ifma", 23), ("movrs", 31)] {
+        assert_ne!(eax7_1 & (1 << bit), 0, "CPUID.7.1:EAX[{bit}] {name}, eax={eax7_1:#010x}");
+    }
+    let (_, _, edx7_0) = cpuid(7, 0);
+    assert_ne!(edx7_0 & (1 << 8), 0, "CPUID.7.0:EDX[8] avx512vp2intersect, edx={edx7_0:#010x}");
+    let (_, ecx_ext1, _) = cpuid(0x8000_0001, 0);
+    for (name, bit) in [("sse4a", 6), ("xop", 11), ("fma4", 16), ("tbm", 21)] {
+        assert_ne!(ecx_ext1 & (1 << bit), 0, "CPUID.80000001:ECX[{bit}] {name}, ecx={ecx_ext1:#010x}");
+    }
+    let (eax_amx, _, _) = cpuid(0x1E, 1);
+    for (name, bit) in [("amx_complex", 2), ("amx_fp16", 3), ("amx_fp8", 4), ("amx_avx512", 7), ("amx_movrs", 8)] {
+        assert_ne!(eax_amx & (1 << bit), 0, "CPUID.1E.1:EAX[{bit}] {name}, eax={eax_amx:#010x}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4r: the two-source fp16→fp8 converts must saturate on the S spelling only.
+//
+// All eight converts are EVEX.128 `op xmm0, xmm1, xmm2` (or `xmm0, xmm1` for
+// the single-source four); the S forms differ from the plain ones only in the
+// map/opcode byte. Lane 0 is +65504 (fp16 max) and lane 1 is −65504, both
+// beyond fp8 range; lane 2 is 1.0 as the in-range control. For the two-source
+// forms xmm2 feeds bytes 0..7 and xmm1 bytes 8..15, so xmm1 carries the two
+// overflow lanes swapped to pin the placement as well.
+
+const F16_MAX: u64 = 0x7BFF;
+const F16_NEG_MAX: u64 = 0xFBFF;
+const F16_ONE: u64 = 0x3C00;
+
+/// `(mnemonic, encoding, expected dst bytes 0..15)`. BF8 is E5M2: Inf = 0x7C,
+/// largest finite = 0x7B, 1.0 = 0x3C. HF8 is E4M3: NaN (there is no Inf) =
+/// 0x7F, largest finite = 0x7E, 1.0 = 0x38.
+const FP8_TWO_SOURCE: &[(&str, [u8; 6], [u8; 16])] = &[
+    ("vcvt2ph2bf8", [0x62, 0xF2, 0x77, 0x08, 0x74, 0xC2],
+        [0x7C, 0xFC, 0x3C, 0, 0, 0, 0, 0, 0xFC, 0x7C, 0x3C, 0, 0, 0, 0, 0]),
+    ("vcvt2ph2bf8s", [0x62, 0xF5, 0x77, 0x08, 0x74, 0xC2],
+        [0x7B, 0xFB, 0x3C, 0, 0, 0, 0, 0, 0xFB, 0x7B, 0x3C, 0, 0, 0, 0, 0]),
+    ("vcvt2ph2hf8", [0x62, 0xF5, 0x77, 0x08, 0x18, 0xC2],
+        [0x7F, 0xFF, 0x38, 0, 0, 0, 0, 0, 0xFF, 0x7F, 0x38, 0, 0, 0, 0, 0]),
+    ("vcvt2ph2hf8s", [0x62, 0xF5, 0x77, 0x08, 0x1B, 0xC2],
+        [0x7E, 0xFE, 0x38, 0, 0, 0, 0, 0, 0xFE, 0x7E, 0x38, 0, 0, 0, 0, 0]),
+];
+
+/// The single-source siblings, which keyed `saturate` correctly all along and
+/// must keep doing so: `(mnemonic, encoding, expected dst bytes 0..7)`. Their
+/// source is xmm1 = [−max, +max, 1.0], hence the sign order.
+const FP8_ONE_SOURCE: &[(&str, [u8; 6], [u8; 8])] = &[
+    ("vcvtph2bf8", [0x62, 0xF2, 0x7E, 0x08, 0x74, 0xC1], [0xFC, 0x7C, 0x3C, 0, 0, 0, 0, 0]),
+    ("vcvtph2bf8s", [0x62, 0xF5, 0x7E, 0x08, 0x74, 0xC1], [0xFB, 0x7B, 0x3C, 0, 0, 0, 0, 0]),
+    ("vcvtph2hf8", [0x62, 0xF5, 0x7E, 0x08, 0x18, 0xC1], [0xFF, 0x7F, 0x38, 0, 0, 0, 0, 0]),
+    ("vcvtph2hf8s", [0x62, 0xF5, 0x7E, 0x08, 0x1B, 0xC1], [0xFE, 0x7E, 0x38, 0, 0, 0, 0, 0]),
+];
+
+fn fp8_convert(code: &[u8]) -> [u8; 16] {
+    let mut cpu = BochsOracle::new();
+    let mut xmm1 = [0u64; ZMM_CHUNKS];
+    xmm1[0] = F16_NEG_MAX | F16_MAX << 16 | F16_ONE << 32;
+    let mut xmm2 = [0u64; ZMM_CHUNKS];
+    xmm2[0] = F16_MAX | F16_NEG_MAX << 16 | F16_ONE << 32;
+    cpu.set_zmm(1, &xmm1);
+    cpu.set_zmm(2, &xmm2);
+    cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+    run(&mut cpu, code, 1);
+    let zmm0 = cpu.get_zmm(0);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&zmm0[0].to_le_bytes());
+    bytes[8..].copy_from_slice(&zmm0[1].to_le_bytes());
+    bytes
+}
+
+/// §4r proper: upstream keyed the two-source handlers' `saturate` on the PLAIN
+/// opcode id, so `vcvt2ph2bf8` clamped and `vcvt2ph2bf8s` produced Inf.
+/// `patches/bochs/0008-vcvt2ph2-fp8-saturate-opcode-key.patch` is what makes
+/// this pass.
+#[test]
+fn two_source_fp8_converts_saturate_on_the_s_spelling_only() {
+    for (name, code, want) in FP8_TWO_SOURCE {
+        let got = fp8_convert(code);
+        assert_eq!(&got, want, "{name} of [+max, -max, 1.0] from xmm2 then xmm1");
+    }
+}
+
+/// The control: the single-source forms were keyed on the S id all along, so
+/// a re-vendor that "fixed" all six the same way round would fail here.
+#[test]
+fn one_source_fp8_converts_still_saturate_on_the_s_spelling_only() {
+    for (name, code, want) in FP8_ONE_SOURCE {
+        let got = fp8_convert(code);
+        assert_eq!(&got[..8], want, "{name} of xmm1 = [-max, +max, 1.0]");
     }
 }

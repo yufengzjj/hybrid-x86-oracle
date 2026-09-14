@@ -1,0 +1,40 @@
+AVX10.2: VCVT2PH2BF8 / VCVT2PH2HF8 keyed their saturate flag on the wrong opcode
+
+The six fp16-to-fp8 converts each come in a plain and a saturating ("S")
+spelling, both bound to one execute method that derives `saturate` from the
+IA opcode. VCVTPH2BF8/HF8 and VCVTBIASPH2BF8/HF8 compare against their S
+opcode id; the two-source VCVT2PH2BF8 and VCVT2PH2HF8 compared against the
+PLAIN id instead, so the plain form clamped overflow to the largest finite
+value and the S form let it go to Inf/NaN - exactly inverted. Any fp16 input
+beyond the fp8 range (|x| > 57344 for BF8, > 448 for HF8) took the wrong path.
+
+Comparing against the S id, as the other four handlers do, is the whole fix.
+
+Unreachable in this crate until 2026-09-14, when the shim started layering
+AVX10.2 onto the sapphire_rapids model (docs/backend-differences.md 4q);
+found by reading the handlers before that switch, see 4r. Still present on
+upstream master as of 2026-09-14.
+
+The hunks below are deliberately comment-free, so that this file can be sent
+upstream as-is.
+
+--- a/cpu/avx/avx10_2_cvt_fp8.cc
++++ b/cpu/avx/avx10_2_cvt_fp8.cc
+@@ -69,7 +69,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2BF8_Vf8HdqWphR(bxInstruction_c *i)
+   BxPackedAvxRegister src1 = BX_READ_AVX_REG(i->src1()), src2 = BX_READ_AVX_REG(i->src2()), dst = BX_READ_AVX_REG(i->dst());
+   unsigned len = i->getVL();
+   unsigned num_elements_from_source = WORD_ELEMENTS(len);
+-  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8_Vf8HdqWph_Kmask);
++  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8S_Vf8HdqWph_Kmask);
+   unsigned n = 0;
+ 
+   Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
+@@ -149,7 +149,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2HF8_Vf8HdqWphR(bxInstruction_c *i)
+   BxPackedAvxRegister src1 = BX_READ_AVX_REG(i->src1()), src2 = BX_READ_AVX_REG(i->src2()), dst = BX_READ_AVX_REG(i->dst());
+   unsigned len = i->getVL();
+   unsigned num_elements_from_source = WORD_ELEMENTS(len);
+-  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8_Vf8HdqWph_Kmask);
++  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8S_Vf8HdqWph_Kmask);
+   unsigned n = 0;
+ 
+   Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;

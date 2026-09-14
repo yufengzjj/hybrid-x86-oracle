@@ -69,7 +69,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2BF8_Vf8HdqWphR(bxInstruction_c *i)
   BxPackedAvxRegister src1 = BX_READ_AVX_REG(i->src1()), src2 = BX_READ_AVX_REG(i->src2()), dst = BX_READ_AVX_REG(i->dst());
   unsigned len = i->getVL();
   unsigned num_elements_from_source = WORD_ELEMENTS(len);
-  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8_Vf8HdqWph_Kmask);
+  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2BF8S_Vf8HdqWph_Kmask);
   unsigned n = 0;
 
   Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
@@ -149,7 +149,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PH2HF8_Vf8HdqWphR(bxInstruction_c *i)
   BxPackedAvxRegister src1 = BX_READ_AVX_REG(i->src1()), src2 = BX_READ_AVX_REG(i->src2()), dst = BX_READ_AVX_REG(i->dst());
   unsigned len = i->getVL();
   unsigned num_elements_from_source = WORD_ELEMENTS(len);
-  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8_Vf8HdqWph_Kmask);
+  bool saturate = (i->getIaOpcode() == BX_IA_EVEX_VCVT2PH2HF8S_Vf8HdqWph_Kmask);
   unsigned n = 0;
 
   Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;

@@ -44,10 +44,15 @@ cases must be skipped (`StepOutcome::is_comparable()` returns false).
 - **Bochs** implements essentially everything a user-mode program can execute,
   including AVX-512. What it *claims* is the selected CPU model's CPUID: the
   shim picks `sapphire_rapids`, the widest **AVX-512-capable** model in cpudb
-  (the full AVX-512 family, CET, MOVDIR*, WAITPKG). `arrow_lake` is newer and
-  carries a handful of ISAs sapphire lacks — `sha512`, `sm3`, `sm4`,
-  `avx_ifma`, `avx_ne_convert`, `avx_vnni_int8/16`, `cmpccxadd` — but no
-  AVX-512 at all; add them with `add_features` if a campaign ever needs them.
+  (the full AVX-512 family, CET, MOVDIR*, WAITPKG). Since 2026-09-14 the shim
+  also layers every extension the core implements but that model lacks on top
+  of it through Bochs' own `add_features` parameter — AVX10.2 (+MOVRS), the
+  Arrow-Lake VEX groups (`avx_ne_convert`, `sha512`/`sm3`/`sm4`, `avx_ifma`,
+  `avx_vnni_int8/16`, `cmpccxadd`), `avx512vp2intersect`, AMX-FP16/COMPLEX/
+  FP8/AVX512/MOVRS, and AMD's XOP/FMA4/TBM/SSE4a/3DNow! — see §4q for the list,
+  the reasoning and the caveats. What it still cannot execute is what this
+  Bochs revision has no handlers for: AVX512-ER/PF, 4FMAPS, Key Locker,
+  AMX-TRANSPOSE/TF32, LWP.
   An earlier revision asked for the nonexistent model name `bx_generic`, which
   `set_by_name` ignores — leaving the build default `corei7_haswell_4770`
   silently selected, so every EVEX encoding (and `kmov*`) raised #UD despite
@@ -389,14 +394,16 @@ truncating handler cannot pass either. zens' `test_fp16_cvt_directed` and the
 FP16 template sweep cover it downstream, but that is the consumer's suite; it
 does not protect this vendored tree.
 
-One sibling shape is deliberately left alone. The AVX10.2 saturating fp8
+One sibling shape looked the same at first and is not. The AVX10.2 fp8
 converts (`VCVTPH2BF8S`, `VCVT2PH2BF8S`, `VCVTBIASPH2BF8S` and their `HF8`
-counterparts) are also bound to their non-saturating handlers — but that is
-upstream incompleteness rather than a mis-binding: Bochs defines no saturating
-handler at all, so there is nothing to point them at. `BX_ISA_AVX10_2` is not
-in `sapphire_rapids` either (§2), so this backend cannot reach them. A CPU
-model with AVX10.2 would make them reachable and wrong; noted here so that is
-not rediscovered from scratch.
+counterparts) are also bound to the same handlers as their non-saturating
+twins — but there the handler itself tells the two apart, deriving a
+`saturate` flag from the IA opcode id and passing it down to the
+`convert_ne_fp16_to_{bf8,hf8}` / `convert_truncate_fp16_to_*_bias` helpers in
+`avx/bf8.h` / `avx/hf8.h`. Four of the six compare against their `S` id; the
+two-source `VCVT2PH2BF8` / `VCVT2PH2HF8` compared against the PLAIN id, so
+their saturation was inverted. Unreachable while AVX10.2 was off (§2); now that
+it is on (§4q) it is fixed as §4r.
 
 ## 4j. `VPGATHERQD` / `VGATHERQPS` with a zmm index left the ymm destination's upper 256 bits stale — patched (Bochs)
 
@@ -549,6 +556,102 @@ flushes nothing it did not flush before. `tests/bochs_patches.rs` pins it
 directly — step one `mov`, overwrite it in place with another, step again — and
 the `bochs_embedding.rs` x87 cases are back to green. Still present on upstream
 master as of 2026-09-12.
+
+## 4q. Extensions beyond Sapphire Rapids, enabled with `add_features` — 2026-09-14
+
+The vendored core carries execute methods for a long tail of extensions that
+`sapphire_rapids` does not advertise, and the CPUID bit is what gates decoding:
+an encoding whose `BX_ISA_*` bit is off is #UD, exactly like on a host that
+lacks the feature. Until 2026-09-14 that left the zens SIMD groups outside
+Sapphire Rapids' feature set with no differential oracle at all. Rather than
+switch models — `arrow_lake` has the newer VEX groups but no AVX-512, the AMD
+models have XOP/3DNow! but nothing past AVX — the shim now sets Bochs' own
+`cpu.add_features` parameter (`cpu/init.cc:add_remove_cpuid_features`, the
+same list a bochsrc `cpu: add_features=` line takes) before `initialize()`,
+with `cpu_added_features` in `csrc/bochs_shim.cpp`:
+
+| group | feature names | what becomes executable |
+|---|---|---|
+| AVX10.2 | `avx10_1,avx10_2,movrs,avx10_2_movrs` | the bf16 arithmetic/compare/manipulation family, `v{u}comxs*`, `vminmax*`, the `ibs`/`iubs` and saturating-truncation converts, the fp8 converts, `vcvt2ps2phx`, `vdpphps`, `vmovrs*` (and the GPR `movrs`, which the sanity check ties to the vector half) |
+| Arrow-Lake VEX | `avx_ne_convert,sha512,sm3,sm4,avx_ifma,avx_vnni_int8,avx_vnni_int16,cmpccxadd` | `vbcstne*`/`vcvtnee*`/`vcvtneo*`, `vsha512*`, `vsm3*`, `vsm4*` (EVEX forms need `avx10_2` too), the `{vex}` IFMA/VNNI-INT twins, `cmp<cc>xadd` |
+| Tiger Lake | `avx512vp2intersect` | `vp2intersectd/q` |
+| AMX | `amx_fp16,amx_complex,amx_fp8,amx_avx512,amx_movrs` | `tdpfp16ps`, `tcmm*`/`tconj*`, `tdp{b,h}{b,h}f8ps`, `tcvtrow*`/`tilemovrow`, `tileloaddrs*` (XCR0 already has bits 17/18, §4k) |
+| AMD | `xop,fma4,tbm,sse4a,3dnow,3dnow_ext` | the XOP map (`vpcom*`, `vpperm`, `vprot*`, `vpsha*/vpshl*`, `vphadd*`, `vpmacs*`, `vfrcz*`, `vpermil2*`), FMA4, TBM, `extrq`/`insertq`/`movnts{s,d}`, the whole `0F 0F` 3DNow! block plus `femms` |
+
+Every name is a `x86_feature(...)` string in `cpu/decoder/features.h`; an
+unknown one is `BX_PANIC` at init, and `cpuid.cc:sanity_checks()` enforces
+the dependency chains the list satisfies (`avx10_2 → avx10_1 → AVX2`,
+`amx_avx512 → avx10_2`, `movrs + avx10_2 ⇔ avx10_2_movrs`, `tbm → xop → AVX`,
+`3dnow_ext → 3dnow → MMX`).
+
+What this means for a consumer:
+
+- The CPU Bochs now describes exists nowhere — Intel AVX10.2 next to AMD
+  3DNow!. That is harmless for an oracle: each encoding executes the
+  semantics Bochs gives *that* extension, and CPUID was already outside the
+  diff (§7). The hardware backends keep raising a genuine #UD for whatever the
+  host lacks, which the harness treats as a skip, so a case gains Bochs
+  coverage without losing anything.
+- Decoding changes at the edges, all of them from "#UD" to "executes": the
+  `0F 0F` block and `femms`, the XOP `8F` prefix (ModRM.reg ≠ 0 — never a legal
+  `pop` in 64-bit mode) and the FMA4 `0F3A 5C–7F` rows. No case in this crate
+  relied on any of those being #UD. One thing that does NOT change is EVEX.b
+  on a register form: Bochs' decoder treats it as "512-bit vector length,
+  L'L is the rounding control" unconditionally (`fetchdecode64.cc`, the
+  `if (i->getEvexb()) i->setVL(BX_VL512)` under `modC0()`), so a 256-bit
+  register form with EVEX.b set was never #UD here — it silently ran as a
+  512-bit operation with embedded rounding before `avx10_2` was on, and still
+  does. The only EVEX.b #UD is the per-opcode `BX_PREPARE_EVEX_NO_SAE` check
+  in `assignHandler`, which no ISA bit influences. (The AVX10 spec's early
+  revisions gave AVX10.2 a 256-bit embedded-rounding form; rev 3.0 removed it,
+  and Bochs never implemented it.)
+- None of these handlers had ever executed in this crate. The AMX precedent
+  (§4k–§4o: five bugs the first day) says to expect the same here; reading the
+  handlers before flipping the switch already found §4r. `tests/bochs_patches.rs`
+  pins the list: one representative encoding per feature name retires
+  (`vminmaxps`, `vmovrsb`, `movrs`, `vbcstnebf162ps`, `vsha512msg1`,
+  `vsm3msg1`, `vsm4key4`, `{vex} vpmadd52luq`, `vpdpbssd`, `vpdpwsud`,
+  `cmpoxadd`, `vp2intersectd`, `vpcomltb`, `vfmaddps`, TBM `bextr`, `extrq`,
+  `pfadd`, `pswapd`, and after an `ldtilecfg` `tdpfp16ps`, `tcmmimfp16ps`,
+  `tdpbf8ps`, `tcvtrowd2ps`, `tileloaddrs`), while `vexp2ps`, `encodekey128`
+  and `vp4dpwssd` are asserted to stay #UD as the boundary.
+- CPUID only half-agrees. The `sapphire_rapids` model derives leaf 7.1 EAX,
+  leaf 7.0 EDX, leaf 0x80000001 ECX and leaf 0x1E.1 EAX from the ISA set, so
+  SHA512/SM3/SM4, CMPCCXADD, AMX-FP16, AVX-IFMA, MOVRS, VP2INTERSECT, SSE4a,
+  XOP, FMA4, TBM and the AMX extensions do show up. But it hard-codes leaf 7.1
+  EDX to zero, has no leaf 0x24 case at all, and reports 0x80000001 EDX
+  through an Intel-only helper — so AVX10 (both the 7.1 EDX bit and the
+  version leaf), AVX-VNNI-INT8/16, AVX-NE-CONVERT, AMX-COMPLEX and 3DNow! are
+  invisible to a CPUID probe even though their encodings execute. Decoding is
+  gated by the ISA bitmask, not by what CPUID says, so this changes nothing
+  for the oracle; it matters only to a consumer that builds skip lists from
+  the backend's CPUID instead of from the #UD it reports.
+  `tests/bochs_patches.rs` checks the bits that are reported.
+- Nothing was deliberately left off. What is missing cannot be enabled:
+  `avx512er`/`avx512pf` are commented out of `features.h` (no `vexp2*`,
+  `vrcp28*`, `vrsqrt28*`, prefetch gathers), and Key Locker, AVX512-4FMAPS,
+  AMX-TRANSPOSE (`t2rpntlvwz*`, `ttransposed`, `ttdp*`, `ttcmm*`),
+  AMX-TF32 (`tmmultf32ps`) and LWP have no handlers in this Bochs revision.
+
+## 4r. `VCVT2PH2BF8` / `VCVT2PH2HF8` saturation inverted — patched (Bochs)
+
+The six AVX10.2 fp16→fp8 converts each have a plain and a saturating (`S`)
+spelling bound to ONE execute method, which derives a `saturate` flag from the
+IA opcode id. `VCVTPH2BF8/HF8` and `VCVTBIASPH2BF8/HF8` compare against their
+`S` id; the two-source `VCVT2PH2BF8_Vf8HdqWphR` and `VCVT2PH2HF8_Vf8HdqWphR`
+compared against the PLAIN `_Kmask` id (`avx/avx10_2_cvt_fp8.cc`), so the plain
+form clamped overflow to the largest finite fp8 value and the `S` form let it
+go to Inf (BF8) / NaN (HF8, which has no Inf) — exactly backwards, for any
+input beyond the fp8 range (|x| > 57344 for BF8, > 448 for HF8). In-range
+inputs, the NaN paths and the mask handling were unaffected.
+
+Comparing against the `S` id, as the other four handlers do, is the whole fix:
+[`patches/bochs/0008-vcvt2ph2-fp8-saturate-opcode-key.patch`](../patches/bochs/0008-vcvt2ph2-fp8-saturate-opcode-key.patch),
+applied by `scripts/vendor-bochs.sh` like its siblings. Found by reading the
+handlers §4q was about to make reachable, not by a diff — which is also why
+§4i's earlier note ("no saturating handler at all") was wrong: the saturating
+path exists in `avx/bf8.h` / `avx/hf8.h`, it was only keyed wrongly for two of
+the six. Still present on upstream master as of 2026-09-14.
 
 ## 5. Faults
 

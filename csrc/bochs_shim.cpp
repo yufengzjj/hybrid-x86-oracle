@@ -453,6 +453,43 @@ const char *cpu_model_names[] = {
     nullptr
 };
 
+/* ISA extensions layered on top of the sapphire_rapids model through Bochs'
+ * own `cpu.add_features` parameter (cpu/init.cc:add_remove_cpuid_features —
+ * the same list a bochsrc `cpu: model=..., add_features=...` line takes). The
+ * vendored core carries HANDLERS for every one of these; only the model's
+ * CPUID bit was missing, and that bit is what gates decoding (#UD otherwise).
+ * The result is a superset no real CPU ships — Intel AVX10.2 next to AMD XOP
+ * and 3DNow! — which is fine for an oracle: each encoding still executes the
+ * semantics Bochs gives that extension, and the hardware backends keep #UD-ing
+ * (and so auto-skipping) the ones the host lacks. Added 2026-09-14 so the
+ * remaining zens SIMD groups get a differential oracle (see
+ * docs/backend-differences.md §4q); every name here is a `x86_feature(...)`
+ * string in cpu/decoder/features.h — an unknown name is BX_PANIC at init.
+ *
+ * Nothing is deliberately left off: what is missing cannot be enabled —
+ * AVX512-ER/PF are commented out of features.h, and Key Locker,
+ * AMX-TRANSPOSE, AMX-TF32 and LWP have no handlers in this Bochs revision.
+ *
+ * Dependency chains cpuid.cc:sanity_checks() enforces, all satisfied here:
+ * avx10_2 -> avx10_1 -> AVX2; amx_avx512 -> avx10_2; movrs + avx10_2 <=>
+ * avx10_2_movrs; tbm -> xop -> AVX; 3dnow_ext -> 3dnow -> MMX. */
+const char cpu_added_features[] =
+    /* Intel AVX10.2: the bf16 arithmetic/compare/manip family, v{u}comxs*,
+     * vminmax*, the ibs/iubs and saturating-truncation converts, the FP8
+     * converts, vcvt2ps2phx, vdpphps; avx10_2_movrs = vmovrs{b,w,d,q} (and
+     * movrs is the GPR half of the same ISA, which the sanity check ties to it). */
+    "avx10_1,avx10_2,movrs,avx10_2_movrs,"
+    /* Arrow-Lake-era VEX groups sapphire lacks. */
+    "avx_ne_convert,sha512,sm3,sm4,avx_ifma,avx_vnni_int8,avx_vnni_int16,cmpccxadd,"
+    /* Tiger-Lake-only. */
+    "avx512vp2intersect,"
+    /* AMX beyond TILE/INT8/BF16: tdpfp16ps, the complex tcmm* / tconj* set, the
+     * FP8 tdp*, the AMX-AVX512 row moves/converts (tcvtrow*, tilemovrow) and
+     * the tileloaddrs hints. XCR0 already has bits 17/18 (below). */
+    "amx_fp16,amx_complex,amx_fp8,amx_avx512,amx_movrs,"
+    /* AMD: XOP/FMA4/TBM (Bulldozer), SSE4a (K10), 3DNow! + extensions (K6-2/K7). */
+    "xop,fma4,tbm,sse4a,3dnow,3dnow_ext";
+
 void build_param_tree() {
     bx_list_c *root = root_param; // created by bx_init_siminterface()
     new bx_list_c(root, "statistics", "Statistics");
@@ -729,21 +766,26 @@ void *oracle_bochs_new(void) {
         /* "sapphire_rapids" is the widest AVX-512-capable model in cpudb —
          * the whole family (F/DQ/CD/BW/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ/
          * BF16/FP16), plus CET, MOVDIR*, WAITPKG — which is the point of this
-         * backend. (arrow_lake is newer and adds sha512/sm3/sm4/avx_ifma/
-         * cmpccxadd/avx_vnni_int8|16/avx_ne_convert, but has no AVX-512 at all;
-         * reach for `add_features` if a campaign ever needs those.) There is no "bx_generic" model in this Bochs tree: an
+         * backend. The extensions it lacks but the core implements are layered
+         * on with `add_features` (cpu_added_features above) rather than by
+         * picking another model: arrow_lake has the newer VEX groups but no
+         * AVX-512 at all, and the AMD models have XOP/3DNow! but nothing past
+         * AVX. There is no "bx_generic" model in this Bochs tree: an
          * unknown name leaves set_by_name a NO-OP and the build default
          * (corei7_haswell_4770, no AVX-512) silently selected — an earlier
          * revision of this shim ran that way for months — hence the hard
          * failure instead of an assert that NDEBUG would compile out. CET
          * still changes nothing until CR4.CET is set (see
          * oracle_bochs_enable_shadow_stack): until then the instructions
-         * behave as the ISA says for "shadow stacks off". Must precede
-         * initialize(), which is what applies this parameter. */
+         * behave as the ISA says for "shadow stacks off". Both must precede
+         * initialize(), which is what applies these parameters (init.cc reads
+         * add_features right after the model's own feature list, then runs
+         * sanity_checks() over the union). */
         if (!SIM->get_param_enum(BXPN_CPU_MODEL)->set_by_name("sapphire_rapids")) {
             fprintf(stderr, "bochs_shim: cpu model 'sapphire_rapids' not in cpudb\n");
             abort();
         }
+        SIM->get_param_string(BXPN_CPU_ADD_FEATURES)->set(cpu_added_features);
         bx_cpu.initialize();
         /* A20 masking is applied to EVERY physical address (A20ADDR in
          * paging.cc). bx_pc_system's mask is zero until this is called, which
