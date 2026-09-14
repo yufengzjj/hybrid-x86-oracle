@@ -787,6 +787,40 @@ pins both spellings at 128 and 256 bits against the SDM pseudocode (a bf16
 Still present on upstream master as of 2026-09-14. No silicon with
 AVX-NE-CONVERT was available; the SDM text is the authority.
 
+## 4v. FMA4 (and VPERMIL2 / XOP VPCMOV, VPPERM): VEX.W bound to the wrong is4 / rm operand roles — patched (Bochs)
+
+Found 2026-09-14 by diffing an independent model of the AMD FMA4 group (the
+20 four-operand `vf{,n}m{add,sub}{ps,pd,ss,sd}` + `vfmaddsub`/`vfmsubadd`
+forms). Every all-register case disagreed on which operand is the addend:
+`vfmaddsd xmm1, xmm2, xmm3, xmm4` with 3, 5, 7 gave 26 (3·7+5) where the
+architecture — and the model — give 22 (3·5+7).
+
+The cause is in the opmap, not the handlers: for every is4 instruction the
+W0 row is the `…VIbW…` operand list (is4 third, ModRM.rm fourth) and the W1
+row the `…WVIb` list. The AMD APM defines the opposite — W = 0: ModRM.rm is
+the THIRD operand (src2, the one that may be memory) and is4 the fourth;
+W = 1: is4 third, rm fourth (`VFMADDPD xmm1, xmm2, xmm3/mem128, xmm4` is the
+`0.src.0.01` encoding, `… xmm3, xmm4/mem128` the `1.src.0.01` one) — which is
+also what LLVM and binutils implement. So each encoding executed
+`src1*src3 + src2` and folded the memory operand into the wrong role.
+
+VPERMIL2PS/PD (VEX 0F3A 48/49) and the XOP VPCMOV / VPPERM (XOP8 A2/A3) share
+the inverted binding and are corrected under the same rule; only FMA4 has been
+diffed so far (the XOP vector group is still unmodeled on the zens side). The
+W0-only VPMACS*/VPMADCS* rows are unaffected.
+
+Fixed by
+[`patches/bochs/0012-fma4-xop-is4-vex-w-roles.patch`](../patches/bochs/0012-fma4-xop-is4-vex-w-roles.patch)
+(the ATTR_VEX_W0/W1 attributes exchanged between the two rows of each of the
+24 groups; `.def` rows and handlers untouched), applied by
+`scripts/vendor-bochs.sh` like its siblings; `tests/bochs_patches.rs` pins
+both W layouts of all twenty FMA4 forms (register and memory rm, xmm and ymm)
+with three distinct values so the multiplicand and addend roles are told
+apart, and pins VPERMIL2PS/PD, VPCMOV and VPPERM taking their selector from
+the fourth operand under both layouts. Still present on upstream master as of
+2026-09-14. No silicon with FMA4 or XOP was available; the AMD APM
+encoding tables and the LLVM/binutils encoders are the authority.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

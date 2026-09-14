@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4u are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4v are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -1548,5 +1548,224 @@ fn ne_convert_even_odd_forms_keep_their_prefixes() {
             let expect = if n < 8 { u64::from(*want) } else { 0 };
             assert_eq!(lane(&zmm0, 32, n), expect, "{name} ymm0, [rbx]: dword {n} of {zmm0:x?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4v: VEX.W and the two operand layouts of the four-operand (is4) forms.
+//
+// Every FMA4 instruction, VPERMIL2PS/PD and the XOP VPCMOV/VPPERM exist in two
+// encodings that differ only in VEX.W. The AMD APM (and LLVM/binutils) bind
+// W = 0 to "ModRM.rm is the THIRD operand, is4 the fourth" and W = 1 to "is4
+// third, rm fourth"; upstream Bochs had the two rows the other way round, so
+// `vfmaddsd xmm0, xmm1, xmm2, xmm3` computed xmm1*xmm3 + xmm2 and a memory
+// operand was folded into the wrong role.
+// `patches/bochs/0012-fma4-xop-is4-vex-w-roles.patch` is what makes these
+// pass. All encodings use vvvv = xmm1 (src1), ModRM.rm = xmm3 or [rbx], and
+// is4 = xmm2; the two W layouts are then "third = xmm2, fourth = xmm3/[rbx]"
+// (W1) and "third = xmm3/[rbx], fourth = xmm2" (W0).
+
+/// Load `third` into whichever register is the third operand under `w` and
+/// `fourth` into the other, so that a correctly decoded instruction gives the
+/// same answer for both W layouts and a swapped one gives the same wrong
+/// answer for both.
+fn set_third_fourth(cpu: &mut BochsOracle, w: u8, third: &[u64; ZMM_CHUNKS], fourth: &[u64; ZMM_CHUNKS]) {
+    let (xmm2, xmm3) = if w == 1 { (third, fourth) } else { (fourth, third) };
+    cpu.set_zmm(2, xmm2);
+    cpu.set_zmm(3, xmm3);
+}
+
+/// VEX byte 2 for a `C4 E3` (0F3A) is4 form: W, vvvv = ~xmm1, L, pp = 66.
+fn is4_byte2(w: u8, l: u8) -> u8 {
+    w << 7 | 0x70 | l << 2 | 0x01
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Fma4Kind {
+    Ps,
+    Pd,
+    Ss,
+    Sd,
+}
+
+/// `(mnemonic, VEX 0F3A opcode, element kind)` for all twenty FMA4 forms.
+const FMA4_FORMS: &[(&str, u8, Fma4Kind)] = &[
+    ("vfmaddsubps", 0x5C, Fma4Kind::Ps),
+    ("vfmaddsubpd", 0x5D, Fma4Kind::Pd),
+    ("vfmsubaddps", 0x5E, Fma4Kind::Ps),
+    ("vfmsubaddpd", 0x5F, Fma4Kind::Pd),
+    ("vfmaddps", 0x68, Fma4Kind::Ps),
+    ("vfmaddpd", 0x69, Fma4Kind::Pd),
+    ("vfmaddss", 0x6A, Fma4Kind::Ss),
+    ("vfmaddsd", 0x6B, Fma4Kind::Sd),
+    ("vfmsubps", 0x6C, Fma4Kind::Ps),
+    ("vfmsubpd", 0x6D, Fma4Kind::Pd),
+    ("vfmsubss", 0x6E, Fma4Kind::Ss),
+    ("vfmsubsd", 0x6F, Fma4Kind::Sd),
+    ("vfnmaddps", 0x78, Fma4Kind::Ps),
+    ("vfnmaddpd", 0x79, Fma4Kind::Pd),
+    ("vfnmaddss", 0x7A, Fma4Kind::Ss),
+    ("vfnmaddsd", 0x7B, Fma4Kind::Sd),
+    ("vfnmsubps", 0x7C, Fma4Kind::Ps),
+    ("vfnmsubpd", 0x7D, Fma4Kind::Pd),
+    ("vfnmsubss", 0x7E, Fma4Kind::Ss),
+    ("vfnmsubsd", 0x7F, Fma4Kind::Sd),
+];
+
+/// The APM definition of lane `n` of form `op` for `dst = src1 op src2 op src3`:
+/// the product is always src1*src2 and src3 is always the addend, so a wrong
+/// third/fourth binding changes the answer whenever src2 != src3.
+fn fma4_expected(op: u8, n: usize, src1: f64, src2: f64, src3: f64) -> f64 {
+    let p = src1 * src2;
+    match op {
+        0x5C | 0x5D => if n % 2 == 0 { p - src3 } else { p + src3 }, // vfmaddsub: odd lanes add
+        0x5E | 0x5F => if n % 2 == 0 { p + src3 } else { p - src3 }, // vfmsubadd: even lanes add
+        0x68..=0x6B => p + src3,
+        0x6C..=0x6F => p - src3,
+        0x78..=0x7B => -p + src3,
+        0x7C..=0x7F => -p - src3,
+        _ => unreachable!("not an FMA4 opcode: {op:#04x}"),
+    }
+}
+
+/// A register image with every `kind`-sized lane of the low `bits` bits set to
+/// `v` (the scalar kinds fill their whole 128 bits too — the sources' upper
+/// lanes are "don't care" for the scalar forms, which zero them in `dst`).
+fn fma4_fill(kind: Fma4Kind, bits: u32, v: f64) -> [u64; ZMM_CHUNKS] {
+    match kind {
+        Fma4Kind::Ps | Fma4Kind::Ss => lanes(32, &vec![u64::from((v as f32).to_bits()); (bits / 32) as usize]),
+        Fma4Kind::Pd | Fma4Kind::Sd => lanes(64, &vec![v.to_bits(); (bits / 64) as usize]),
+    }
+}
+
+/// What `op` at vector length `bits` must leave in the destination for the
+/// sources (3, 5, 7): packed forms fill every lane below VL, scalar forms
+/// write lane 0 and zero the rest of their 128 bits.
+fn fma4_result(op: u8, kind: Fma4Kind, bits: u32) -> [u64; ZMM_CHUNKS] {
+    let f = |n| fma4_expected(op, n, 3.0, 5.0, 7.0);
+    match kind {
+        Fma4Kind::Ps => lanes(32, &(0..bits / 32).map(|n| u64::from((f(n as usize) as f32).to_bits())).collect::<Vec<_>>()),
+        Fma4Kind::Pd => lanes(64, &(0..bits / 64).map(|n| f(n as usize).to_bits()).collect::<Vec<_>>()),
+        Fma4Kind::Ss => lanes(32, &[u64::from((f(0) as f32).to_bits())]),
+        Fma4Kind::Sd => lanes(64, &[f(0).to_bits()]),
+    }
+}
+
+/// Run FMA4 form `op` with src1 = xmm1 = 3, the third operand = 5 and the
+/// fourth = 7, the third/fourth pair placed per `w`; `mem` puts the ModRM.rm
+/// operand in memory (`[rbx]`) instead of xmm3. Returns the destination image.
+fn run_fma4(op: u8, kind: Fma4Kind, w: u8, l: u8, mem: bool) -> [u64; ZMM_CHUNKS] {
+    let bits = if l == 1 { 256 } else { 128 };
+    let mut cpu = BochsOracle::new();
+    cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+    cpu.set_zmm(1, &fma4_fill(kind, bits, 3.0));
+    let (third, fourth) = (fma4_fill(kind, bits, 5.0), fma4_fill(kind, bits, 7.0));
+    set_third_fourth(&mut cpu, w, &third, &fourth);
+    let modrm = if mem {
+        // The rm operand is the fourth under W1 and the third under W0: put
+        // that value in memory instead of xmm3.
+        let rm = if w == 1 { fourth } else { third };
+        cpu.write_mem(DATA, &bytes(&rm)[..(bits / 8) as usize]);
+        cpu.set_gpr(RBX, DATA);
+        cpu.set_zmm(3, &[STALE; ZMM_CHUNKS]);
+        0x03 // [rbx]
+    } else {
+        0xC3 // xmm3
+    };
+    run(&mut cpu, &[0xC4, 0xE3, is4_byte2(w, l), op, modrm, 0x20], 1); // is4 = xmm2
+    cpu.get_zmm(0)
+}
+
+/// §4v proper: every FMA4 form, both W layouts, all-register. With src1 = 3
+/// and (third, fourth) = (5, 7) the APM answer for `vfmaddsd` is 3*5+7 = 22;
+/// a swapped binding computes 3*7+5 = 26, and likewise for every other form
+/// (8 vs 16, -8 vs -16, -22 vs -26).
+#[test]
+fn fma4_register_forms_bind_is4_as_the_third_operand_only_under_vex_w1() {
+    for (name, op, kind) in FMA4_FORMS {
+        let scalar = matches!(kind, Fma4Kind::Ss | Fma4Kind::Sd);
+        for l in if scalar { 0..1 } else { 0..2 } {
+            let want = fma4_result(*op, *kind, if l == 1 { 256 } else { 128 });
+            for w in [0u8, 1] {
+                let got = run_fma4(*op, *kind, w, l, false);
+                assert_eq!(got, want, "{name} W{w} L{l}: xmm1 = 3, third = 5, fourth = 7");
+            }
+        }
+    }
+}
+
+/// The memory forms: under W0 `[rbx]` is the third operand (the multiplicand),
+/// under W1 the fourth (the addend). Same values, same expected images; only
+/// where the 5 or the 7 lives changes.
+#[test]
+fn fma4_memory_operand_takes_the_role_vex_w_selects() {
+    for (name, op, kind) in FMA4_FORMS {
+        let scalar = matches!(kind, Fma4Kind::Ss | Fma4Kind::Sd);
+        for l in if scalar { 0..1 } else { 0..2 } {
+            let want = fma4_result(*op, *kind, if l == 1 { 256 } else { 128 });
+            for w in [0u8, 1] {
+                let got = run_fma4(*op, *kind, w, l, true);
+                let role = if w == 1 { "fourth" } else { "third" };
+                assert_eq!(got, want, "{name} W{w} L{l} with [rbx] as the {role} operand");
+            }
+        }
+    }
+}
+
+/// The three non-FMA4 users of the same opmap rows. Each is set up so that the
+/// answer does not depend on which of src1/src2 a selector bit picks (both hold
+/// the same data), only on whether the selector register is the fourth operand:
+/// a swapped binding would use the data as the selector and vice versa.
+#[test]
+fn permil2_vpcmov_and_vpperm_take_their_selector_from_the_fourth_operand() {
+    // vpermil2ps xmm0, xmm1, xmm2, xmm3, 0: control dwords 3,2,1,0 reverse the
+    // four dwords; used as data instead they would be the tiny values 0..3.
+    let data = lanes(32, &[0x11, 0x12, 0x13, 0x14]);
+    let ctrl = lanes(32, &[3, 2, 1, 0]);
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &data);
+        set_third_fourth(&mut cpu, w, &data, &ctrl);
+        run(&mut cpu, &[0xC4, 0xE3, is4_byte2(w, 0), 0x48, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), lanes(32, &[0x14, 0x13, 0x12, 0x11]), "vpermil2ps W{w}");
+    }
+    // vpermil2pd: the control for qword n is dword 2n, bit 1 picks the element.
+    let data = lanes(64, &[0xA1, 0xA2]);
+    let ctrl = lanes(64, &[2, 0]);
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &data);
+        set_third_fourth(&mut cpu, w, &data, &ctrl);
+        run(&mut cpu, &[0xC4, 0xE3, is4_byte2(w, 0), 0x49, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), lanes(64, &[0xA2, 0xA1]), "vpermil2pd W{w}");
+    }
+    // vpcmov: dst = (src1 & sel) | (src2 & ~sel). XOP: 8F E8 (map 8), pp = 00.
+    let src1 = lanes(64, &[0xFF00_FF00_FF00_FF00, 0xFF00_FF00_FF00_FF00]);
+    let src2 = lanes(64, &[0x0F0F_0F0F_0F0F_0F0F, 0x0F0F_0F0F_0F0F_0F0F]);
+    let sel = lanes(64, &[0xF0F0_F0F0_F0F0_F0F0, 0xF0F0_F0F0_F0F0_F0F0]);
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &src1);
+        set_third_fourth(&mut cpu, w, &src2, &sel);
+        run(&mut cpu, &[0x8F, 0xE8, w << 7 | 0x70, 0xA2, 0xC3, 0x20], 1);
+        // (FF00 & F0F0) | (0F0F & 0F0F) = FF0F; swapped roles would give FFF0.
+        assert_eq!(cpu.get_zmm(0), lanes(64, &[0xFF0F_FF0F_FF0F_FF0F, 0xFF0F_FF0F_FF0F_FF0F]), "vpcmov W{w}");
+    }
+    // vpperm: selector byte 0x13 = byte 3 of one source (which one does not
+    // matter, both hold `data`), no bit operation. Swapped, `data` would be the
+    // selector and the result would vary by byte.
+    let data: [u8; 16] = core::array::from_fn(|n| 0x10 | (n as u8 ^ 1));
+    let data = lanes(8, &data.map(u64::from));
+    let sel = lanes(8, &[0x13; 16]);
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &data);
+        set_third_fourth(&mut cpu, w, &data, &sel);
+        run(&mut cpu, &[0x8F, 0xE8, w << 7 | 0x70, 0xA3, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), lanes(8, &[0x12; 16]), "vpperm W{w}");
     }
 }
