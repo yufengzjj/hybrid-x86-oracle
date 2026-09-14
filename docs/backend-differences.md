@@ -821,6 +821,61 @@ the fourth operand under both layouts. Still present on upstream master as of
 2026-09-14. No silicon with FMA4 or XOP was available; the AMD APM
 encoding tables and the LLVM/binutils encoders are the authority.
 
+## 4w. XOP vector: VPPERM / VPERMIL2 source select, VPMACS(S)WD word index, VPSHL/VPSHA count saturation, VPROT/VPSHL/VPSHA VEX.W roles, VPSHA opcode — patched (Bochs)
+
+Found 2026-09-14 by diffing an independent model of the AMD XOP vector group
+(the 55 `vpcom*`/`vpcmov`/`vpperm`/`vpermil2*`/`vpmacs*`/`vphadd*`/`vprot*`/
+`vpsh*`/`vfrcz*` forms). Five families disagreed, each against the AMD
+definition — the AMD64 APM Vol. 4 XOP chapter, quoted verbatim by Microsoft's
+XOP intrinsic reference, and (for the two selects) LLVM's X86ShuffleDecode /
+X86InstComments, which were written and tested against Bulldozer hardware:
+
+- **VPPERM** picked the FIRST source when selector bit 4 was set. The
+  architecture indexes the 32-byte concatenation `src2:src1` with src1 LOW:
+  values 0..15 are src1 bytes, 16..31 src2 bytes (LLVM folds
+  `vpperm(a0, a1, <8,24,9,25,…>)` to `unpckhbw(a0, a1)`).
+- **VPERMIL2PS/PD** (`xmm_permil2ps/pd`) likewise returned src1 for selector
+  bit 2 set; values 0..3 select src1, 4..7 src2
+  (`vpermil2ps(a0, a1, <1,1,7,4>)` is `a0[1],a0[1],a1[3],a1[0]`). The m2z
+  zeroing rule was already right.
+- **VPMACSWD / VPMACSSWD** multiplied words 1, 3, 5, 7. The definition is
+  `r[i] = src1[2*i] * src2[2*i] + src3[i]` — the EVEN word of each dword, the
+  odd one ignored (VPMADCS(S)WD, which uses both, was right).
+- **VPSHL{b,w,d,q} / VPSHA{b,w,d,q}** (`xmm_pshl*`/`xmm_psha*`) masked the
+  count magnitude with width-1, so `vpshlb` by 8 left the byte unchanged. A
+  magnitude at or past the width gives 0 (logical, and arithmetic left) or
+  the sign fill (arithmetic right). `xmm_pshlw` also read its count as an
+  UNSIGNED byte, so a negative word count never shifted right. `vprot*`'s
+  count is unaffected — a rotate count is taken modulo the width by definition.
+- **VPROT/VPSHL/VPSHA variable forms** (XOP9 90-9B): the opmap binds VEX.W
+  the wrong way round, the §4v pattern again. AMD's W = 0 encoding is
+  `xmm1, xmm2/m128, xmm3` — ModRM.rm is the DATA (src1, may be memory),
+  VEX.vvvv the count — and W = 1 is `xmm1, xmm2, xmm3/m128`; the W0 rows were
+  the `VdqHdqWdq` lists (data from vvvv), so every register form shifted the
+  count vector by the data and every memory form took the memory operand in
+  the wrong role.
+- **VPSHA{b,w,d,q}** were decoded at XOP9 opcodes 88-8B (found while writing
+  the tests below). AMD's map 9 has VPROT at 90-93, VPSHL at 94-97 and VPSHA
+  at 98-9B — where LLVM and binutils encode them — so the architectural
+  encodings raised #UD in the oracle and four undefined opcodes executed
+  instead.
+
+Fixed by
+[`patches/bochs/0013-xop-vpperm-vpermil2-select-vpmacswd-even-word-shift-saturate.patch`](../patches/bochs/0013-xop-vpperm-vpermil2-select-vpmacswd-even-word-shift-saturate.patch)
+(`avx/xop.cc`: the VPPERM select and the four VPMACS(S)WD word indices;
+`simd_int.h`: the two permil2 selects and the eight shift helpers;
+`decoder/fetchdecode_opmap_xop.cc`: ATTR_VEX_W0/W1 exchanged on the 12 XOP9
+90-9B groups and the four VPSHA groups moved from 88-8B to 98-9B), applied by
+`scripts/vendor-bochs.sh` like its siblings; `tests/bochs_patches.rs` pins
+`vpperm` with selectors on both sides of 16, `vpermil2ps`/`vpermil2pd` with
+selectors on both sides of 4 (plus the m2z rule, at 128 and 256 bits),
+`vpmacswd`/`vpmacsswd` with zero odd words and overflowing lanes, all eight
+`vpshl*`/`vpsha*` with counts at, past and far past the width in both
+directions, and all twelve variable `vprot*`/`vpshl*`/`vpsha*` forms under
+both W layouts with a register and a memory rm — the VPSHA cases at 98-9B.
+Still present on upstream master as of 2026-09-14. No XOP silicon was
+available.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

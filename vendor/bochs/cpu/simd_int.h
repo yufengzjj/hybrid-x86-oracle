@@ -399,7 +399,7 @@ BX_CPP_INLINE void xmm_permil2ps(BxPackedXmmRegister *r, const BxPackedXmmRegist
     if ((m2z ^ ((ctrl >> 3) & 0x1)) == 0x3)
       r->xmm32u(n) = 0;
     else
-      r->xmm32u(n) = (ctrl & 0x4) ? op1->xmm32u(ctrl & 0x3) : op2->xmm32u(ctrl & 0x3);
+      r->xmm32u(n) = (ctrl & 0x4) ? op2->xmm32u(ctrl & 0x3) : op1->xmm32u(ctrl & 0x3);
   }
 }
 
@@ -410,7 +410,7 @@ BX_CPP_INLINE void xmm_permil2pd(BxPackedXmmRegister *r, const BxPackedXmmRegist
     if ((m2z ^ ((ctrl >> 3) & 0x1)) == 0x3)
       r->xmm64u(n) = 0;
     else
-      r->xmm64u(n) = (ctrl & 0x4) ? op1->xmm64u((ctrl >> 1) & 0x1) : op2->xmm64u((ctrl >> 1) & 0x1);
+      r->xmm64u(n) = (ctrl & 0x4) ? op2->xmm64u((ctrl >> 1) & 0x1) : op1->xmm64u((ctrl >> 1) & 0x1);
   }
 }
 
@@ -1631,12 +1631,12 @@ BX_CPP_INLINE void xmm_pshab(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 16;n++) {
     int shift = op2->xmmsbyte(n);
     if (shift > 0) {
-      // shift left
-      op1->xmmsbyte(n) <<= (shift & 0x7);
+      // shift left, a count past the element width gives 0
+      op1->xmmsbyte(n) = (shift < 8) ? (op1->xmmsbyte(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmmsbyte(n) >>= (-shift & 0x7);
+      // shift right, a count past the element width gives the sign fill
+      op1->xmmsbyte(n) = (-shift < 8) ? (op1->xmmsbyte(n) >> -shift) : (op1->xmmsbyte(n) < 0) ? -1 : 0;
     }
   }
 }
@@ -1646,12 +1646,12 @@ BX_CPP_INLINE void xmm_pshaw(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 8;n++) {
     int shift = op2->xmmsbyte(n*2);
     if (shift > 0) {
-      // shift left
-      op1->xmm16s(n) <<= (shift & 0xf);
+      // shift left, a count past the element width gives 0
+      op1->xmm16s(n) = (shift < 16) ? (op1->xmm16s(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm16s(n) >>= (-shift & 0xf);
+      // shift right, a count past the element width gives the sign fill
+      op1->xmm16s(n) = (-shift < 16) ? (op1->xmm16s(n) >> -shift) : (op1->xmm16s(n) < 0) ? -1 : 0;
     }
   }
 }
@@ -1661,12 +1661,12 @@ BX_CPP_INLINE void xmm_pshad(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 4;n++) {
     int shift = op2->xmmsbyte(n*4);
     if (shift > 0) {
-      // shift left
-      op1->xmm32s(n) <<= (shift & 0x1f);
+      // shift left, a count past the element width gives 0
+      op1->xmm32s(n) = (shift < 32) ? (op1->xmm32s(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm32s(n) >>= (-shift & 0x1f);
+      // shift right, a count past the element width gives the sign fill
+      op1->xmm32s(n) = (-shift < 32) ? (op1->xmm32s(n) >> -shift) : (op1->xmm32s(n) < 0) ? -1 : 0;
     }
   }
 }
@@ -1676,12 +1676,12 @@ BX_CPP_INLINE void xmm_pshaq(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 2;n++) {
     int shift = op2->xmmsbyte(n*8);
     if (shift > 0) {
-      // shift left
-      op1->xmm64s(n) <<= (shift & 0x3f);
+      // shift left, a count past the element width gives 0
+      op1->xmm64s(n) = (shift < 64) ? (op1->xmm64s(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm64s(n) >>= (-shift & 0x3f);
+      // shift right, a count past the element width gives the sign fill
+      op1->xmm64s(n) = (-shift < 64) ? (op1->xmm64s(n) >> -shift) : (op1->xmm64s(n) < 0) ? -1 : 0;
     }
   }
 }
@@ -1691,12 +1691,12 @@ BX_CPP_INLINE void xmm_pshlb(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 16;n++) {
     int shift = op2->xmmsbyte(n);
     if (shift > 0) {
-      // shift left
-      op1->xmmubyte(n) <<= (shift & 0x7);
+      // shift left, a count past the element width gives 0
+      op1->xmmubyte(n) = (shift < 8) ? (op1->xmmubyte(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmmubyte(n) >>= (-shift & 0x7);
+      // shift right, a count past the element width gives 0
+      op1->xmmubyte(n) = (-shift < 8) ? (op1->xmmubyte(n) >> -shift) : 0;
     }
   }
 }
@@ -1704,14 +1704,14 @@ BX_CPP_INLINE void xmm_pshlb(BxPackedXmmRegister *op1, const BxPackedXmmRegister
 BX_CPP_INLINE void xmm_pshlw(BxPackedXmmRegister *op1, const BxPackedXmmRegister *op2)
 {
   for(unsigned n=0;n < 8;n++) {
-    int shift = op2->xmmubyte(n*2);
+    int shift = op2->xmmsbyte(n*2);
     if (shift > 0) {
-      // shift left
-      op1->xmm16u(n) <<= (shift & 0xf);
+      // shift left, a count past the element width gives 0
+      op1->xmm16u(n) = (shift < 16) ? (op1->xmm16u(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm16u(n) >>= (-shift & 0xf);
+      // shift right, a count past the element width gives 0
+      op1->xmm16u(n) = (-shift < 16) ? (op1->xmm16u(n) >> -shift) : 0;
     }
   }
 }
@@ -1721,12 +1721,12 @@ BX_CPP_INLINE void xmm_pshld(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 4;n++) {
     int shift = op2->xmmsbyte(n*4);
     if (shift > 0) {
-      // shift left
-      op1->xmm32u(n) <<= (shift & 0x1f);
+      // shift left, a count past the element width gives 0
+      op1->xmm32u(n) = (shift < 32) ? (op1->xmm32u(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm32u(n) >>= (-shift & 0x1f);
+      // shift right, a count past the element width gives 0
+      op1->xmm32u(n) = (-shift < 32) ? (op1->xmm32u(n) >> -shift) : 0;
     }
   }
 }
@@ -1736,12 +1736,12 @@ BX_CPP_INLINE void xmm_pshlq(BxPackedXmmRegister *op1, const BxPackedXmmRegister
   for(unsigned n=0;n < 2;n++) {
     int shift = op2->xmmsbyte(n*8);
     if (shift > 0) {
-      // shift left
-      op1->xmm64u(n) <<= (shift & 0x3f);
+      // shift left, a count past the element width gives 0
+      op1->xmm64u(n) = (shift < 64) ? (op1->xmm64u(n) << shift) : 0;
     }
     else if (shift < 0) {
-      // shift right
-      op1->xmm64u(n) >>= (-shift & 0x3f);
+      // shift right, a count past the element width gives 0
+      op1->xmm64u(n) = (-shift < 64) ? (op1->xmm64u(n) >> -shift) : 0;
     }
   }
 }

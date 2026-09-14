@@ -1,0 +1,389 @@
+XOP: VPPERM / VPERMIL2 select the wrong source, VPMACS(S)WD multiply the odd words, VPSHL/VPSHA counts wrap instead of saturating, VPROT/VPSHL/VPSHA VEX.W roles inverted, VPSHA decoded at 88-8B instead of 98-9B
+
+Six independent defects in the XOP vector handlers and decoder, all against the AMD
+definition (AMD64 APM Vol. 4 "128-Bit and 256-Bit XOP and FMA4 Instructions";
+the Microsoft XOP intrinsic reference quotes the same semantics; LLVM's
+X86ShuffleDecode / X86InstComments, written and tested against Bulldozer
+hardware, agree on the two selects):
+
+1. VPPERM: selector values 0..15 pick bytes of the FIRST source (src1, the
+   VEX.vvvv register) and 16..31 bytes of the second — "the 32-byte
+   concatenation src2:src1 with src1 low". The handler picked src1 when bit 4
+   was SET. (LLVM: vpperm(a0, a1, <8,24,9,25,...>) is unpckhbw(a0, a1).)
+
+2. VPERMIL2PS / VPERMIL2PD (xmm_permil2ps/pd): selector values 0..3 pick src1
+   and 4..7 (bit 2 set) pick src2. The helper returned op1 (src1) for bit 2
+   set. (LLVM: vpermil2ps(a0, a1, <1,1,7,4>) is a0[1],a0[1],a1[3],a1[0].)
+
+3. VPMACSWD / VPMACSSWD: "each EVEN-indexed 16-bit signed integer in src1 is
+   multiplied by the corresponding one in src2 ... the odd-indexed values are
+   ignored" (r[i] = src1[2*i] * src2[2*i] + src3[i]). The handlers used words
+   1, 3, 5, 7.
+
+4. VPSHLB/W/D/Q and VPSHAB/W/D/Q (xmm_pshl*/xmm_psha*): "if a shift count is
+   greater than 7 [15/31/63] the result is 0; if less than -7 [...] the result
+   is 0 (logical) / -1 if the value is negative, 0 otherwise (arithmetic)".
+   The helpers masked the magnitude with width-1, so a count of 8 on bytes
+   left the element unshifted. xmm_pshlw additionally read its count through
+   xmmubyte, so a negative word count could never shift right.
+
+5. VPROT/VPSHL/VPSHA variable forms (XOP9 90-9B): the opmap binds VEX.W the
+   wrong way round, exactly as 0012 found for the is4 rows. The AMD APM's
+   W = 0 encoding is "xmm1, xmm2/m128, xmm3" — ModRM.rm is the DATA (src1,
+   may be memory) and VEX.vvvv the count — and W = 1 is "xmm1, xmm2,
+   xmm3/m128" (vvvv the data, rm the count). The opmap had W0 on the
+   VdqHdqWdq rows (data from vvvv, count from rm), so every register form
+   rotated/shifted the count vector by the data and every memory form took
+   the memory operand in the wrong role.
+
+6. VPSHAB/W/D/Q were decoded at XOP9 opcodes 88-8B. AMD's map 9 places them
+   at 98-9B (VPROT 90-93, VPSHL 94-97, VPSHA 98-9B; LLVM's X86InstrXOP.td and
+   binutils encode them there), so the architectural encodings raised #UD and
+   four undefined opcodes executed instead.
+
+Fixed in avx/xop.cc (VPPERM select, the four VPMACS(S)WD word indices),
+simd_int.h (the permil2 selects, the eight shift helpers) and
+decoder/fetchdecode_opmap_xop.cc (ATTR_VEX_W0/W1 exchanged on the 12 XOP9
+90-9B groups; the four VPSHA groups moved from 88-8B to 98-9B, 88-8B are #UD
+again). VPROT*'s count itself is unaffected: a rotate count IS taken modulo
+the width.
+
+Found 2026-09-14 by the hybrid-x86-oracle differential harness diffing the
+zens model of the XOP vector group. Present on upstream master as of
+2026-09-14. No XOP silicon was available; the AMD manual, the MS intrinsic
+reference and LLVM's hardware-validated decoders are the authority.
+
+diff --git a/cpu/avx/xop.cc b/cpu/avx/xop.cc
+index e2ed7fe..45ca417 100644
+--- a/cpu/avx/xop.cc
++++ b/cpu/avx/xop.cc
+@@ -193,9 +193,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPPERM_VdqHdqWdqVIb(bxInstruction_c *i)
+     unsigned control = op3.xmmubyte(n);
+ 
+     if (control & 0x10)
+-      dst.xmmubyte(n) = op1.xmmubyte(control & 0xf);
+-    else
+       dst.xmmubyte(n) = op2.xmmubyte(control & 0xf);
++    else
++      dst.xmmubyte(n) = op1.xmmubyte(control & 0xf);
+ 
+     dst.xmmubyte(n) = vpperm_op[control >> 5](dst.xmmubyte(n));
+   }
+@@ -252,10 +252,10 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPMACSSWD_VdqHdqWdqVIbR(bxInstruction_c *i
+   BxPackedXmmRegister op2 = BX_READ_XMM_REG(i->src2());
+   BxPackedXmmRegister op3 = BX_READ_XMM_REG(i->src3());
+ 
+-  op1.xmm32s(0) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(1) * (Bit32s) op2.xmm16s(1)) + (Bit64s) op3.xmm32s(0));
+-  op1.xmm32s(1) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(3) * (Bit32s) op2.xmm16s(3)) + (Bit64s) op3.xmm32s(1));
+-  op1.xmm32s(2) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(5) * (Bit32s) op2.xmm16s(5)) + (Bit64s) op3.xmm32s(2));
+-  op1.xmm32s(3) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(7) * (Bit32s) op2.xmm16s(7)) + (Bit64s) op3.xmm32s(3));
++  op1.xmm32s(0) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(0) * (Bit32s) op2.xmm16s(0)) + (Bit64s) op3.xmm32s(0));
++  op1.xmm32s(1) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(2) * (Bit32s) op2.xmm16s(2)) + (Bit64s) op3.xmm32s(1));
++  op1.xmm32s(2) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(4) * (Bit32s) op2.xmm16s(4)) + (Bit64s) op3.xmm32s(2));
++  op1.xmm32s(3) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(6) * (Bit32s) op2.xmm16s(6)) + (Bit64s) op3.xmm32s(3));
+ 
+   BX_WRITE_XMM_REG_CLEAR_HIGH(i->dst(), op1);
+ 
+@@ -342,10 +342,10 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPMACSWD_VdqHdqWdqVIbR(bxInstruction_c *i)
+   BxPackedXmmRegister op2 = BX_READ_XMM_REG(i->src2());
+   BxPackedXmmRegister op3 = BX_READ_XMM_REG(i->src3());
+ 
+-  op1.xmm32s(0) = ((Bit32s) op1.xmm16s(1) * (Bit32s) op2.xmm16s(1)) + (Bit64s) op3.xmm32s(0);
+-  op1.xmm32s(1) = ((Bit32s) op1.xmm16s(3) * (Bit32s) op2.xmm16s(3)) + (Bit64s) op3.xmm32s(1);
+-  op1.xmm32s(2) = ((Bit32s) op1.xmm16s(5) * (Bit32s) op2.xmm16s(5)) + (Bit64s) op3.xmm32s(2);
+-  op1.xmm32s(3) = ((Bit32s) op1.xmm16s(7) * (Bit32s) op2.xmm16s(7)) + (Bit64s) op3.xmm32s(3);
++  op1.xmm32s(0) = ((Bit32s) op1.xmm16s(0) * (Bit32s) op2.xmm16s(0)) + (Bit64s) op3.xmm32s(0);
++  op1.xmm32s(1) = ((Bit32s) op1.xmm16s(2) * (Bit32s) op2.xmm16s(2)) + (Bit64s) op3.xmm32s(1);
++  op1.xmm32s(2) = ((Bit32s) op1.xmm16s(4) * (Bit32s) op2.xmm16s(4)) + (Bit64s) op3.xmm32s(2);
++  op1.xmm32s(3) = ((Bit32s) op1.xmm16s(6) * (Bit32s) op2.xmm16s(6)) + (Bit64s) op3.xmm32s(3);
+ 
+   BX_WRITE_XMM_REG_CLEAR_HIGH(i->dst(), op1);
+ 
+diff --git a/cpu/decoder/fetchdecode_opmap_xop.cc b/cpu/decoder/fetchdecode_opmap_xop.cc
+index 7488975..adb3ac8 100644
+--- a/cpu/decoder/fetchdecode_opmap_xop.cc
++++ b/cpu/decoder/fetchdecode_opmap_xop.cc
+@@ -105,64 +105,64 @@ static const Bit64u BxOpcodeGroup_XOP_0x9_81[] = { last_opcode(ATTR_VEX_W0, BX_I
+ static const Bit64u BxOpcodeGroup_XOP_0x9_82[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VFRCZSS_VssWss) };
+ static const Bit64u BxOpcodeGroup_XOP_0x9_83[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VFRCZSD_VsdWsd) };
+ 
+-static const Bit64u BxOpcodeGroup_XOP_0x9_88[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqWdqHdq)
++static const Bit64u BxOpcodeGroup_XOP_0x9_98[] = {
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqWdqHdq)
+ };
+ 
+-static const Bit64u BxOpcodeGroup_XOP_0x9_89[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqWdqHdq)
++static const Bit64u BxOpcodeGroup_XOP_0x9_99[] = {
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqWdqHdq)
+ };
+ 
+-static const Bit64u BxOpcodeGroup_XOP_0x9_8A[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqWdqHdq)
++static const Bit64u BxOpcodeGroup_XOP_0x9_9A[] = {
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqWdqHdq)
+ };
+ 
+-static const Bit64u BxOpcodeGroup_XOP_0x9_8B[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqWdqHdq)
++static const Bit64u BxOpcodeGroup_XOP_0x9_9B[] = {
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_90[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTB_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTB_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTB_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTB_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_91[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTW_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTW_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTW_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTW_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_92[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTD_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTD_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTD_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTD_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_93[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_94[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_95[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_96[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_97[] = {
+-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqHdqWdq),
+-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqWdqHdq)
++  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqHdqWdq),
++  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqWdqHdq)
+ };
+ 
+ static const Bit64u BxOpcodeGroup_XOP_0x9_C1[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPHADDBW_VdqWdq) };
+@@ -585,10 +585,10 @@ const Bit64u *BxOpcodeTableXOP[256*3] = {
+   /* 85  */ BxOpcodeGroup_ERR,
+   /* 86  */ BxOpcodeGroup_ERR,
+   /* 87  */ BxOpcodeGroup_ERR,
+-  /* 88  */ BxOpcodeGroup_XOP_0x9_88,
+-  /* 89  */ BxOpcodeGroup_XOP_0x9_89,
+-  /* 8A  */ BxOpcodeGroup_XOP_0x9_8A,
+-  /* 8B  */ BxOpcodeGroup_XOP_0x9_8B,
++  /* 88  */ BxOpcodeGroup_ERR,
++  /* 89  */ BxOpcodeGroup_ERR,
++  /* 8A  */ BxOpcodeGroup_ERR,
++  /* 8B  */ BxOpcodeGroup_ERR,
+   /* 8C  */ BxOpcodeGroup_ERR,
+   /* 8D  */ BxOpcodeGroup_ERR,
+   /* 8E  */ BxOpcodeGroup_ERR,
+@@ -601,10 +601,10 @@ const Bit64u *BxOpcodeTableXOP[256*3] = {
+   /* 95  */ BxOpcodeGroup_XOP_0x9_95,
+   /* 96  */ BxOpcodeGroup_XOP_0x9_96,
+   /* 97  */ BxOpcodeGroup_XOP_0x9_97,
+-  /* 98  */ BxOpcodeGroup_ERR,
+-  /* 99  */ BxOpcodeGroup_ERR,
+-  /* 9A  */ BxOpcodeGroup_ERR,
+-  /* 9B  */ BxOpcodeGroup_ERR,
++  /* 98  */ BxOpcodeGroup_XOP_0x9_98,
++  /* 99  */ BxOpcodeGroup_XOP_0x9_99,
++  /* 9A  */ BxOpcodeGroup_XOP_0x9_9A,
++  /* 9B  */ BxOpcodeGroup_XOP_0x9_9B,
+   /* 9C  */ BxOpcodeGroup_ERR,
+   /* 9D  */ BxOpcodeGroup_ERR,
+   /* 9E  */ BxOpcodeGroup_ERR,
+diff --git a/cpu/simd_int.h b/cpu/simd_int.h
+index b36da83..10e19b3 100644
+--- a/cpu/simd_int.h
++++ b/cpu/simd_int.h
+@@ -399,7 +399,7 @@ BX_CPP_INLINE void xmm_permil2ps(BxPackedXmmRegister *r, const BxPackedXmmRegist
+     if ((m2z ^ ((ctrl >> 3) & 0x1)) == 0x3)
+       r->xmm32u(n) = 0;
+     else
+-      r->xmm32u(n) = (ctrl & 0x4) ? op1->xmm32u(ctrl & 0x3) : op2->xmm32u(ctrl & 0x3);
++      r->xmm32u(n) = (ctrl & 0x4) ? op2->xmm32u(ctrl & 0x3) : op1->xmm32u(ctrl & 0x3);
+   }
+ }
+ 
+@@ -410,7 +410,7 @@ BX_CPP_INLINE void xmm_permil2pd(BxPackedXmmRegister *r, const BxPackedXmmRegist
+     if ((m2z ^ ((ctrl >> 3) & 0x1)) == 0x3)
+       r->xmm64u(n) = 0;
+     else
+-      r->xmm64u(n) = (ctrl & 0x4) ? op1->xmm64u((ctrl >> 1) & 0x1) : op2->xmm64u((ctrl >> 1) & 0x1);
++      r->xmm64u(n) = (ctrl & 0x4) ? op2->xmm64u((ctrl >> 1) & 0x1) : op1->xmm64u((ctrl >> 1) & 0x1);
+   }
+ }
+ 
+@@ -1631,12 +1631,12 @@ BX_CPP_INLINE void xmm_pshab(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 16;n++) {
+     int shift = op2->xmmsbyte(n);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmmsbyte(n) <<= (shift & 0x7);
++      // shift left, a count past the element width gives 0
++      op1->xmmsbyte(n) = (shift < 8) ? (op1->xmmsbyte(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmmsbyte(n) >>= (-shift & 0x7);
++      // shift right, a count past the element width gives the sign fill
++      op1->xmmsbyte(n) = (-shift < 8) ? (op1->xmmsbyte(n) >> -shift) : (op1->xmmsbyte(n) < 0) ? -1 : 0;
+     }
+   }
+ }
+@@ -1646,12 +1646,12 @@ BX_CPP_INLINE void xmm_pshaw(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 8;n++) {
+     int shift = op2->xmmsbyte(n*2);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm16s(n) <<= (shift & 0xf);
++      // shift left, a count past the element width gives 0
++      op1->xmm16s(n) = (shift < 16) ? (op1->xmm16s(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm16s(n) >>= (-shift & 0xf);
++      // shift right, a count past the element width gives the sign fill
++      op1->xmm16s(n) = (-shift < 16) ? (op1->xmm16s(n) >> -shift) : (op1->xmm16s(n) < 0) ? -1 : 0;
+     }
+   }
+ }
+@@ -1661,12 +1661,12 @@ BX_CPP_INLINE void xmm_pshad(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 4;n++) {
+     int shift = op2->xmmsbyte(n*4);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm32s(n) <<= (shift & 0x1f);
++      // shift left, a count past the element width gives 0
++      op1->xmm32s(n) = (shift < 32) ? (op1->xmm32s(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm32s(n) >>= (-shift & 0x1f);
++      // shift right, a count past the element width gives the sign fill
++      op1->xmm32s(n) = (-shift < 32) ? (op1->xmm32s(n) >> -shift) : (op1->xmm32s(n) < 0) ? -1 : 0;
+     }
+   }
+ }
+@@ -1676,12 +1676,12 @@ BX_CPP_INLINE void xmm_pshaq(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 2;n++) {
+     int shift = op2->xmmsbyte(n*8);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm64s(n) <<= (shift & 0x3f);
++      // shift left, a count past the element width gives 0
++      op1->xmm64s(n) = (shift < 64) ? (op1->xmm64s(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm64s(n) >>= (-shift & 0x3f);
++      // shift right, a count past the element width gives the sign fill
++      op1->xmm64s(n) = (-shift < 64) ? (op1->xmm64s(n) >> -shift) : (op1->xmm64s(n) < 0) ? -1 : 0;
+     }
+   }
+ }
+@@ -1691,12 +1691,12 @@ BX_CPP_INLINE void xmm_pshlb(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 16;n++) {
+     int shift = op2->xmmsbyte(n);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmmubyte(n) <<= (shift & 0x7);
++      // shift left, a count past the element width gives 0
++      op1->xmmubyte(n) = (shift < 8) ? (op1->xmmubyte(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmmubyte(n) >>= (-shift & 0x7);
++      // shift right, a count past the element width gives 0
++      op1->xmmubyte(n) = (-shift < 8) ? (op1->xmmubyte(n) >> -shift) : 0;
+     }
+   }
+ }
+@@ -1704,14 +1704,14 @@ BX_CPP_INLINE void xmm_pshlb(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+ BX_CPP_INLINE void xmm_pshlw(BxPackedXmmRegister *op1, const BxPackedXmmRegister *op2)
+ {
+   for(unsigned n=0;n < 8;n++) {
+-    int shift = op2->xmmubyte(n*2);
++    int shift = op2->xmmsbyte(n*2);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm16u(n) <<= (shift & 0xf);
++      // shift left, a count past the element width gives 0
++      op1->xmm16u(n) = (shift < 16) ? (op1->xmm16u(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm16u(n) >>= (-shift & 0xf);
++      // shift right, a count past the element width gives 0
++      op1->xmm16u(n) = (-shift < 16) ? (op1->xmm16u(n) >> -shift) : 0;
+     }
+   }
+ }
+@@ -1721,12 +1721,12 @@ BX_CPP_INLINE void xmm_pshld(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 4;n++) {
+     int shift = op2->xmmsbyte(n*4);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm32u(n) <<= (shift & 0x1f);
++      // shift left, a count past the element width gives 0
++      op1->xmm32u(n) = (shift < 32) ? (op1->xmm32u(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm32u(n) >>= (-shift & 0x1f);
++      // shift right, a count past the element width gives 0
++      op1->xmm32u(n) = (-shift < 32) ? (op1->xmm32u(n) >> -shift) : 0;
+     }
+   }
+ }
+@@ -1736,12 +1736,12 @@ BX_CPP_INLINE void xmm_pshlq(BxPackedXmmRegister *op1, const BxPackedXmmRegister
+   for(unsigned n=0;n < 2;n++) {
+     int shift = op2->xmmsbyte(n*8);
+     if (shift > 0) {
+-      // shift left
+-      op1->xmm64u(n) <<= (shift & 0x3f);
++      // shift left, a count past the element width gives 0
++      op1->xmm64u(n) = (shift < 64) ? (op1->xmm64u(n) << shift) : 0;
+     }
+     else if (shift < 0) {
+-      // shift right
+-      op1->xmm64u(n) >>= (-shift & 0x3f);
++      // shift right, a count past the element width gives 0
++      op1->xmm64u(n) = (-shift < 64) ? (op1->xmm64u(n) >> -shift) : 0;
+     }
+   }
+ }

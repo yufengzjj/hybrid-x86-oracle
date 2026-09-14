@@ -193,9 +193,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPPERM_VdqHdqWdqVIb(bxInstruction_c *i)
     unsigned control = op3.xmmubyte(n);
 
     if (control & 0x10)
-      dst.xmmubyte(n) = op1.xmmubyte(control & 0xf);
-    else
       dst.xmmubyte(n) = op2.xmmubyte(control & 0xf);
+    else
+      dst.xmmubyte(n) = op1.xmmubyte(control & 0xf);
 
     dst.xmmubyte(n) = vpperm_op[control >> 5](dst.xmmubyte(n));
   }
@@ -252,10 +252,10 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPMACSSWD_VdqHdqWdqVIbR(bxInstruction_c *i
   BxPackedXmmRegister op2 = BX_READ_XMM_REG(i->src2());
   BxPackedXmmRegister op3 = BX_READ_XMM_REG(i->src3());
 
-  op1.xmm32s(0) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(1) * (Bit32s) op2.xmm16s(1)) + (Bit64s) op3.xmm32s(0));
-  op1.xmm32s(1) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(3) * (Bit32s) op2.xmm16s(3)) + (Bit64s) op3.xmm32s(1));
-  op1.xmm32s(2) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(5) * (Bit32s) op2.xmm16s(5)) + (Bit64s) op3.xmm32s(2));
-  op1.xmm32s(3) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(7) * (Bit32s) op2.xmm16s(7)) + (Bit64s) op3.xmm32s(3));
+  op1.xmm32s(0) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(0) * (Bit32s) op2.xmm16s(0)) + (Bit64s) op3.xmm32s(0));
+  op1.xmm32s(1) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(2) * (Bit32s) op2.xmm16s(2)) + (Bit64s) op3.xmm32s(1));
+  op1.xmm32s(2) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(4) * (Bit32s) op2.xmm16s(4)) + (Bit64s) op3.xmm32s(2));
+  op1.xmm32s(3) = SaturateQwordSToDwordS(((Bit32s) op1.xmm16s(6) * (Bit32s) op2.xmm16s(6)) + (Bit64s) op3.xmm32s(3));
 
   BX_WRITE_XMM_REG_CLEAR_HIGH(i->dst(), op1);
 
@@ -342,10 +342,10 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VPMACSWD_VdqHdqWdqVIbR(bxInstruction_c *i)
   BxPackedXmmRegister op2 = BX_READ_XMM_REG(i->src2());
   BxPackedXmmRegister op3 = BX_READ_XMM_REG(i->src3());
 
-  op1.xmm32s(0) = ((Bit32s) op1.xmm16s(1) * (Bit32s) op2.xmm16s(1)) + (Bit64s) op3.xmm32s(0);
-  op1.xmm32s(1) = ((Bit32s) op1.xmm16s(3) * (Bit32s) op2.xmm16s(3)) + (Bit64s) op3.xmm32s(1);
-  op1.xmm32s(2) = ((Bit32s) op1.xmm16s(5) * (Bit32s) op2.xmm16s(5)) + (Bit64s) op3.xmm32s(2);
-  op1.xmm32s(3) = ((Bit32s) op1.xmm16s(7) * (Bit32s) op2.xmm16s(7)) + (Bit64s) op3.xmm32s(3);
+  op1.xmm32s(0) = ((Bit32s) op1.xmm16s(0) * (Bit32s) op2.xmm16s(0)) + (Bit64s) op3.xmm32s(0);
+  op1.xmm32s(1) = ((Bit32s) op1.xmm16s(2) * (Bit32s) op2.xmm16s(2)) + (Bit64s) op3.xmm32s(1);
+  op1.xmm32s(2) = ((Bit32s) op1.xmm16s(4) * (Bit32s) op2.xmm16s(4)) + (Bit64s) op3.xmm32s(2);
+  op1.xmm32s(3) = ((Bit32s) op1.xmm16s(6) * (Bit32s) op2.xmm16s(6)) + (Bit64s) op3.xmm32s(3);
 
   BX_WRITE_XMM_REG_CLEAR_HIGH(i->dst(), op1);
 

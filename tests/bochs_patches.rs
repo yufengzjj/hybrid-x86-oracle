@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4v are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4w are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -1767,5 +1767,239 @@ fn permil2_vpcmov_and_vpperm_take_their_selector_from_the_fourth_operand() {
         set_third_fourth(&mut cpu, w, &data, &sel);
         run(&mut cpu, &[0x8F, 0xE8, w << 7 | 0x70, 0xA3, 0xC3, 0x20], 1);
         assert_eq!(cpu.get_zmm(0), lanes(8, &[0x12; 16]), "vpperm W{w}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4w: the XOP vector group — VPPERM / VPERMIL2 source select, VPMACS(S)WD
+// word index, VPSHL/VPSHA count saturation, and VEX.W on the variable
+// VPROT/VPSHL/VPSHA forms.
+//
+// `patches/bochs/0013-xop-vpperm-vpermil2-select-vpmacswd-even-word-shift-saturate.patch`
+// is what makes these pass. XOP encodings are `8F E8` (map 8) / `8F E9`
+// (map 9) + byte 2 (W, vvvv = ~xmm1, L, pp = 00); the is4 forms reuse
+// `set_third_fourth` from §4v, so both W layouts are covered by each case.
+
+/// XOP byte 2: W, vvvv = ~xmm1, L, pp = 00.
+fn xop_byte2(w: u8, l: u8) -> u8 {
+    w << 7 | 0x70 | l << 2
+}
+
+/// Selector values 0..15 index src1 (VEX.vvvv), 16..31 index src2 — the
+/// 32-byte concatenation `src2:src1` with src1 low (LLVM folds
+/// `vpperm(a0, a1, <8,24,9,25,…>)` to `unpckhbw(a0, a1)`). Upstream had the
+/// two halves crossed.
+#[test]
+fn vpperm_indexes_src1_below_16_and_src2_from_16() {
+    let src1 = lanes(8, &core::array::from_fn::<u64, 16, _>(|n| 0xA0 + n as u64));
+    let src2 = lanes(8, &core::array::from_fn::<u64, 16, _>(|n| 0xB0 + n as u64));
+    // Bytes 0..7 come from src1[0..8], bytes 8..15 from src2[8..16].
+    let sel = lanes(8, &core::array::from_fn::<u64, 16, _>(|n| if n < 8 { n as u64 } else { 0x10 + n as u64 }));
+    let want = lanes(8, &core::array::from_fn::<u64, 16, _>(|n| if n < 8 { 0xA0 + n as u64 } else { 0xB0 + n as u64 }));
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &src1);
+        set_third_fourth(&mut cpu, w, &src2, &sel);
+        run(&mut cpu, &[0x8F, 0xE8, xop_byte2(w, 0), 0xA3, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), want, "vpperm W{w}: {:x?}", bytes(&cpu.get_zmm(0)));
+    }
+}
+
+/// Selector values 0..3 pick src1, 4..7 (bit 2 set) pick src2:
+/// `vpermil2ps(a0, a1, <1,1,7,4>)` is `a0[1], a0[1], a1[3], a1[0]`, per
+/// 128-bit lane; for `pd` the control is dword 2n, bit 1 the element. The
+/// m2z rule (imm 2: zero where bit 3 is set; imm 3: zero where it is clear)
+/// was already right and is pinned alongside.
+#[test]
+fn vpermil2_selects_src1_below_4_and_src2_from_4() {
+    let src1 = lanes(32, &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]);
+    let src2 = lanes(32, &[0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27]);
+    const PS_CASES: &[(u8, [u64; 4], [u64; 8])] = &[
+        (0, [1, 1, 7, 4], [0x11, 0x11, 0x23, 0x20, 0x15, 0x15, 0x27, 0x24]),
+        (2, [1, 9, 7, 12], [0x11, 0, 0x23, 0, 0x15, 0, 0x27, 0]),
+        (3, [1, 9, 7, 12], [0, 0x11, 0, 0x20, 0, 0x15, 0, 0x24]),
+    ];
+    for (m2z, ctrl, want) in PS_CASES {
+        let ctrl = lanes(32, &[ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[0], ctrl[1], ctrl[2], ctrl[3]]);
+        for l in [0u8, 1] {
+            let want = lanes(32, &want[..if l == 1 { 8 } else { 4 }]);
+            for w in [0u8, 1] {
+                let mut cpu = BochsOracle::new();
+                cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+                cpu.set_zmm(1, &src1);
+                set_third_fourth(&mut cpu, w, &src2, &ctrl);
+                run(&mut cpu, &[0xC4, 0xE3, is4_byte2(w, l), 0x48, 0xC3, 0x20 | m2z], 1);
+                assert_eq!(cpu.get_zmm(0), want, "vpermil2ps W{w} L{l} m2z={m2z}");
+            }
+        }
+    }
+    // vpermil2pd xmm0, xmm1, xmm2, xmm3, 0 with controls <2, 4>: src1[1], src2[0].
+    let src1 = lanes(64, &[0x10, 0x11]);
+    let src2 = lanes(64, &[0x20, 0x21]);
+    let ctrl = lanes(64, &[2, 4]);
+    for w in [0u8, 1] {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &src1);
+        set_third_fourth(&mut cpu, w, &src2, &ctrl);
+        run(&mut cpu, &[0xC4, 0xE3, is4_byte2(w, 0), 0x49, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), lanes(64, &[0x11, 0x20]), "vpermil2pd W{w}");
+    }
+}
+
+/// `r[i] = src1.word[2i] * src2.word[2i] + src3.dword[i]`: the EVEN word of
+/// each dword pair, the odd one ignored (upstream used the odd words). The odd
+/// words are zero here, so the upstream answer is `src3` alone. Lanes 2 and 3
+/// overflow: `vpmacsswd` saturates them, `vpmacswd` wraps.
+#[test]
+fn vpmacswd_forms_multiply_the_even_words() {
+    let src1 = lanes(16, &[3, 0, 5, 0, 0x7FFF, 0, 0x8000, 0]);
+    let src2 = lanes(16, &[2, 0, 4, 0, 0x7FFF, 0, 0x7FFF, 0]);
+    let src3 = lanes(32, &[1000, 2000, 0x7FFF_FFFF, 0x8000_0000]);
+    // 0x7FFF*0x7FFF + 0x7FFFFFFF = 0xBFFF0000 (wraps negative);
+    // -0x8000*0x7FFF - 0x80000000 = -0xBFFF8000 (wraps to 0x40008000).
+    const FORMS: &[(&str, u8, [u64; 4])] = &[
+        ("vpmacswd", 0x96, [1006, 2020, 0xBFFF_0000, 0x4000_8000]),
+        ("vpmacsswd", 0x86, [1006, 2020, 0x7FFF_FFFF, 0x8000_0000]),
+    ];
+    for (name, op, want) in FORMS {
+        let mut cpu = BochsOracle::new();
+        cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+        cpu.set_zmm(1, &src1);
+        cpu.set_zmm(3, &src2); // ModRM.rm: these rows are W0-only, rm third
+        cpu.set_zmm(2, &src3); // is4: the accumulator
+        run(&mut cpu, &[0x8F, 0xE8, xop_byte2(0, 0), *op, 0xC3, 0x20], 1);
+        assert_eq!(cpu.get_zmm(0), lanes(32, want), "{name} xmm0, xmm1, xmm3, xmm2");
+    }
+}
+
+/// `(mnemonic, XOP9 opcode, element bits, arithmetic)` for the eight variable
+/// shifts. AMD's map 9 has VPSHL at 94-97 and VPSHA at 98-9B.
+const XOP_SHIFTS: &[(&str, u8, u32, bool)] = &[
+    ("vpshlb", 0x94, 8, false),
+    ("vpshlw", 0x95, 16, false),
+    ("vpshld", 0x96, 32, false),
+    ("vpshlq", 0x97, 64, false),
+    ("vpshab", 0x98, 8, true),
+    ("vpshaw", 0x99, 16, true),
+    ("vpshad", 0x9A, 32, true),
+    ("vpshaq", 0x9B, 64, true),
+];
+
+/// The APM definition of one element: the signed count shifts left when
+/// positive and right when negative; a magnitude at or past the element width
+/// gives 0, except that an arithmetic right shift gives the sign fill.
+fn xop_shift(v: u64, bits: u32, count: i8, arith: bool) -> u64 {
+    let mask = u64::MAX >> (64 - bits);
+    let n = u32::from(count.unsigned_abs());
+    let negative = (v >> (bits - 1)) & 1 == 1;
+    if count == 0 {
+        v
+    } else if n >= bits {
+        if arith && count < 0 && negative { mask } else { 0 }
+    } else if count > 0 {
+        (v << n) & mask
+    } else if arith {
+        (((v << (64 - bits)) as i64 >> (64 - bits + n)) as u64) & mask
+    } else {
+        v >> n
+    }
+}
+
+/// Run `op` with every element of the data at `data` and every count byte
+/// `count` (the low byte of each count element; W0: data from ModRM.rm =
+/// xmm2, count from VEX.vvvv = xmm1). Returns the destination image.
+fn run_xop_shift(op: u8, bits: u32, data: &[u64], count: i8) -> [u64; ZMM_CHUNKS] {
+    let mut cpu = BochsOracle::new();
+    cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+    cpu.set_zmm(2, &lanes(bits, data));
+    cpu.set_zmm(1, &lanes(bits, &vec![u64::from(count as u8); (128 / bits) as usize]));
+    run(&mut cpu, &[0x8F, 0xE9, xop_byte2(0, 0), op, 0xC2], 1);
+    cpu.get_zmm(0)
+}
+
+/// Counts at, past and far past the element width in both directions,
+/// against a negative and a positive element. Upstream masked the magnitude
+/// with `width - 1`, so `vpshlb` by 8 was a no-op and by 9 a shift by 1; and
+/// `vpshlw` read its count unsigned, so it never shifted right.
+#[test]
+fn xop_shifts_saturate_past_the_element_width() {
+    for (name, op, bits, arith) in XOP_SHIFTS {
+        let bits = *bits;
+        let negative = 0xA5A5_A5A5_A5A5_A5A5 & (u64::MAX >> (64 - bits));
+        let positive = 0x5A5A_5A5A_5A5A_5A5A & (u64::MAX >> (64 - bits));
+        let data: Vec<u64> = (0..128 / bits).map(|n| if n % 2 == 0 { negative } else { positive }).collect();
+        let w = bits as i8;
+        for count in [0i8, 1, w - 1, w, w + 1, 127, -1, -(w - 1), -w, -(w + 1), -128] {
+            let want: Vec<u64> = data.iter().map(|v| xop_shift(*v, bits, count, *arith)).collect();
+            let got = run_xop_shift(*op, bits, &data, count);
+            assert_eq!(got, lanes(bits, &want), "{name} by {count}: got {got:x?}");
+        }
+    }
+}
+
+/// The twelve variable rotate/shift forms exist in two encodings: W = 0 is
+/// `xmm1, xmm2/m128, xmm3` (ModRM.rm the data, VEX.vvvv the count) and
+/// W = 1 `xmm1, xmm2, xmm3/m128` (vvvv the data, rm the count). Upstream had
+/// them crossed. Data 3 by count 1 is 6 for every form; the swap gives 1 by
+/// 3 = 8.
+#[test]
+fn xop_variable_rotates_and_shifts_take_their_data_from_rm_under_w0() {
+    const FORMS: &[(&str, u8, u32)] = &[
+        ("vprotb", 0x90, 8),
+        ("vprotw", 0x91, 16),
+        ("vprotd", 0x92, 32),
+        ("vprotq", 0x93, 64),
+        ("vpshlb", 0x94, 8),
+        ("vpshlw", 0x95, 16),
+        ("vpshld", 0x96, 32),
+        ("vpshlq", 0x97, 64),
+        ("vpshab", 0x98, 8),
+        ("vpshaw", 0x99, 16),
+        ("vpshad", 0x9A, 32),
+        ("vpshaq", 0x9B, 64),
+    ];
+    for (name, op, bits) in FORMS {
+        let n = (128 / bits) as usize;
+        let data = lanes(*bits, &vec![3; n]);
+        let count = lanes(*bits, &vec![1; n]);
+        let want = lanes(*bits, &vec![6; n]);
+        for w in [0u8, 1] {
+            // W0: rm = data, vvvv = count; W1: vvvv = data, rm = count.
+            let (vvvv, rm) = if w == 0 { (&count, &data) } else { (&data, &count) };
+            for mem in [false, true] {
+                let mut cpu = BochsOracle::new();
+                cpu.set_zmm(0, &[STALE; ZMM_CHUNKS]);
+                cpu.set_zmm(1, vvvv);
+                let modrm = if mem {
+                    cpu.write_mem(DATA, &bytes(rm)[..16]);
+                    cpu.set_gpr(RBX, DATA);
+                    cpu.set_zmm(2, &[STALE; ZMM_CHUNKS]);
+                    0x03
+                } else {
+                    cpu.set_zmm(2, rm);
+                    0xC2
+                };
+                run(&mut cpu, &[0x8F, 0xE9, xop_byte2(w, 0), *op, modrm], 1);
+                let role = if w == 0 { "data" } else { "count" };
+                let src = if mem { "[rbx]" } else { "xmm2" };
+                assert_eq!(cpu.get_zmm(0), want, "{name} W{w} with {src} as the {role}");
+            }
+        }
+    }
+}
+
+/// The other half of the relocation: XOP9 88-8B, where upstream had put the
+/// VPSHA forms, are undefined in AMD's map 9 and must #UD again.
+#[test]
+fn xop9_88_to_8b_are_undefined() {
+    use x86_oracle::FaultKind;
+    for op in 0x88..=0x8Bu8 {
+        let mut cpu = BochsOracle::new();
+        cpu.set_rip(CODE);
+        cpu.write_mem(CODE, &[0x8F, 0xE9, xop_byte2(0, 0), op, 0xC2]);
+        let out = cpu.step();
+        assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "XOP9 {op:#04x}: {out:?}");
     }
 }

@@ -105,64 +105,64 @@ static const Bit64u BxOpcodeGroup_XOP_0x9_81[] = { last_opcode(ATTR_VEX_W0, BX_I
 static const Bit64u BxOpcodeGroup_XOP_0x9_82[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VFRCZSS_VssWss) };
 static const Bit64u BxOpcodeGroup_XOP_0x9_83[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VFRCZSD_VsdWsd) };
 
-static const Bit64u BxOpcodeGroup_XOP_0x9_88[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqWdqHdq)
+static const Bit64u BxOpcodeGroup_XOP_0x9_98[] = {
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAB_VdqWdqHdq)
 };
 
-static const Bit64u BxOpcodeGroup_XOP_0x9_89[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqWdqHdq)
+static const Bit64u BxOpcodeGroup_XOP_0x9_99[] = {
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAW_VdqWdqHdq)
 };
 
-static const Bit64u BxOpcodeGroup_XOP_0x9_8A[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqWdqHdq)
+static const Bit64u BxOpcodeGroup_XOP_0x9_9A[] = {
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAD_VdqWdqHdq)
 };
 
-static const Bit64u BxOpcodeGroup_XOP_0x9_8B[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqWdqHdq)
+static const Bit64u BxOpcodeGroup_XOP_0x9_9B[] = {
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHAQ_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_90[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTB_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTB_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTB_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTB_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_91[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTW_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTW_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTW_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTW_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_92[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTD_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTD_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTD_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTD_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_93[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPROTQ_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_94[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLB_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_95[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLW_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_96[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLD_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_97[] = {
-  form_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqHdqWdq),
-  last_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqWdqHdq)
+  form_opcode(ATTR_VEX_W1 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqHdqWdq),
+  last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPSHLQ_VdqWdqHdq)
 };
 
 static const Bit64u BxOpcodeGroup_XOP_0x9_C1[] = { last_opcode(ATTR_VEX_W0 | ATTR_VEX_L0, BX_IA_VPHADDBW_VdqWdq) };
@@ -585,10 +585,10 @@ const Bit64u *BxOpcodeTableXOP[256*3] = {
   /* 85  */ BxOpcodeGroup_ERR,
   /* 86  */ BxOpcodeGroup_ERR,
   /* 87  */ BxOpcodeGroup_ERR,
-  /* 88  */ BxOpcodeGroup_XOP_0x9_88,
-  /* 89  */ BxOpcodeGroup_XOP_0x9_89,
-  /* 8A  */ BxOpcodeGroup_XOP_0x9_8A,
-  /* 8B  */ BxOpcodeGroup_XOP_0x9_8B,
+  /* 88  */ BxOpcodeGroup_ERR,
+  /* 89  */ BxOpcodeGroup_ERR,
+  /* 8A  */ BxOpcodeGroup_ERR,
+  /* 8B  */ BxOpcodeGroup_ERR,
   /* 8C  */ BxOpcodeGroup_ERR,
   /* 8D  */ BxOpcodeGroup_ERR,
   /* 8E  */ BxOpcodeGroup_ERR,
@@ -601,10 +601,10 @@ const Bit64u *BxOpcodeTableXOP[256*3] = {
   /* 95  */ BxOpcodeGroup_XOP_0x9_95,
   /* 96  */ BxOpcodeGroup_XOP_0x9_96,
   /* 97  */ BxOpcodeGroup_XOP_0x9_97,
-  /* 98  */ BxOpcodeGroup_ERR,
-  /* 99  */ BxOpcodeGroup_ERR,
-  /* 9A  */ BxOpcodeGroup_ERR,
-  /* 9B  */ BxOpcodeGroup_ERR,
+  /* 98  */ BxOpcodeGroup_XOP_0x9_98,
+  /* 99  */ BxOpcodeGroup_XOP_0x9_99,
+  /* 9A  */ BxOpcodeGroup_XOP_0x9_9A,
+  /* 9B  */ BxOpcodeGroup_XOP_0x9_9B,
   /* 9C  */ BxOpcodeGroup_ERR,
   /* 9D  */ BxOpcodeGroup_ERR,
   /* 9E  */ BxOpcodeGroup_ERR,
