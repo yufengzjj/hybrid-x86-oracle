@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4w are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4x are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -2001,5 +2001,71 @@ fn xop9_88_to_8b_are_undefined() {
         cpu.write_mem(CODE, &[0x8F, 0xE9, xop_byte2(0, 0), op, 0xC2]);
         let out = cpu.step();
         assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "XOP9 {op:#04x}: {out:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4x: VEX map 5 has no immediate.
+//
+// `decoder_vex64` decides "has an immediate" from the flattened table index;
+// upstream's unbounded `>= 0x200` (meant for map 3's imm8 and map 7's
+// imm32) also caught map 5 at 0x300.., so every AMX-FP8 dot product consumed
+// one byte too many: RIP advanced by 6 for a 5-byte instruction and the next
+// instruction was decoded from its second byte.
+// `patches/bochs/0014-vex-map5-no-immediate.patch` is what makes these pass.
+
+/// `(mnemonic, VEX byte 2)` for the four map 5 forms: `C4 E5 <byte2> FD C1`
+/// is `op tmm0, tmm1, tmm2` with W0, vvvv = tmm2 and the pp that names the
+/// form (NP/66/F3/F2 = bf8·bf8, hf8·hf8, hf8·bf8, bf8·hf8).
+const MAP5_FORMS: &[(&str, u8)] = &[
+    ("tdpbf8ps", 0x68),
+    ("tdphf8ps", 0x69),
+    ("tdphbf8ps", 0x6A),
+    ("tdpbhf8ps", 0x6B),
+];
+
+/// §4x proper: each map 5 dot product is five bytes long, and the
+/// `tilerelease` that follows it runs as `tilerelease` — upstream's decoder
+/// swallowed its `C4` and ran `E2 78` = `loop`, which decremented RCX and
+/// jumped. The third step proves the release happened: with the tiles gone
+/// the dot product itself is #UD.
+#[test]
+fn map5_instructions_carry_no_immediate() {
+    use x86_oracle::FaultKind;
+    for (name, byte2) in MAP5_FORMS {
+        let mut cpu = BochsOracle::new();
+        cpu.write_mem(CFG_IN, &tilecfg(&[(16, 64), (16, 64), (16, 64)]));
+        cpu.set_gpr(RBX, CFG_IN);
+        retires(&mut cpu, "ldtilecfg [rbx]", &LDTILECFG_RBX);
+        let tdp = [0xC4, 0xE5, *byte2, 0xFD, 0xC1];
+        let code = [tdp.as_slice(), &TILERELEASE, &tdp].concat();
+        cpu.set_rip(CODE);
+        cpu.write_mem(CODE, &code);
+        cpu.set_gpr(RCX, 7);
+        let out = cpu.step();
+        assert!(out.is_retired(), "{name}: {out:?} ({})", cpu.fault_msg());
+        assert_eq!(cpu.get_rip(), CODE + 5, "{name} tmm0, tmm1, tmm2 is five bytes long");
+        let out = cpu.step();
+        assert!(out.is_retired(), "{name}; tilerelease: {out:?} ({})", cpu.fault_msg());
+        assert_eq!(cpu.get_rip(), CODE + 10, "after {name}; tilerelease");
+        assert_eq!(cpu.get_gpr(RCX), 7, "after {name}: the tilerelease ran as `loop`");
+        let out = cpu.step();
+        assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "{name} after tilerelease: {out:?}");
+    }
+}
+
+/// The control: the rule still fetches map 3's imm8 (`vpalignr` is six bytes)
+/// and nothing for map 2 (`vpshufb` is five) — the two neighbours of the
+/// range that was bounded.
+#[test]
+fn vex_map2_and_map3_lengths_are_unchanged() {
+    const CASES: &[(&str, &[u8])] = &[
+        ("vpshufb xmm0, xmm1, xmm2", &[0xC4, 0xE2, 0x71, 0x00, 0xC2]),
+        ("vpalignr xmm0, xmm1, xmm2, 1", &[0xC4, 0xE3, 0x71, 0x0F, 0xC2, 0x01]),
+    ];
+    for (name, code) in CASES {
+        let mut cpu = BochsOracle::new();
+        run(&mut cpu, code, 1);
+        assert_eq!(cpu.get_rip(), CODE + code.len() as u64, "{name}");
     }
 }

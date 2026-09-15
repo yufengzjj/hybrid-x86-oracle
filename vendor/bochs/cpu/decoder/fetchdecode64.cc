@@ -863,7 +863,10 @@ int decoder_vex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsig
 
   ia_opcode = findOpcode(BxOpcodeTableVEX[opcode_byte], decmask);
 
-  bool has_immediate = (opcode_byte >= 0x70 && opcode_byte <= 0x73) || (opcode_byte >= 0xC2 && opcode_byte <= 0xC6) || (opcode_byte >= 0x200);
+  // Only map 1's 0F 70-73 / C2-C6 groups, every map 3 (0F 3A) opcode and map 7's imm32 forms
+  // carry an immediate. Map 5 (AMX-FP8, AMX-TRANSPOSE's T2RPNTLVWZ*RS) sits at 0x300.. in the
+  // table and has none — an unbounded ">= 0x200" fetched one byte too many there.
+  bool has_immediate = (opcode_byte >= 0x70 && opcode_byte <= 0x73) || (opcode_byte >= 0xC2 && opcode_byte <= 0xC6) || (opcode_byte >= 0x200 && opcode_byte < 0x300) || (vex_opc_map == 7);
   if (has_immediate) {
     if (vex_opc_map == 7) {
       if (remain > 3) {

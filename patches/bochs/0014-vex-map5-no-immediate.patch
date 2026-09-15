@@ -1,0 +1,41 @@
+VEX map 5 (AMX-FP8 / AMX-TRANSPOSE) instructions decoded one byte too long
+
+decoder_vex64's immediate rule is written against the flattened opcode table
+index: map 1 occupies 0x000-0x0FF, map 2 0x100-0x1FF, map 3 0x200-0x2FF and,
+with BX_SUPPORT_AMX, map 5 0x300-0x3FF and map 7 0x400-0x4FF. The test
+
+  has_immediate = (0x70..0x73) || (0xC2..0xC6) || (opcode_byte >= 0x200)
+
+was meant as "map 3 always has an imm8, map 7 an imm32", but it also catches
+every map 5 opcode, none of which carries an immediate (TDPBF8PS / TDPHF8PS /
+TDPBHF8PS / TDPHBF8PS at FD, T2RPNTLVWZ0RS/1RS and their T1 twins at F8/F9).
+The decoder therefore consumed one extra byte and advanced RIP by 6 for a
+5-byte instruction: the AMX-FP8 dot product itself executed correctly, and
+the byte after it was silently swallowed — in a straight-line sequence the
+NEXT instruction was then decoded from its second byte (a following
+`tilerelease` C4 E2 78 49 C0 turned into `loop` E2 78).
+
+decoder_evex64 (and the 32-bit VEX decoder, which rejects maps >= 4) already
+bound the range with `< 0x300`; the 64-bit VEX rule now does the same and
+names map 7 explicitly for its imm32.
+
+Fixed in decoder/fetchdecode64.cc. Found 2026-09-14 by diffing an independent
+model of AMX-FP8: the RCX decrement of the phantom `loop` showed up in the
+register diff while the tile result matched.
+
+diff --git a/cpu/decoder/fetchdecode64.cc b/cpu/decoder/fetchdecode64.cc
+index 9cf70ed..d65c1aa 100644
+--- a/cpu/decoder/fetchdecode64.cc
++++ b/cpu/decoder/fetchdecode64.cc
+@@ -863,7 +863,10 @@ int decoder_vex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsig
+ 
+   ia_opcode = findOpcode(BxOpcodeTableVEX[opcode_byte], decmask);
+ 
+-  bool has_immediate = (opcode_byte >= 0x70 && opcode_byte <= 0x73) || (opcode_byte >= 0xC2 && opcode_byte <= 0xC6) || (opcode_byte >= 0x200);
++  // Only map 1's 0F 70-73 / C2-C6 groups, every map 3 (0F 3A) opcode and map 7's imm32 forms
++  // carry an immediate. Map 5 (AMX-FP8, AMX-TRANSPOSE's T2RPNTLVWZ*RS) sits at 0x300.. in the
++  // table and has none — an unbounded ">= 0x200" fetched one byte too many there.
++  bool has_immediate = (opcode_byte >= 0x70 && opcode_byte <= 0x73) || (opcode_byte >= 0xC2 && opcode_byte <= 0xC6) || (opcode_byte >= 0x200 && opcode_byte < 0x300) || (vex_opc_map == 7);
+   if (has_immediate) {
+     if (vex_opc_map == 7) {
+       if (remain > 3) {

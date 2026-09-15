@@ -876,6 +876,30 @@ both W layouts with a register and a memory rm — the VPSHA cases at 98-9B.
 Still present on upstream master as of 2026-09-14. No XOP silicon was
 available.
 
+## 4x. VEX map 5 (AMX-FP8) instructions decoded one byte too long — patched (Bochs)
+
+Found 2026-09-14 by diffing an independent model of AMX-FP8 (`tdpbf8ps`,
+`tdphf8ps`, `tdpbhf8ps`, `tdphbf8ps`): the tile result matched, but RCX came
+back decremented. `decoder_vex64`'s immediate rule tests the flattened table
+index with an unbounded `opcode_byte >= 0x200` — meant for map 3's universal
+imm8 and map 7's imm32 — which also catches map 5 (0x300..0x3FF once
+`BX_SUPPORT_AMX` puts it in the table). No map 5 opcode has an immediate, so
+every AMX-FP8 / `t2rpntlvwz*rs` instruction consumed one byte too many: RIP
+advanced by 6 for a 5-byte instruction and the following instruction was
+decoded from its second byte (a `tilerelease` after the dot product ran as
+`loop`, which is where the RCX came from). The EVEX decoder and the 32-bit
+VEX decoder already bound the range with `< 0x300`.
+
+Fixed by
+[`patches/bochs/0014-vex-map5-no-immediate.patch`](../patches/bochs/0014-vex-map5-no-immediate.patch)
+(`decoder/fetchdecode64.cc`: the range bounded, map 7 named explicitly),
+applied by `scripts/vendor-bochs.sh` like its siblings; `tests/bochs_patches.rs`
+pins all four map 5 forms at five bytes, each followed by a `tilerelease`
+whose second byte is `loop`: the post-step RIP, an untouched RCX, and a #UD
+on the dot product once the tiles are released, with `vpshufb`/`vpalignr`
+as the map 2 / map 3 length controls. Still present on upstream master as
+of 2026-09-14. No AMX-FP8 silicon was available.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was
