@@ -900,6 +900,67 @@ on the dot product once the tiles are released, with `vpshufb`/`vpalignr`
 as the map 2 / map 3 length controls. Still present on upstream master as
 of 2026-09-14. No AMX-FP8 silicon was available.
 
+## 4y. AMX-AVX512: `TCVTROWPS2PHH` / `TCVTROWPS2BF16H` imm8 forms #UD, `TCVTROWPS2PHL` imm8 ran the BF16H handler — patched (Bochs)
+
+Found 2026-09-26 when `tcvtrowps2phh zmm, tmm, imm8` raised #UD. Upstream
+put all four `tcvtrowps2*` imm8 forms in the 0F3A 77 group, copying the
+prefix layout of their 0F38 6D register forms (NP/66/F3/F2 =
+PHH/PHL/BF16L/BF16H). The real imm8 encodings (checked against binutils
+2.45) are split across two opcodes:
+
+| imm8 form | Encoding | Upstream |
+|---|---|---|
+| `tilemovrow` | EVEX.512.66.0F3A.W0 07 | right |
+| `tcvtrowd2ps` | EVEX.512.F3.0F3A.W0 07 | right |
+| `tcvtrowps2phh` | EVEX.512.NP.0F3A.W0 07 | at NP.77 — #UD |
+| `tcvtrowps2bf16h` | EVEX.512.F2.0F3A.W0 07 | at F2.77 — #UD |
+| `tcvtrowps2phl` | EVEX.512.F2.0F3A.W0 77 | at 66.77 — F2.77 ran BF16H: bf16 in the high halves instead of fp16 in the low halves |
+| `tcvtrowps2bf16l` | EVEX.512.F3.0F3A.W0 77 | right |
+
+NP.77 and 66.77, which no instruction uses, also decoded. The register
+forms were right.
+
+Fixed by
+[`patches/bochs/0015-amx-avx512-imm8-opcode-map.patch`](../patches/bochs/0015-amx-avx512-imm8-opcode-map.patch)
+(`decoder/fetchdecode_opmap_evex.cc`: PHH and BF16H moved to the 07 group, 77
+left with PHL and BF16L), applied by `scripts/vendor-bochs.sh` like its
+siblings; `tests/bochs_patches.rs` runs all six row instructions in both the
+imm8 and the register form against a tile whose row 3 is the only one not
+-1.0, checks each result dword, and pins the other ten 0F3A 07 / 77 slots
+(NP/66 at 77, every W1) at #UD. Only these six AMX instructions take an
+immediate in this Bochs revision. Still present on upstream master as of
+2026-09-26 (`22f494f`). No AMX-AVX512 silicon was available.
+
+## 4z. `TILELOADD*` / `TILESTORED`: no-SIB forms executed, and a SIB byte with no index used RSP as the stride — patched (Bochs)
+
+Found 2026-09-26 by diffing the Bochs decoder against binutils 2.45 over the
+whole VEX/EVEX encoding space (every other AMX encoding agreed). The SDM
+requires SIB addressing for `tileloadd`, `tileloaddt1`, `tileloaddrs`,
+`tileloaddrst1` and `tilestored`, and a SIB byte with no index register
+means stride 0. Upstream's handlers tested `sibIndex() == BX_NIL_REGISTER`
+for "no SIB byte", but the 64-bit decoder records both a missing SIB byte and
+a SIB index field of 100b as index 4 — RSP's number (`BX_NIL_REGISTER` is
+19). So the check never fired and both cases read RSP as the stride:
+
+| Form | SDM | Upstream |
+|---|---|---|
+| `tileloadd tmm0, [rdi]`, `[rip+disp32]` (no SIB) | #UD | executed, stride = RSP |
+| `tileloadd tmm0, [rdi+riz]` | stride 0 | stride = RSP |
+| `tilestored [rcx], tmm0` (no SIB) | #UD | executed, stride = RSP |
+| `tilestored [rcx+riz], tmm0` | stride 0 | stride = RSP |
+
+Fixed by
+[`patches/bochs/0016-amx-tile-load-store-sib.patch`](../patches/bochs/0016-amx-tile-load-store-sib.patch):
+past the decoder the two cases cannot be told apart, so `decoder_vex64`
+(`decoder/fetchdecode64.cc`) now decodes a memory form of these five opcodes
+without a SIB byte as #UD, and the handlers (`avx/amx.cc`) drop the dead
+check and use stride 0 for index 4. `tests/bochs_patches.rs` pins all five
+forms at #UD for `[rdi]`, `[rdi+0]` and `[rip+0]`, and stride 0 for
+`[rdi+riz]` loads and a `[rcx+riz]` store, with RSP = 128 so the old stride
+reads differently; `[reg+r12]` (the same SIB index field, VEX.X set) is the
+control. Still present on upstream master as of 2026-09-26 (`22f494f`). No
+AMX silicon was available.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

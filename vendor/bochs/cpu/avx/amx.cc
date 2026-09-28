@@ -96,11 +96,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::STTILECFG(bxInstruction_c *i)
 
 void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
 {
-  if (i->sibIndex() == BX_NIL_REGISTER) {
-    BX_ERROR(("%s: SIB byte required", i->getIaOpcodeNameShort()));
-    exception(BX_UD_EXCEPTION, 0);
-  }
-
+  // The required SIB byte is enforced by decoder_vex64: here, a missing SIB byte and
+  // a SIB byte with no index both read as sibIndex() == 4, so the check cannot live here.
   unsigned tile = i->dst();
 
   check_tile(i, tile);
@@ -122,7 +119,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
   BX_CPU_THIS_PTR amx->tile[tile].clear_upper_rows(BX_CPU_THIS_PTR amx->start_row);
 
   Bit64u start_eaddr = BX_READ_64BIT_REG(i->sibBase()) + (Bit64s) i->displ32s();
-  Bit64u stride = BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
+  // SIB index 100b with VEX.X clear means "no index": the stride is 0, not RSP.
+  Bit64u stride = (i->sibIndex() == 4) ? 0 : BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
   i->setVL(BX_VL512);
 
   for (unsigned row=BX_CPU_THIS_PTR amx->start_row; row < rows; row++) {
@@ -146,11 +144,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
 
 void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILESTORED_MdqTnnn(bxInstruction_c *i)
 {
-  if (i->sibIndex() == BX_NIL_REGISTER) {
-    BX_ERROR(("%s: SIB byte required", i->getIaOpcodeNameShort()));
-    exception(BX_UD_EXCEPTION, 0);
-  }
-
+  // SIB byte required: enforced by decoder_vex64, see TILELOADD_TnnnMdq.
   unsigned tile = i->src();
 
   check_tile(i, tile);
@@ -167,7 +161,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILESTORED_MdqTnnn(bxInstruction_c *i)
   i->setVL(BX_VL512);
 
   Bit64u start_eaddr = BX_READ_64BIT_REG(i->sibBase()) + (Bit64s) i->displ32s();
-  Bit64u stride = BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
+  // SIB index 100b with VEX.X clear means "no index": the stride is 0, not RSP.
+  Bit64u stride = (i->sibIndex() == 4) ? 0 : BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
 
   for (unsigned row=BX_CPU_THIS_PTR amx->start_row; row < rows; row++) {
     BxPackedAvxRegister *data = &(BX_CPU_THIS_PTR amx->tile[tile].row[row]);

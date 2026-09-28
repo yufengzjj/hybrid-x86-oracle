@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4x are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4z are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -11,7 +11,7 @@
 
 use x86_oracle::{
     BochsOracle, X86Oracle, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, ZMM_CHUNKS, RAX, RBX,
-    RCX, RDI, RDX, RSI,
+    RCX, RDI, RDX, RSI, RSP, R12,
 };
 
 const CODE: u64 = 0x10_0000;
@@ -2068,4 +2068,190 @@ fn vex_map2_and_map3_lengths_are_unchanged() {
         run(&mut cpu, code, 1);
         assert_eq!(cpu.get_rip(), CODE + code.len() as u64, "{name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// §4y: the AMX-AVX512 imm8 forms sit at 0F3A 07 and 0F3A 77.
+//
+// Upstream copied the 0F38 6D register forms' prefix layout (NP/66/F3/F2 =
+// PHH/PHL/BF16L/BF16H) onto 0F3A 77, but the imm8 forms are split: PHH (NP)
+// and BF16H (F2) live at 07 beside TILEMOVROW and TCVTROWD2PS, and 77 holds
+// only PHL (F2) and BF16L (F3). So PHH and BF16H imm8 raised #UD, PHL imm8
+// ran the BF16H handler, and NP/66.0F3A 77 decoded.
+// `patches/bochs/0015-amx-avx512-imm8-opcode-map.patch` is what makes these pass.
+
+/// `(mnemonic, (register-form opcode, pp), (imm8-form opcode, pp), row 3
+/// dword after conversion)`, pp as NP/66/F3/F2 = 0-3. Encodings as binutils
+/// 2.45 assembles them; note PHL is the one whose prefix changes between the
+/// two forms. Row 3 of tmm1 holds 4.1f (0x40833333) and every other row
+/// -1.0f, so each handler — and a wrong row — gives a different dword.
+const AMX_AVX512_ROW_FORMS: &[(&str, (u8, u8), (u8, u8), u32)] = &[
+    ("tilemovrow", (0x4A, 1), (0x07, 1), 0x4083_3333),
+    ("tcvtrowd2ps", (0x4A, 2), (0x07, 2), 0x4E81_0666),
+    ("tcvtrowps2phh", (0x6D, 0), (0x07, 0), 0x441A_0000),
+    ("tcvtrowps2phl", (0x6D, 1), (0x77, 3), 0x0000_441A),
+    ("tcvtrowps2bf16h", (0x6D, 3), (0x07, 3), 0x4083_0000),
+    ("tcvtrowps2bf16l", (0x6D, 2), (0x77, 2), 0x0000_4083),
+];
+
+/// Load tmm1 (16 rows × 64 bytes) with 4.1f in row 3 and -1.0f elsewhere.
+fn amx_avx512_row_setup() -> BochsOracle {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(16, 64), (16, 64)]));
+    let tile: Vec<u8> = (0..16)
+        .flat_map(|row| {
+            let v: u32 = if row == 3 { 0x4083_3333 } else { 0xBF80_0000 };
+            std::iter::repeat(v.to_le_bytes()).take(16).flatten()
+        })
+        .collect();
+    cpu.write_mem(TILE_A, &tile);
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RSI, 64);
+    run(&mut cpu, &[LDTILECFG_RBX.as_slice(), &TILELOADD_TMM1_RDI_RSI].concat(), 2);
+    cpu
+}
+
+/// §4y proper: `op zmm2, tmm1, 3` and `op zmm2, tmm1, ecx` (ecx = 3) both
+/// retire and give row 3 converted by the right handler. The register forms
+/// were right all along; they are the control.
+#[test]
+fn amx_avx512_imm8_forms_decode_to_their_own_handlers() {
+    for (name, (reg_op, reg_pp), (imm_op, imm_pp), want) in AMX_AVX512_ROW_FORMS {
+        let mut cpu = amx_avx512_row_setup();
+        cpu.set_gpr(RCX, 3);
+        // P1 = W0 · vvvv (1111 unused, or ~ecx = 1110) · 1 · pp; ModRM D1 = zmm2, tmm1.
+        let forms = [
+            ("imm8", vec![0x62, 0xF3, 0x7C | imm_pp, 0x48, *imm_op, 0xD1, 0x03]),
+            ("ecx", vec![0x62, 0xF2, 0x74 | reg_pp, 0x48, *reg_op, 0xD1]),
+        ];
+        for (form, code) in forms {
+            cpu.set_zmm(2, &[STALE; ZMM_CHUNKS]);
+            run(&mut cpu, &code, 1);
+            let want = [*want as u64 | (*want as u64) << 32; ZMM_CHUNKS];
+            assert_eq!(cpu.get_zmm(2), want, "{name} zmm2, tmm1, {form}");
+        }
+    }
+}
+
+/// The other half: every 0F3A 07 / 77 slot that no instruction uses is #UD —
+/// the two upstream filled at 77 (NP and 66, W0) and all eight W1 slots.
+/// binutils 2.45 decodes exactly the six W0 slots in `AMX_AVX512_ROW_FORMS`.
+#[test]
+fn amx_avx512_unused_0f3a07_0f3a77_slots_raise_ud() {
+    use x86_oracle::FaultKind;
+    let mut cpu = amx_avx512_row_setup();
+    for op in [0x07u8, 0x77] {
+        for w in [0u8, 1] {
+            for pp in 0..4u8 {
+                if w == 0 && AMX_AVX512_ROW_FORMS.iter().any(|&(_, _, imm, _)| imm == (op, pp)) {
+                    continue;
+                }
+                cpu.set_rip(CODE);
+                cpu.write_mem(CODE, &[0x62, 0xF3, w << 7 | 0x7C | pp, 0x48, op, 0xD1, 0x03]);
+                let out = cpu.step();
+                assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "EVEX.512.pp{pp}.0F3A.W{w} {op:02X}: {out:?}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4z: TILELOADD* / TILESTORED and their SIB byte.
+//
+// The SDM requires SIB addressing, and a SIB byte with no index register means
+// stride 0. Upstream tested `sibIndex() == BX_NIL_REGISTER` for "no SIB byte",
+// but the decoder records both a missing SIB byte and a SIB byte with no index
+// as index 4 — RSP's number — so the check never fired and both used RSP as
+// the stride. `patches/bochs/0016-amx-tile-load-store-sib.patch` is what makes
+// these pass.
+
+/// `(mnemonic, VEX byte 2, opcode, is a store)`: W0, vvvv unused, pp naming
+/// the form. Encodings as binutils 2.45 assembles them.
+const TILE_MEM_FORMS: &[(&str, u8, u8, bool)] = &[
+    ("tileloadd", 0x7B, 0x4B, false),
+    ("tileloaddt1", 0x79, 0x4B, false),
+    ("tileloaddrs", 0x7B, 0x4A, false),
+    ("tileloaddrst1", 0x79, 0x4A, false),
+    ("tilestored", 0x7A, 0x4B, true),
+];
+
+/// tmm0 configured as 4 rows × 64 bytes; `TILE_A` holds bytes 0..=255, so
+/// row r of a stride-64 load starts with byte 64·r. RSP = 128 is what
+/// upstream used as the stride, so a stride of 0 and of RSP read differently.
+fn tile_sib_setup() -> BochsOracle {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(4, 64)]));
+    cpu.write_mem(TILE_A, &(0..=255u8).collect::<Vec<_>>());
+    cpu.write_mem(TILE_OUT, &[0xEE; 256]);
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RCX, TILE_OUT);
+    cpu.set_gpr(RSI, 64);
+    cpu.set_gpr(RSP, 128);
+    run(&mut cpu, &LDTILECFG_RBX, 1);
+    cpu
+}
+
+fn read_rows(cpu: &BochsOracle, addr: u64) -> Vec<Vec<u8>> {
+    let mut buf = [0u8; 256];
+    cpu.read_mem(addr, &mut buf);
+    buf.chunks(64).map(<[u8]>::to_vec).collect()
+}
+
+/// Without a SIB byte — `[rdi]`, `[rdi+0]`, `[rip+0]` — every form is #UD.
+#[test]
+fn tile_load_store_without_sib_raise_ud() {
+    use x86_oracle::FaultKind;
+    let mut cpu = tile_sib_setup();
+    for (name, byte2, op, _) in TILE_MEM_FORMS {
+        for (operand, modrm) in [("[rdi]", &[0x07][..]), ("[rdi+0]", &[0x47, 0x00]), ("[rip+0]", &[0x05, 0, 0, 0, 0])] {
+            cpu.set_rip(CODE);
+            cpu.write_mem(CODE, &[&[0xC4, 0xE2, *byte2, *op][..], modrm].concat());
+            let out = cpu.step();
+            assert_eq!(out.fault_kind(), Some(FaultKind::UndefinedOpcode), "{name} {operand}: {out:?}");
+        }
+    }
+}
+
+/// `[rdi+riz]` loads with stride 0: every row is the first 64 bytes. The
+/// control is `[rdi+r12]`: the same SIB index field 100b, but VEX.X set, so
+/// the index is r12 (= 64) and the rows are consecutive.
+#[test]
+fn tile_loads_with_no_sib_index_use_stride_0() {
+    const TILESTORED_RCX_RSI: [u8; 6] = [0xC4, 0xE2, 0x7A, 0x4B, 0x04, 0x31];
+    let consecutive: Vec<Vec<u8>> = (0..=255u8).collect::<Vec<_>>().chunks(64).map(<[u8]>::to_vec).collect();
+    for (name, byte2, op, is_store) in TILE_MEM_FORMS {
+        if *is_store {
+            continue;
+        }
+        let mut cpu = tile_sib_setup();
+        run(&mut cpu, &[&[0xC4, 0xE2, *byte2, *op, 0x04, 0x27][..], &TILESTORED_RCX_RSI].concat(), 2);
+        assert_eq!(read_rows(&cpu, TILE_OUT), vec![consecutive[0].clone(); 4], "{name} tmm0, [rdi+riz]");
+        drop(cpu);
+
+        let mut cpu = tile_sib_setup();
+        cpu.set_gpr(R12, 64);
+        run(&mut cpu, &[&[0xC4, 0xA2, *byte2, *op, 0x04, 0x27][..], &TILESTORED_RCX_RSI].concat(), 2);
+        assert_eq!(read_rows(&cpu, TILE_OUT), consecutive, "{name} tmm0, [rdi+r12]");
+    }
+}
+
+/// `tilestored [rcx+riz]` stores with stride 0: all four rows land on the
+/// first 64 bytes, the last one written (row 3) wins, and nothing past them
+/// is touched. Control: `[rcx+r12]` with r12 = 64 lays the rows out in order.
+#[test]
+fn tile_store_with_no_sib_index_uses_stride_0() {
+    let consecutive: Vec<Vec<u8>> = (0..=255u8).collect::<Vec<_>>().chunks(64).map(<[u8]>::to_vec).collect();
+    let mut cpu = tile_sib_setup();
+    run(&mut cpu, &[&TILELOADD_TMM0_RDI_RSI[..], &[0xC4, 0xE2, 0x7A, 0x4B, 0x04, 0x21]].concat(), 2);
+    let untouched = vec![0xEE; 64];
+    let want = vec![consecutive[3].clone(), untouched.clone(), untouched.clone(), untouched];
+    assert_eq!(read_rows(&cpu, TILE_OUT), want, "tilestored [rcx+riz], tmm0");
+    drop(cpu);
+
+    let mut cpu = tile_sib_setup();
+    cpu.set_gpr(R12, 64);
+    run(&mut cpu, &[&TILELOADD_TMM0_RDI_RSI[..], &[0xC4, 0xA2, 0x7A, 0x4B, 0x04, 0x21]].concat(), 2);
+    assert_eq!(read_rows(&cpu, TILE_OUT), consecutive, "tilestored [rcx+r12], tmm0");
 }

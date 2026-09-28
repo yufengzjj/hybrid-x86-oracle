@@ -1,0 +1,106 @@
+TILELOADD* / TILESTORED: no-SIB forms executed, and a SIB byte with no index used RSP as the stride
+
+The SDM requires SIB addressing for TILELOADD, TILELOADDT1, TILELOADDRS,
+TILELOADDRST1 and TILESTORED, and says "if no index register in the SIB
+encoding, the value zero is used" for the stride. The handlers tried to
+raise #UD with
+
+  if (i->sibIndex() == BX_NIL_REGISTER)
+
+but the 64-bit decoder records both a missing SIB byte and a SIB byte whose
+index field is 100b (without VEX.X) as index 4, which is RSP's number;
+BX_NIL_REGISTER is 19. So the check never fired, and in both cases
+
+  stride = BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale()
+
+read RSP: `tileloadd tmm0, [rdi]` and `[rip+disp32]` executed instead of
+raising #UD, and `tileloadd tmm0, [rdi+riz]` loaded rows RSP bytes apart
+instead of repeating the first one (the same for tilestored).
+
+Past the decoder the two cases cannot be told apart, so the SIB check moves
+to decoder_vex64: a memory form of these five opcodes with ModRM.rm != 100b
+decodes as BX_IA_ERROR (#UD). The handlers drop the dead check and use a
+stride of 0 when the index is 4; index 12 (r12, VEX.X set) is unaffected.
+
+Fixed in decoder/fetchdecode64.cc and avx/amx.cc. Found 2026-09-26 by
+diffing the Bochs decoder against binutils 2.45 over the VEX/EVEX encoding
+space: binutils marked the no-SIB forms (bad), Bochs decoded them.
+
+diff --git a/cpu/avx/amx.cc b/cpu/avx/amx.cc
+index 66896c7..9e961b8 100644
+--- a/cpu/avx/amx.cc
++++ b/cpu/avx/amx.cc
+@@ -96,11 +96,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::STTILECFG(bxInstruction_c *i)
+ 
+ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
+ {
+-  if (i->sibIndex() == BX_NIL_REGISTER) {
+-    BX_ERROR(("%s: SIB byte required", i->getIaOpcodeNameShort()));
+-    exception(BX_UD_EXCEPTION, 0);
+-  }
+-
++  // The required SIB byte is enforced by decoder_vex64: here, a missing SIB byte and
++  // a SIB byte with no index both read as sibIndex() == 4, so the check cannot live here.
+   unsigned tile = i->dst();
+ 
+   check_tile(i, tile);
+@@ -122,7 +119,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
+   BX_CPU_THIS_PTR amx->tile[tile].clear_upper_rows(BX_CPU_THIS_PTR amx->start_row);
+ 
+   Bit64u start_eaddr = BX_READ_64BIT_REG(i->sibBase()) + (Bit64s) i->displ32s();
+-  Bit64u stride = BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
++  // SIB index 100b with VEX.X clear means "no index": the stride is 0, not RSP.
++  Bit64u stride = (i->sibIndex() == 4) ? 0 : BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
+   i->setVL(BX_VL512);
+ 
+   for (unsigned row=BX_CPU_THIS_PTR amx->start_row; row < rows; row++) {
+@@ -146,11 +144,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILELOADD_TnnnMdq(bxInstruction_c *i)
+ 
+ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILESTORED_MdqTnnn(bxInstruction_c *i)
+ {
+-  if (i->sibIndex() == BX_NIL_REGISTER) {
+-    BX_ERROR(("%s: SIB byte required", i->getIaOpcodeNameShort()));
+-    exception(BX_UD_EXCEPTION, 0);
+-  }
+-
++  // SIB byte required: enforced by decoder_vex64, see TILELOADD_TnnnMdq.
+   unsigned tile = i->src();
+ 
+   check_tile(i, tile);
+@@ -167,7 +161,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TILESTORED_MdqTnnn(bxInstruction_c *i)
+   i->setVL(BX_VL512);
+ 
+   Bit64u start_eaddr = BX_READ_64BIT_REG(i->sibBase()) + (Bit64s) i->displ32s();
+-  Bit64u stride = BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
++  // SIB index 100b with VEX.X clear means "no index": the stride is 0, not RSP.
++  Bit64u stride = (i->sibIndex() == 4) ? 0 : BX_READ_64BIT_REG(i->sibIndex()) << i->sibScale();
+ 
+   for (unsigned row=BX_CPU_THIS_PTR amx->start_row; row < rows; row++) {
+     BxPackedAvxRegister *data = &(BX_CPU_THIS_PTR amx->tile[tile].row[row]);
+diff --git a/cpu/decoder/fetchdecode64.cc b/cpu/decoder/fetchdecode64.cc
+index d65c1aa..2d50cc7 100644
+--- a/cpu/decoder/fetchdecode64.cc
++++ b/cpu/decoder/fetchdecode64.cc
+@@ -863,6 +863,22 @@ int decoder_vex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsig
+ 
+   ia_opcode = findOpcode(BxOpcodeTableVEX[opcode_byte], decmask);
+ 
++#if BX_SUPPORT_AMX
++  // TILELOADD* / TILESTORED require a SIB byte. This has to be checked here: past the
++  // decoder, a missing SIB byte and a SIB byte with no index both read as sibIndex() == 4.
++  if (! i->modC0() && (rm & 0x7) != 4) {
++    switch (ia_opcode) {
++      case BX_IA_TILELOADD_TnnnMdq:
++      case BX_IA_TILELOADDT1_TnnnMdq:
++      case BX_IA_TILELOADDRS_TnnnMdq:
++      case BX_IA_TILELOADDRST1_TnnnMdq:
++      case BX_IA_TILESTORED_MdqTnnn:
++        ia_opcode = BX_IA_ERROR;
++        break;
++    }
++  }
++#endif
++
+   // Only map 1's 0F 70-73 / C2-C6 groups, every map 3 (0F 3A) opcode and map 7's imm32 forms
+   // carry an immediate. Map 5 (AMX-FP8, AMX-TRANSPOSE's T2RPNTLVWZ*RS) sits at 0x300.. in the
+   // table and has none — an unbounded ">= 0x200" fetched one byte too many there.

@@ -1,0 +1,56 @@
+AMX-AVX512: TCVTROWPS2PHH / TCVTROWPS2BF16H imm8 forms #UD, TCVTROWPS2PHL imm8 ran the BF16H handler
+
+The imm8 forms of the four TCVTROWPS2* conversions were all put in the
+0F3A 77 group with the prefix layout of their 0F38 6D register forms
+(NP/66/F3/F2 = PHH/PHL/BF16L/BF16H). The real imm8 encodings are split
+across two opcodes:
+
+  EVEX.512.NP.0F3A.W0 07 /r ib   TCVTROWPS2PHH
+  EVEX.512.66.0F3A.W0 07 /r ib   TILEMOVROW          (already right)
+  EVEX.512.F3.0F3A.W0 07 /r ib   TCVTROWD2PS         (already right)
+  EVEX.512.F2.0F3A.W0 07 /r ib   TCVTROWPS2BF16H
+  EVEX.512.F2.0F3A.W0 77 /r ib   TCVTROWPS2PHL
+  EVEX.512.F3.0F3A.W0 77 /r ib   TCVTROWPS2BF16L     (already right)
+
+So PHH imm8 (NP.07) and BF16H imm8 (F2.07) raised #UD, PHL imm8 (F2.77)
+decoded as BF16H and wrote bf16 into the high halves instead of fp16 into
+the low halves, and NP.77 / 66.77, which no instruction uses, decoded.
+PHH and BF16H move into the 07 group; 77 keeps only PHL (F2) and BF16L (F3).
+The register forms at 0F38 6D were right and are unchanged.
+
+Fixed in decoder/fetchdecode_opmap_evex.cc. Found 2026-09-26 when
+tcvtrowps2phh with an immediate raised #UD; encodings checked against
+binutils 2.45.
+
+diff --git a/cpu/decoder/fetchdecode_opmap_evex.cc b/cpu/decoder/fetchdecode_opmap_evex.cc
+index b7aac0c..a401bcb 100644
+--- a/cpu/decoder/fetchdecode_opmap_evex.cc
++++ b/cpu/decoder/fetchdecode_opmap_evex.cc
+@@ -1677,9 +1677,13 @@ static const Bit64u BxOpcodeGroup_EVEX_0F3A05[] = {
+ };
+ 
+ #if BX_SUPPORT_AMX
++// The imm8 forms do not follow the 0F38 4A / 6D register forms' prefix layout: 07 holds
++// TILEMOVROW, TCVTROWD2PS, TCVTROWPS2PHH and TCVTROWPS2BF16H; 77 holds only PHL (F2) and BF16L (F3).
+ static const Bit64u BxOpcodeGroup_EVEX_0F3A07[] = {
++  form_opcode(ATTR_SSE_NO_PREFIX | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2PHH_VphTrmIb),
+   form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TILEMOVROW_VdqTrmIb),
+-  last_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWD2PS_VpsTrmIb) 
++  form_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWD2PS_VpsTrmIb),
++  last_opcode(ATTR_SSE_PREFIX_F2 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2BF16H_VphTrmIb)
+ };
+ #endif
+ 
+@@ -1910,10 +1914,8 @@ static const Bit64u BxOpcodeGroup_EVEX_0F3A73[] = {
+ 
+ #if BX_SUPPORT_AMX
+ static const Bit64u BxOpcodeGroup_EVEX_0F3A77[] = {
+-  form_opcode(ATTR_SSE_NO_PREFIX | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2PHH_VphTrmIb),
+-  form_opcode(ATTR_SSE_PREFIX_66 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2PHL_VphTrmIb),
+-  form_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2BF16L_VphTrmIb),
+-  last_opcode(ATTR_SSE_PREFIX_F2 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2BF16H_VphTrmIb)
++  form_opcode(ATTR_SSE_PREFIX_F2 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2PHL_VphTrmIb),
++  last_opcode(ATTR_SSE_PREFIX_F3 | ATTR_VEX_W0 | ATTR_VL512 | ATTR_MASK_K0 | ATTR_MODC0 | ATTR_IS64, BX_IA_EVEX_TCVTROWPS2BF16L_VphTrmIb)
+ };
+ #endif
+ 

@@ -863,6 +863,22 @@ int decoder_vex64(const Bit8u *iptr, unsigned &remain, bxInstruction_c *i, unsig
 
   ia_opcode = findOpcode(BxOpcodeTableVEX[opcode_byte], decmask);
 
+#if BX_SUPPORT_AMX
+  // TILELOADD* / TILESTORED require a SIB byte. This has to be checked here: past the
+  // decoder, a missing SIB byte and a SIB byte with no index both read as sibIndex() == 4.
+  if (! i->modC0() && (rm & 0x7) != 4) {
+    switch (ia_opcode) {
+      case BX_IA_TILELOADD_TnnnMdq:
+      case BX_IA_TILELOADDT1_TnnnMdq:
+      case BX_IA_TILELOADDRS_TnnnMdq:
+      case BX_IA_TILELOADDRST1_TnnnMdq:
+      case BX_IA_TILESTORED_MdqTnnn:
+        ia_opcode = BX_IA_ERROR;
+        break;
+    }
+  }
+#endif
+
   // Only map 1's 0F 70-73 / C2-C6 groups, every map 3 (0F 3A) opcode and map 7's imm32 forms
   // carry an immediate. Map 5 (AMX-FP8, AMX-TRANSPOSE's T2RPNTLVWZ*RS) sits at 0x300.. in the
   // table and has none — an unbounded ">= 0x200" fetched one byte too many there.
