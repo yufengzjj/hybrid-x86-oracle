@@ -66,6 +66,17 @@ softfloat_status_t mxcsr_to_softfloat_status_word(bx_mxcsr_t mxcsr)
   return status;
 }
 
+// AVX512-FP16 spec, chapter 4: FP16 operands are neither treated as zero (MXCSR.DAZ) nor
+// flushed to zero (MXCSR.FTZ). A conversion from FP32/FP64 to FP16 still obeys DAZ for its
+// input, so it must not use this one.
+softfloat_status_t mxcsr_to_softfloat_status_word_fp16(bx_mxcsr_t mxcsr)
+{
+  softfloat_status_t status = mxcsr_to_softfloat_status_word(mxcsr);
+  status.softfloat_denormals_are_zeros = 0;
+  status.softfloat_flush_underflow_to_zero = 0;
+  return status;
+}
+
 void mxcsr_to_softfloat_status_word_imm_override(softfloat_status_t &status, Bit8u control)
 {
   // override MXCSR rounding mode with control coming from imm8

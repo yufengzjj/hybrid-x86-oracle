@@ -8234,6 +8234,7 @@ static const Bit16u rcp14_table[65536] = {
 #include "softfloat3e/include/softfloat.h"
 
 extern softfloat_status_t mxcsr_to_softfloat_status_word(bx_mxcsr_t mxcsr);
+extern softfloat_status_t mxcsr_to_softfloat_status_word_fp16(bx_mxcsr_t mxcsr);
 
 #include "fpu/softfloat-specialize.h"
 #include "simd_int.h"
@@ -8555,7 +8556,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VRCPSH_MASK_VshHphWshR(bxInstruction_c *i)
   if (! i->opmask() || BX_SCALAR_ELEMENT_MASK(i->opmask())) {
     float16 op2 = BX_READ_XMM_REG_LO_WORD(i->src2());
 
-    softfloat_status_t status = mxcsr_to_softfloat_status_word(MXCSR);
+    softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
     op1.xmm16u(0) = approximate_rcp14(op2, status);
   }
   else {
@@ -8576,7 +8577,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VRCPPH_MASK_VphWphR(bxInstruction_c *i)
   unsigned len = i->getVL();
   unsigned num_elements = WORD_ELEMENTS(len);
 
-  softfloat_status_t status = mxcsr_to_softfloat_status_word(MXCSR);
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
 
   for (unsigned n=0, tmp_mask = mask; n < num_elements; n++, tmp_mask >>= 1) {
     if (tmp_mask & 0x1)

@@ -105,7 +105,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCVTROWPS2PHL_VphTrm(bxInstruction_c *i)
   }
 
   // "round to nearest even" rounding mode is used when doing each convertion below.
+  // FP32 denormal inputs become zero, but FP16 denormal results are kept (ISE: no FTZ here).
   softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
+  status.softfloat_flush_underflow_to_zero = false;
 
   // convert the fp32 source elements to fp16 and place them in low 16-bits of each dword
   for (unsigned n=0;n < DWORD_ELEMENTS(BX_VL512); n++)
@@ -128,6 +130,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCVTROWPS2PHH_VphTrm(bxInstruction_c *i)
 
   // "round to nearest even" rounding mode is used when doing each convertion below.
   softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
+  status.softfloat_flush_underflow_to_zero = false;
 
   // convert the fp32 source elements to fp16 and place them in high 16-bits of each dword
   for (unsigned n=0;n < DWORD_ELEMENTS(BX_VL512); n++)

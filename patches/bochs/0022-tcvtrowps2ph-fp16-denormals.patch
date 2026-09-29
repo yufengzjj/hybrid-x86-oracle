@@ -1,0 +1,37 @@
+TCVTROWPS2PH[H,L] flushed FP16 denormal results to zero
+
+ISE 319433-057, TCVTROWPS2PH[H,L]: "Input FP32 denormals become FP16 zeros on
+outputs. This instruction can produce FP16 denormal outputs. (MXCSR.FTZ only
+controls FP32 and FP64 denormal outputs)."
+
+Both handlers converted under prepare_ne_softfloat_status_helper(true), whose
+FTZ=1 makes f32_to_f16 flush every FP16 denormal result: 2^-15, 2^-16 and
+2^-24 all became 0 instead of 0x0200, 0x0100 and 0x0001. The status keeps
+DAZ=1 for the FP32 inputs and now has FTZ=0.
+
+Fixed in avx/amx_avx512.cc. Found 2026-09-29 while checking the other AMX
+floating-point instructions against the ISE after the AMX-FP8 fix; upstream
+master has the same code.
+
+diff --git a/cpu/avx/amx_avx512.cc b/cpu/avx/amx_avx512.cc
+index 3a25828..f942fd6 100644
+--- a/cpu/avx/amx_avx512.cc
++++ b/cpu/avx/amx_avx512.cc
+@@ -105,7 +105,9 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCVTROWPS2PHL_VphTrm(bxInstruction_c *i)
+   }
+ 
+   // "round to nearest even" rounding mode is used when doing each convertion below.
++  // FP32 denormal inputs become zero, but FP16 denormal results are kept (ISE: no FTZ here).
+   softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
++  status.softfloat_flush_underflow_to_zero = false;
+ 
+   // convert the fp32 source elements to fp16 and place them in low 16-bits of each dword
+   for (unsigned n=0;n < DWORD_ELEMENTS(BX_VL512); n++)
+@@ -128,6 +130,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCVTROWPS2PHH_VphTrm(bxInstruction_c *i)
+ 
+   // "round to nearest even" rounding mode is used when doing each convertion below.
+   softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
++  status.softfloat_flush_underflow_to_zero = false;
+ 
+   // convert the fp32 source elements to fp16 and place them in high 16-bits of each dword
+   for (unsigned n=0;n < DWORD_ELEMENTS(BX_VL512); n++)

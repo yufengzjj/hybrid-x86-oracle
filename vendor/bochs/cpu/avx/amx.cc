@@ -598,11 +598,12 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCMMRLFP16PS_TnnnTrmTreg(bxInstruction_c *
       for (unsigned n=0; n < max_n; n++) {
         float32 s1r = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k));                        // real
         float32 s2r = convert_ne_fp16_to_fp32(tsrc2->row[k].vmm16u(2*n));                        // real
-        float32 s1i = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k+1));                      // imaginary
+        // imaginary, negated for i^2 = -1: the ISE negates the FP16 input, so a NaN's sign flips too
+        float32 s1i = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k+1) ^ 0x8000);
         float32 s2i = convert_ne_fp16_to_fp32(tsrc2->row[k].vmm16u(2*n+1));                      // imaginary
 
         tmp[2*n]   = f32_mulAdd(s1r, s2r, tmp[2*n],   0, &status);                               // real
-        tmp[2*n+1] = f32_mulAdd(s1i, s2i, tmp[2*n+1], softfloat_muladd_negate_product, &status);     // imaginary, negate for i^2 = -1
+        tmp[2*n+1] = f32_mulAdd(s1i, s2i, tmp[2*n+1], 0, &status);                               // imaginary
       }
     }
 
@@ -684,247 +685,165 @@ BX_CPP_INLINE float32 f32_silence_snan(float32 a)
 
 // AMX-FP8 //
 
-#include "bf8.h"
-#include "hf8.h"
+// ISE 319433-057, TDP[B,H,BH,HB]F8PS: the products and their sum over the whole K dimension are
+// exact (int128 in the pseudocode), converted to FP32 once (RNE) and then added to srcdest
+// (RNE, FTZ=1). Inputs are not DAZ'd - the "FP32 MUL with DAZ=1" comment in the pseudocode loop
+// contradicts both the description ("DAZ==0 is assumed") and the exact fixed-point computation.
+// Any NaN in the operands of an element, srcdest included, gives QNaN indefinite.
 
-void BX_CPP_AttrRegparmN(1) BX_CPU_C::TDPBF8PS_TnnnTrmTreg(bxInstruction_c *i)
+#include "fpu/softfloat-specialize.h"
+
+struct amx_fp8_value {
+  bool nan, inf, neg;
+  Bit64u mag;  // value = mag * 2^-16 (BF8) or mag * 2^-9 (HF8)
+};
+
+static amx_fp8_value amx_decode_fp8(Bit8u v, bool is_bf8)
 {
-  unsigned tile_dst = i->dst(), tile_src1 = i->src1(), tile_src2 = i->src2();
-  check_tiles(i, tile_dst, tile_src1, tile_src2);
+  amx_fp8_value r = { false, false, (v & 0x80) != 0, 0 };
+  if (is_bf8) {
+    unsigned exp = (v >> 2) & 0x1F, frac = v & 0x3;
+    if (exp == 0x1F) { r.nan = (frac != 0); r.inf = (frac == 0); return r; }
+    r.mag = exp ? Bit64u(4 | frac) << (exp - 1) : frac;
+  }
+  else {
+    unsigned exp = (v >> 3) & 0xF, frac = v & 0x7;
+    if (exp == 0xF && frac == 0x7) { r.nan = true; return r; }  // HF8 has no infinity
+    r.mag = exp ? Bit64u(8 | frac) << (exp - 1) : frac;
+  }
+  return r;
+}
 
-  //     R   C
-  // A = m x k (tsrc1)
-  // B = k x n (tsrc2)
-  // C = m x n (tsrcdest)
-  unsigned max_n = BX_CPU_THIS_PTR amx->tile_dword_elements_per_row(tile_dst);
-  unsigned max_m = BX_CPU_THIS_PTR amx->tile_num_rows(tile_dst);
-  unsigned max_k = BX_CPU_THIS_PTR amx->tile_num_rows(tile_src2);
+// two's complement 128-bit accumulator
+struct amx_fp8_acc {
+  Bit64u lo, hi;
+  bool nan, pos_inf, neg_inf;
+};
 
-  AMX::TILE *tdst  = &(BX_CPU_THIS_PTR amx->tile[tile_dst]);
-  AMX::TILE *tsrc1 = &(BX_CPU_THIS_PTR amx->tile[tile_src1]);
-  AMX::TILE *tsrc2 = &(BX_CPU_THIS_PTR amx->tile[tile_src2]);
+static void amx_fp8_accumulate(amx_fp8_acc &acc, Bit8u a, Bit8u b, bool a_is_bf8, bool b_is_bf8)
+{
+  amx_fp8_value x = amx_decode_fp8(a, a_is_bf8), y = amx_decode_fp8(b, b_is_bf8);
+  bool neg = x.neg != y.neg;
 
-  // "round to nearest even" rounding mode is used when doing each accumulation of the FMA.
-  // output denormals are always flushed to zero and input denormals are always treated as zero.
-  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
+  if (x.nan || y.nan) { acc.nan = true; return; }
+  if (x.inf || y.inf) {
+    if ((x.inf ? y.mag : x.mag) == 0 && !(x.inf && y.inf)) acc.nan = true;  // inf * 0
+    else if (neg) acc.neg_inf = true;
+    else acc.pos_inf = true;
+    return;
+  }
+
+  Bit64u p = x.mag * y.mag;  // < 2^64: BF8 x BF8 at most 7*2^29 squared
+  if (neg) {
+    Bit64u lo = acc.lo - p;
+    acc.hi -= (lo > acc.lo);
+    acc.lo = lo;
+  }
+  else {
+    Bit64u lo = acc.lo + p;
+    acc.hi += (lo < acc.lo);
+    acc.lo = lo;
+  }
+}
+
+static int amx_msb64(Bit64u x)  // x != 0
+{
+  int n = 63;
+  while (!(x >> n)) n--;
+  return n;
+}
+
+// value = acc * 2^-scale, rounded to FP32 with RNE; the smallest nonzero value, 2^-32, is normal
+static float32 amx_fp8_acc_to_f32(const amx_fp8_acc &acc, int scale)
+{
+  Bit64u lo = acc.lo, hi = acc.hi;
+  bool neg = (hi >> 63) != 0;
+  if (neg) {  // negate
+    lo = ~lo + 1;
+    hi = ~hi + (lo == 0);
+  }
+  if (!lo && !hi) return 0;
+
+  int msb = hi ? 64 + amx_msb64(hi) : amx_msb64(lo);
+  Bit32u sig;
+  if (msb <= 23) {
+    sig = Bit32u(lo << (23 - msb));
+  }
+  else {
+    int shift = msb - 23;  // 1..104
+    Bit64u q, rem_hi_bit, sticky;
+    if (shift < 64) {
+      q = (lo >> shift) | (shift ? hi << (64 - shift) : 0);
+      rem_hi_bit = (lo >> (shift - 1)) & 1;
+      sticky = (shift > 1) ? (lo & ((BX_CONST64(1) << (shift - 1)) - 1)) : 0;
+    }
+    else {
+      q = hi >> (shift - 64);
+      rem_hi_bit = (shift == 64) ? (lo >> 63) : (hi >> (shift - 65)) & 1;
+      sticky = (shift == 64) ? (lo & ~(BX_CONST64(1) << 63)) :
+               (lo | (hi & ((BX_CONST64(1) << (shift - 65)) - 1)));
+    }
+    sig = Bit32u(q);
+    if (rem_hi_bit && (sticky || (sig & 1))) {
+      sig++;
+      if (sig == (1u << 24)) { sig >>= 1; msb++; }
+    }
+  }
+  Bit32u exp = Bit32u(msb - scale + 127);
+  return (Bit32u(neg) << 31) | (exp << 23) | (sig & 0x7FFFFF);
+}
+
+static void amx_fp8_dot_product(AMX::TILE *tdst, const AMX::TILE *tsrc1, const AMX::TILE *tsrc2,
+    unsigned max_m, unsigned max_n, unsigned max_k, bool src1_is_bf8, bool src2_is_bf8)
+{
+  softfloat_status_t status = prepare_ne_softfloat_status_helper(false);
+  int scale = (src1_is_bf8 ? 16 : 9) + (src2_is_bf8 ? 16 : 9);
 
   for (unsigned m=0; m < max_m; m++) {
-    float32 tmp[32]; // new empty array
-    for (unsigned n=0; n < 32; n++) tmp[n] = 0;
-
-    for (unsigned k=0; k < max_k; k++) {
-      for (unsigned n=0; n < max_n; n++) {
-        float32 s1s2[4];
-
-        for (unsigned fp8_index = 0; fp8_index < 4; fp8_index++) {
-          // we don't have function to directly convert fp8 to f32 so convert to f16 first
-          float16 s1 = convert_bf8_to_fp16(tsrc1->row[m].vmmubyte(4*k+fp8_index));
-          float16 s2 = convert_bf8_to_fp16(tsrc2->row[k].vmmubyte(4*n+fp8_index));
-
-          s1s2[fp8_index] = f32_mul(f16_to_f32(s1, &status), f16_to_f32(s2, &status), &status);
-        }
-
-        float32 tmp0 = f32_add(s1s2[0], s1s2[1], &status);
-        float32 tmp1 = f32_add(s1s2[2], s1s2[3], &status);
-
-        tmp[2*n]   = f32_add(tmp[2*n],   tmp0, &status);
-        tmp[2*n+1] = f32_add(tmp[2*n+1], tmp1, &status);
-      }
-    }
-
     for (unsigned n=0; n < max_n; n++) {
-      float32 tmpf32 = f32_add(tmp[2*n], tmp[2*n+1], &status);
-      tdst->row[m].vmm32u(n) = f32_add(tdst->row[m].vmm32u(n), tmpf32, &status);
+      amx_fp8_acc acc = { 0, 0, false, false, false };
+      for (unsigned k=0; k < max_k; k++)
+        for (unsigned fp8_index = 0; fp8_index < 4; fp8_index++)
+          amx_fp8_accumulate(acc, tsrc1->row[m].vmmubyte(4*k+fp8_index), tsrc2->row[k].vmmubyte(4*n+fp8_index), src1_is_bf8, src2_is_bf8);
+
+      float32 srcdest = tdst->row[m].vmm32u(n);
+      if (acc.nan || (acc.pos_inf && acc.neg_inf) || f32_isNaN(srcdest)) {
+        tdst->row[m].vmm32u(n) = float32_default_nan;
+        continue;
+      }
+      float32 sum = acc.pos_inf ? float32_positive_inf : acc.neg_inf ? float32_negative_inf : amx_fp8_acc_to_f32(acc, scale);
+      tdst->row[m].vmm32u(n) = f32_add(srcdest, sum, &status);
     }
 
     tdst->zero_upper_row_data32(m, max_n);
   }
-
-  BX_CPU_THIS_PTR amx->set_tile_used(tile_dst);
-  BX_CPU_THIS_PTR amx->tile[tile_dst].clear_upper_rows(max_m);
-  BX_CPU_THIS_PTR amx->restart();
-
-  BX_NEXT_INSTR(i);
 }
 
-void BX_CPP_AttrRegparmN(1) BX_CPU_C::TDPHF8PS_TnnnTrmTreg(bxInstruction_c *i)
-{
-  unsigned tile_dst = i->dst(), tile_src1 = i->src1(), tile_src2 = i->src2();
-  check_tiles(i, tile_dst, tile_src1, tile_src2);
-
-  //     R   C
-  // A = m x k (tsrc1)
-  // B = k x n (tsrc2)
-  // C = m x n (tsrcdest)
-  unsigned max_n = BX_CPU_THIS_PTR amx->tile_dword_elements_per_row(tile_dst);
-  unsigned max_m = BX_CPU_THIS_PTR amx->tile_num_rows(tile_dst);
-  unsigned max_k = BX_CPU_THIS_PTR amx->tile_num_rows(tile_src2);
-
-  AMX::TILE *tdst  = &(BX_CPU_THIS_PTR amx->tile[tile_dst]);
-  AMX::TILE *tsrc1 = &(BX_CPU_THIS_PTR amx->tile[tile_src1]);
-  AMX::TILE *tsrc2 = &(BX_CPU_THIS_PTR amx->tile[tile_src2]);
-
-  // "round to nearest even" rounding mode is used when doing each accumulation of the FMA.
-  // output denormals are always flushed to zero and input denormals are always treated as zero.
-  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
-
-  for (unsigned m=0; m < max_m; m++) {
-    float32 tmp[32]; // new empty array
-    for (unsigned n=0; n < 32; n++) tmp[n] = 0;
-
-    for (unsigned k=0; k < max_k; k++) {
-      for (unsigned n=0; n < max_n; n++) {
-        float32 s1s2[4];
-
-        for (unsigned fp8_index = 0; fp8_index < 4; fp8_index++) {
-          // we don't have function to directly convert fp8 to f32 so convert to f16 first
-          float16 s1 = convert_hf8_to_fp16(tsrc1->row[m].vmmubyte(4*k+fp8_index));
-          float16 s2 = convert_hf8_to_fp16(tsrc2->row[k].vmmubyte(4*n+fp8_index));
-
-          s1s2[fp8_index] = f32_mul(f16_to_f32(s1, &status), f16_to_f32(s2, &status), &status);
-        }
-
-        float32 tmp0 = f32_add(s1s2[0], s1s2[1], &status);
-        float32 tmp1 = f32_add(s1s2[2], s1s2[3], &status);
-
-        tmp[2*n]   = f32_add(tmp[2*n],   tmp0, &status);
-        tmp[2*n+1] = f32_add(tmp[2*n+1], tmp1, &status);
-      }
-    }
-
-    for (unsigned n=0; n < max_n; n++) {
-      float32 tmpf32 = f32_add(tmp[2*n], tmp[2*n+1], &status);
-      tdst->row[m].vmm32u(n) = f32_add(tdst->row[m].vmm32u(n), tmpf32, &status);
-    }
-
-    tdst->zero_upper_row_data32(m, max_n);
+#define AMX_FP8_DOT_PRODUCT(HANDLER, src1_is_bf8, src2_is_bf8)                              \
+  void BX_CPP_AttrRegparmN(1) BX_CPU_C:: HANDLER (bxInstruction_c *i)                     \
+  {                                                                                       \
+    unsigned tile_dst = i->dst(), tile_src1 = i->src1(), tile_src2 = i->src2();           \
+    check_tiles(i, tile_dst, tile_src1, tile_src2);                                       \
+                                                                                          \
+    /* A = m x k (tsrc1), B = k x n (tsrc2), C = m x n (tsrcdest) */                      \
+    unsigned max_n = BX_CPU_THIS_PTR amx->tile_dword_elements_per_row(tile_dst);         \
+    unsigned max_m = BX_CPU_THIS_PTR amx->tile_num_rows(tile_dst);                       \
+    unsigned max_k = BX_CPU_THIS_PTR amx->tile_num_rows(tile_src2);                      \
+                                                                                          \
+    amx_fp8_dot_product(&BX_CPU_THIS_PTR amx->tile[tile_dst],                            \
+      &BX_CPU_THIS_PTR amx->tile[tile_src1], &BX_CPU_THIS_PTR amx->tile[tile_src2],      \
+      max_m, max_n, max_k, src1_is_bf8, src2_is_bf8);                                     \
+                                                                                          \
+    BX_CPU_THIS_PTR amx->set_tile_used(tile_dst);                                         \
+    BX_CPU_THIS_PTR amx->tile[tile_dst].clear_upper_rows(max_m);                          \
+    BX_CPU_THIS_PTR amx->restart();                                                       \
+                                                                                          \
+    BX_NEXT_INSTR(i);                                                                     \
   }
 
-  BX_CPU_THIS_PTR amx->set_tile_used(tile_dst);
-  BX_CPU_THIS_PTR amx->tile[tile_dst].clear_upper_rows(max_m);
-  BX_CPU_THIS_PTR amx->restart();
-
-  BX_NEXT_INSTR(i);
-}
-
-void BX_CPP_AttrRegparmN(1) BX_CPU_C::TDPBHF8PS_TnnnTrmTreg(bxInstruction_c *i)
-{
-  unsigned tile_dst = i->dst(), tile_src1 = i->src1(), tile_src2 = i->src2();
-  check_tiles(i, tile_dst, tile_src1, tile_src2);
-
-  //     R   C
-  // A = m x k (tsrc1)
-  // B = k x n (tsrc2)
-  // C = m x n (tsrcdest)
-  unsigned max_n = BX_CPU_THIS_PTR amx->tile_dword_elements_per_row(tile_dst);
-  unsigned max_m = BX_CPU_THIS_PTR amx->tile_num_rows(tile_dst);
-  unsigned max_k = BX_CPU_THIS_PTR amx->tile_num_rows(tile_src2);
-
-  AMX::TILE *tdst  = &(BX_CPU_THIS_PTR amx->tile[tile_dst]);
-  AMX::TILE *tsrc1 = &(BX_CPU_THIS_PTR amx->tile[tile_src1]);
-  AMX::TILE *tsrc2 = &(BX_CPU_THIS_PTR amx->tile[tile_src2]);
-
-  // "round to nearest even" rounding mode is used when doing each accumulation of the FMA.
-  // output denormals are always flushed to zero and input denormals are always treated as zero.
-  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
-
-  for (unsigned m=0; m < max_m; m++) {
-    float32 tmp[32]; // new empty array
-    for (unsigned n=0; n < 32; n++) tmp[n] = 0;
-
-    for (unsigned k=0; k < max_k; k++) {
-      for (unsigned n=0; n < max_n; n++) {
-        float32 s1s2[4];
-
-        for (unsigned fp8_index = 0; fp8_index < 4; fp8_index++) {
-          // we don't have function to directly convert fp8 to f32 so convert to f16 first
-          float16 s1 = convert_bf8_to_fp16(tsrc1->row[m].vmmubyte(4*k+fp8_index));
-          float16 s2 = convert_hf8_to_fp16(tsrc2->row[k].vmmubyte(4*n+fp8_index));
-
-          s1s2[fp8_index] = f32_mul(f16_to_f32(s1, &status), f16_to_f32(s2, &status), &status);
-        }
-
-        float32 tmp0 = f32_add(s1s2[0], s1s2[1], &status);
-        float32 tmp1 = f32_add(s1s2[2], s1s2[3], &status);
-
-        tmp[2*n]   = f32_add(tmp[2*n],   tmp0, &status);
-        tmp[2*n+1] = f32_add(tmp[2*n+1], tmp1, &status);
-      }
-    }
-
-    for (unsigned n=0; n < max_n; n++) {
-      float32 tmpf32 = f32_add(tmp[2*n], tmp[2*n+1], &status);
-      tdst->row[m].vmm32u(n) = f32_add(tdst->row[m].vmm32u(n), tmpf32, &status);
-    }
-
-    tdst->zero_upper_row_data32(m, max_n);
-  }
-
-  BX_CPU_THIS_PTR amx->set_tile_used(tile_dst);
-  BX_CPU_THIS_PTR amx->tile[tile_dst].clear_upper_rows(max_m);
-  BX_CPU_THIS_PTR amx->restart();
-
-  BX_NEXT_INSTR(i);
-}
-
-void BX_CPP_AttrRegparmN(1) BX_CPU_C::TDPHBF8PS_TnnnTrmTreg(bxInstruction_c *i)
-{
-  unsigned tile_dst = i->dst(), tile_src1 = i->src1(), tile_src2 = i->src2();
-  check_tiles(i, tile_dst, tile_src1, tile_src2);
-
-  //     R   C
-  // A = m x k (tsrc1)
-  // B = k x n (tsrc2)
-  // C = m x n (tsrcdest)
-  unsigned max_n = BX_CPU_THIS_PTR amx->tile_dword_elements_per_row(tile_dst);
-  unsigned max_m = BX_CPU_THIS_PTR amx->tile_num_rows(tile_dst);
-  unsigned max_k = BX_CPU_THIS_PTR amx->tile_num_rows(tile_src2);
-
-  AMX::TILE *tdst  = &(BX_CPU_THIS_PTR amx->tile[tile_dst]);
-  AMX::TILE *tsrc1 = &(BX_CPU_THIS_PTR amx->tile[tile_src1]);
-  AMX::TILE *tsrc2 = &(BX_CPU_THIS_PTR amx->tile[tile_src2]);
-
-  // "round to nearest even" rounding mode is used when doing each accumulation of the FMA.
-  // output denormals are always flushed to zero and input denormals are always treated as zero.
-  softfloat_status_t status = prepare_ne_softfloat_status_helper(true);
-
-  for (unsigned m=0; m < max_m; m++) {
-    float32 tmp[32]; // new empty array
-    for (unsigned n=0; n < 32; n++) tmp[n] = 0;
-
-    for (unsigned k=0; k < max_k; k++) {
-      for (unsigned n=0; n < max_n; n++) {
-        float32 s1s2[4];
-
-        for (unsigned fp8_index = 0; fp8_index < 4; fp8_index++) {
-          // we don't have function to directly convert fp8 to f32 so convert to f16 first
-          float16 s1 = convert_hf8_to_fp16(tsrc1->row[m].vmmubyte(4*k+fp8_index));
-          float16 s2 = convert_bf8_to_fp16(tsrc2->row[k].vmmubyte(4*n+fp8_index));
-
-          s1s2[fp8_index] = f32_mul(f16_to_f32(s1, &status), f16_to_f32(s2, &status), &status);
-        }
-
-        float32 tmp0 = f32_add(s1s2[0], s1s2[1], &status);
-        float32 tmp1 = f32_add(s1s2[2], s1s2[3], &status);
-
-        tmp[2*n]   = f32_add(tmp[2*n],   tmp0, &status);
-        tmp[2*n+1] = f32_add(tmp[2*n+1], tmp1, &status);
-      }
-    }
-
-    for (unsigned n=0; n < max_n; n++) {
-      float32 tmpf32 = f32_add(tmp[2*n], tmp[2*n+1], &status);
-      tdst->row[m].vmm32u(n) = f32_add(tdst->row[m].vmm32u(n), tmpf32, &status);
-    }
-
-    tdst->zero_upper_row_data32(m, max_n);
-  }
-
-  BX_CPU_THIS_PTR amx->set_tile_used(tile_dst);
-  BX_CPU_THIS_PTR amx->tile[tile_dst].clear_upper_rows(max_m);
-  BX_CPU_THIS_PTR amx->restart();
-
-  BX_NEXT_INSTR(i);
-}
+AMX_FP8_DOT_PRODUCT(TDPBF8PS_TnnnTrmTreg, true, true)
+AMX_FP8_DOT_PRODUCT(TDPHF8PS_TnnnTrmTreg, false, false)
+AMX_FP8_DOT_PRODUCT(TDPBHF8PS_TnnnTrmTreg, true, false)
+AMX_FP8_DOT_PRODUCT(TDPHBF8PS_TnnnTrmTreg, false, true)
 
 #endif // BX_SUPPORT_AMX

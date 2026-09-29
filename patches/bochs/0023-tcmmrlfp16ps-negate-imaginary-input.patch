@@ -1,0 +1,36 @@
+TCMMRLFP16PS: negate the FP16 imaginary part of src1, not the product
+
+ISE 319433-057, TCMMRLFP16PS pseudocode:
+    s1o = cvt_fp16_to_fp32(-tsrc1.row[m].fp16[2*k+1])
+    temp1.fp32[2*n+1] = fma32(temp1.fp32[2*n+1], s1o, s2o, ...)
+The handler instead passed softfloat_muladd_negate_product to f32_mulAdd.
+For numbers and zeros the two agree, but softfloat returns a NaN operand
+unchanged, so a NaN in that imaginary part kept its sign: 0x7E00 gave
+0x7FC00000 where the pseudocode gives 0xFFC00000, and 0xFE00 the reverse.
+The FP16 sign bit is now flipped before the conversion.
+
+Not checked on hardware: this follows the pseudocode as written.
+
+Fixed in avx/amx.cc. Found 2026-09-29 while checking the other AMX
+floating-point instructions against the ISE after the AMX-FP8 fix; upstream
+master has the same code.
+
+diff --git a/cpu/avx/amx.cc b/cpu/avx/amx.cc
+index ce716aa..1350006 100644
+--- a/cpu/avx/amx.cc
++++ b/cpu/avx/amx.cc
+@@ -598,11 +598,12 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::TCMMRLFP16PS_TnnnTrmTreg(bxInstruction_c *
+       for (unsigned n=0; n < max_n; n++) {
+         float32 s1r = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k));                        // real
+         float32 s2r = convert_ne_fp16_to_fp32(tsrc2->row[k].vmm16u(2*n));                        // real
+-        float32 s1i = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k+1));                      // imaginary
++        // imaginary, negated for i^2 = -1: the ISE negates the FP16 input, so a NaN's sign flips too
++        float32 s1i = convert_ne_fp16_to_fp32(tsrc1->row[m].vmm16u(2*k+1) ^ 0x8000);
+         float32 s2i = convert_ne_fp16_to_fp32(tsrc2->row[k].vmm16u(2*n+1));                      // imaginary
+ 
+         tmp[2*n]   = f32_mulAdd(s1r, s2r, tmp[2*n],   0, &status);                               // real
+-        tmp[2*n+1] = f32_mulAdd(s1i, s2i, tmp[2*n+1], softfloat_muladd_negate_product, &status);     // imaginary, negate for i^2 = -1
++        tmp[2*n+1] = f32_mulAdd(s1i, s2i, tmp[2*n+1], 0, &status);                               // imaginary
+       }
+     }
+ 

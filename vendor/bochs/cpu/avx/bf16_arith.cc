@@ -47,12 +47,18 @@ bfloat16 bf16_div(bfloat16 a, bfloat16 b) {
   return convert_ne_fp32_to_bfloat16(f32_div(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
 }
 
+// VMIN/VMAXBF16 pseudocode: every case but a strict win for SRC1 returns SRC2 bit for bit, so a
+// NaN SRC2 (an SNaN included) must not go through convert_ne_fp32_to_bfloat16, which quiets it.
 bfloat16 bf16_min(bfloat16 a, bfloat16 b) {
-  return convert_ne_fp32_to_bfloat16(f32_min(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
+  a = bf16_denormal_to_zero(a);
+  b = bf16_denormal_to_zero(b);
+  return (bf16_compare(a, b) == softfloat_relation_less) ? a : b;
 }
 
 bfloat16 bf16_max(bfloat16 a, bfloat16 b) {
-  return convert_ne_fp32_to_bfloat16(f32_max(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
+  a = bf16_denormal_to_zero(a);
+  b = bf16_denormal_to_zero(b);
+  return (bf16_compare(a, b) == softfloat_relation_greater) ? a : b;
 }
 
 bfloat16 bf16_scalef(bfloat16 a, bfloat16 b) {

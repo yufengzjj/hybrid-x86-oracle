@@ -961,6 +961,200 @@ reads differently; `[reg+r12]` (the same SIB index field, VEX.X set) is the
 control. Still present on upstream master as of 2026-09-26 (`22f494f`). No
 AMX silicon was available.
 
+## 4aa. `VRANGE*` MIN_ABS / MAX_ABS broke equal-magnitude ties by position — patched (Bochs), fixed upstream
+
+SDM Tables 5-24 and 5-25 (VRANGEPD): when |src1| = |src2| with opposite
+signs, including +0 / −0, MIN_ABS returns the negative operand and MAX_ABS
+the positive one, whichever position it is in. `f{16,32,64}_range` cleared
+the sign before the absolute compare, so on a tie MIN_ABS always returned
+src2 and MAX_ABS always src1:
+
+| imm8[1:0] | src1, src2 | SDM | Upstream |
+|---|---|---|---|
+| MIN_ABS | −2, +2 | −2 | +2 |
+| MIN_ABS | −0, +0 | −0 | +0 |
+| MAX_ABS | −2, +2 | +2 | −2 |
+| MAX_ABS | −0, +0 | +0 | −0 |
+
+With src1 the positive one the result was right by luck. Only
+imm8[3:2] = 01 (sign of the compare result) shows it; the other three sign
+controls rewrite the sign bit, and on a tie that is all that differs. Hit
+`vrangeps`, `vrangepd`, `vrangess` and `vrangesd`; `f16_range` had the same
+code but no caller.
+
+Fixed upstream by `04b100ae1f` (2026-08-30), after the pinned revision;
+[`patches/bochs/0017-vrange-abs-equal-magnitude.patch`](../patches/bochs/0017-vrange-abs-equal-magnitude.patch)
+backports it to all three `softfloat3e/f*_range.cc`. A re-vendor at or past
+that commit will fail to apply the patch — delete it then.
+`tests/bochs_patches.rs` pins all four instructions on (−2, +2), (+2, −2),
+(−0, +0) and (+0, −0) for both MIN_ABS and MAX_ABS, with (−3, +2) as the
+unequal-magnitude control. No AVX-512 silicon was available.
+
+## 4ab. FP16 instructions obeyed MXCSR.DAZ and MXCSR.FTZ — patched (Bochs)
+
+AVX512-FP16 spec, chapter 4: FP16 operands are "neither conditionally
+flushed to zero (MXCSR.FTZ) nor conditionally treated as zero (MXCSR.DAZ)".
+Conversions from FP32/FP64 still obey DAZ for their source, conversions to
+FP32/FP64 still obey FTZ; the AVX10.2 VMINMAXPH/SH pseudocode likewise says
+`daz=false`. Upstream built every FP16 handler's softfloat status straight
+from MXCSR, and the f16 routines honour both bits, so once a program set DAZ
+or FTZ nearly the whole AVX512-FP16 set changed its results or its MXCSR
+flags:
+
+| MXCSR `9FC0` (DAZ + FTZ) | SDM | Upstream |
+|---|---|---|
+| `vaddph` 2⁻²⁴ + 2⁻²⁴ | 2⁻²³ (`0x0002`) | 0 |
+| `vmulph` 2⁻¹⁴ × 0.5 | 2⁻¹⁵ (`0x0200`) | 0 |
+| `vminmaxph` max(+denormal, +0) | the denormal | +0 |
+| `vcvtph2w` of a denormal | 0, PE set | 0, PE clear |
+
+Found 2026-09-29 by running all 297 FP16/BF16/FP8 opcode entries under MXCSR
+`1F80`, `1FC0` and `9F80` and comparing results and flags: arithmetic, FMA,
+complex, compare/comi, fpclass, getexp/getmant/reduce/rndscale/scalef,
+sqrt/rcp/rsqrt, min/max/minmax and the conversions were all affected. The
+AVX10.2 BF16 and FP8 instructions, F16C, AVX-NE-CONVERT and VCVT2PS2PHX were
+already MXCSR-independent as specified. No FP16 case appears in the
+differential suite because none of it sets DAZ or FTZ.
+
+Fixed by
+[`patches/bochs/0018-fp16-ignore-mxcsr-daz-ftz.patch`](../patches/bochs/0018-fp16-ignore-mxcsr-daz-ftz.patch):
+a `mxcsr_to_softfloat_status_word_fp16()` with DAZ and FTZ cleared, used by
+every FP16 handler — the FP16-only `*_HALF` masked templates, new unmasked
+`HANDLE_AVX_PFP_{1,2,3}OP_HALF` twins of the shared templates (the 27 unmasked
+AVX512-FP16 opcode entries now point at them), the scalar and FMA macros,
+rcp/rsqrt, fpclass, minmax and comx — while the FP32/FP64/integer → FP16
+conversions keep DAZ and clear FTZ only. The fix is at the handlers rather
+than in softfloat because AMX-FP8 converts through `f16_to_f32` and relies on
+its DAZ. `tests/bochs_patches.rs` runs 27 representatives, one per handler
+family, under DAZ, FTZ and both, and requires the result and the flags to
+match the default MXCSR (FTZ only for the two FP32-source conversions); each
+of the 27 fails without the patch. After the fix, re-running the full sweep
+leaves only the FP32/FP64-source conversions differing, and only under DAZ.
+Still present on upstream master as of 2026-09-29 (`4b46aea`). No AVX512-FP16
+silicon was available.
+
+## 4ac. `VCVT2PS2PHX` never set its MXCSR flags — patched (Bochs)
+
+AVX10.2 spec: VCVT2PS2PHX updates MXCSR "as if all MXCSR numerical
+exceptions flags are masked and does not generate floating point
+exceptions", and can set DE, IE, OE, PE and UE. Upstream suppressed every
+flag, so MXCSR never changed — `vcvt2ps2phx` of 1/3 left PE clear where
+`vcvtps2phx` sets it. Dropping the suppression alone would have let
+`check_exceptionsSSE` raise #XM for an exception unmasked in MXCSR, so
+[`patches/bochs/0019-vcvt2ps2phx-mxcsr-flags.patch`](../patches/bochs/0019-vcvt2ps2phx-mxcsr-flags.patch)
+ORs the flags into MXCSR directly. `tests/bochs_patches.rs` pins PE (and only
+PE) for 1/3, both with the default MXCSR and with PE unmasked, where the
+instruction must still retire. Still present on upstream master as of
+2026-09-29 (`4b46aea`). No AVX10.2 silicon was available.
+
+## 4ad. `VMINBF16` / `VMAXBF16` quieted an SNaN SRC2 — patched (Bochs); two BF16 corners left open
+
+The AVX10.2 pseudocode follows MINPS/MAXPS: two zeros, a NaN in SRC1 or a NaN
+in SRC2 all return SRC2 unchanged, with DAZ on the inputs. Upstream computed
+the result in FP32 and converted it back with `convert_ne_fp32_to_bfloat16`,
+which forces every NaN quiet, so `vmaxbf16 1.0, SNaN(0x7F81)` returned
+`0x7FC1`.
+[`patches/bochs/0020-bf16-min-max-return-src2.patch`](../patches/bochs/0020-bf16-min-max-return-src2.patch)
+(`avx/bf16_arith.cc`) flushes denormal inputs and returns SRC1 only when it
+strictly wins, SRC2 bit for bit otherwise. `tests/bochs_patches.rs` pins
+SNaN and QNaN on either side, both zero orders, a denormal and two ordered
+pairs. Still present on upstream master as of 2026-09-29 (`4b46aea`).
+
+Found 2026-09-29 while checking the BF16 instructions against their specs.
+The same sweep found everything else as specified: every AVX10.2 BF16,
+AVX512-BF16 and AVX-NE-CONVERT instruction is independent of MXCSR (RC,
+exception masks, DAZ, FTZ) and never sets its flags; DAZ, FTZ and RNE hold
+where the pseudocode puts them; `vdpbf16ps` follows the NaN priority of SDM
+Table 5-1; the AVX-NE-CONVERT BF16 → FP32 conversions keep denormals, as the
+current ISE says (ISE -049 claimed DAZ; later editions withdrew that as
+inaccurate). Two corners the spec does not settle, left as upstream has
+them until silicon can decide:
+
+- `vgetmantbf16` of a negative denormal with sign control `1x`: the
+  description says denormals are treated as zero (Bochs: ±1.0, as for −0),
+  but the pseudocode tests "negative" before "denormal", which gives
+  QNaN_Indefinite.
+- A BF16 result whose exact value is just below 2⁻¹²⁶ but rounds to 2⁻¹²⁶:
+  Bochs flushes it to zero (tininess before rounding); the spec only says
+  "denormal BF16 outputs are flushed to zero".
+
+## 4ae. AMX-FP8 dot products rounded every step, DAZ'd BF8 denormals and kept NaN payloads — patched (Bochs)
+
+ISE 319433-057 (unchanged since -055), `TDP[B,H,BH,HB]F8PS`: "For the inputs,
+DAZ==0 is assumed, for the output FTZ==1 is assumed"; the pseudocode sums the
+products of each 4-tuple and then all tuples over K exactly (int128),
+converts once to FP32 (RNE) and adds srcdest (RNE, FTZ); any NaN among an
+element's operands, srcdest included, gives QNaN indefinite `0xFFC00000`.
+(A loop comment in the same pseudocode, "FP32 MUL with DAZ=1", contradicts
+both the description and the fixed-point computation it sits on.) Upstream
+widened FP8 → FP16 → FP32 under DAZ=1 and rounded after every multiply and
+add:
+
+| 1×1 tile | ISE | Upstream |
+|---|---|---|
+| `tdpbf8ps` 2⁻¹⁶ (BF8 denormal) × 1.0 | 2⁻¹⁶ | 0 |
+| 2³⁰ + 2⁻¹⁰ − 2³⁰, in one 4-tuple or across K | 2⁻¹⁰ | 0 |
+| a NaN in src1, src2 or srcdest | `0xFFC00000` | the NaN with its payload |
+
+HF8 denormals were unaffected: they widen to normal FP16. Found 2026-09-29
+while checking the FP8 instructions against their specs.
+
+Fixed by
+[`patches/bochs/0021-amx-fp8-exact-dot-product.patch`](../patches/bochs/0021-amx-fp8-exact-dot-product.patch)
+(`avx/amx.cc`): the four handlers share one routine that decodes FP8 to
+integers (units of 2⁻¹⁶ for BF8, 2⁻⁹ for HF8), sums the products in a 128-bit
+two's complement accumulator made of two `Bit64u` (no `__int128`, for MSVC),
+tracks NaN and ±∞ per element, rounds the sum to FP32 once and adds srcdest
+with DAZ=0, FTZ=1, RNE. A randomized comparison against an exact model of the
+ISE pseudocode — 6000 1×1×K tiles, K = 1..4, all four forms, with denormals,
+infinities, NaNs and constructed cancellations — went from about 950
+mismatches per form to none. `tests/bochs_patches.rs` pins the cases above
+plus inf × 0, +∞ + −∞, an infinite sum, −0 plus an exact zero, both mixed
+forms, and two controls. Still present on upstream master as of 2026-09-29
+(`4b46aea`). No AMX-FP8 silicon was available.
+
+The AVX10.2 FP8 conversions were checked in the same pass and are as
+specified: an exhaustive comparison of all 65536 FP16 inputs (with seven
+biases each for the `vcvtbiasph2*` forms, and all 256 inputs of `vcvthf82ph`)
+against the helper pseudocode of AVX10.2 spec chapter 5, under randomly
+chosen MXCSR values, found no difference, no MXCSR flag set and the upper
+half of the destination zeroed.
+
+## 4af. `TCVTROWPS2PH[H,L]` flushed FP16 denormal results — patched (Bochs)
+
+ISE 319433-057: "Input FP32 denormals become FP16 zeros on outputs. This
+instruction can produce FP16 denormal outputs." Upstream converted with
+DAZ=1 and FTZ=1, so every FP16 denormal result became zero: 2⁻¹⁵, 2⁻¹⁶ and
+2⁻²⁴ gave 0 instead of `0x0200`, `0x0100` and `0x0001`.
+[`patches/bochs/0022-tcvtrowps2ph-fp16-denormals.patch`](../patches/bochs/0022-tcvtrowps2ph-fp16-denormals.patch)
+(`avx/amx_avx512.cc`) keeps DAZ=1 and sets FTZ=0. `tests/bochs_patches.rs`
+pins those three, an FP32 denormal (still 0) and 1.0 in both the H and L
+forms. Still present on upstream master as of 2026-09-29 (`4b46aea`). No
+AMX-AVX512 silicon was available.
+
+## 4ag. `TCMMRLFP16PS` kept the sign of a NaN in src1's imaginary part — patched (Bochs)
+
+ISE 319433-057 pseudocode negates the FP16 input before the FMA:
+`s1o = cvt_fp16_to_fp32(-tsrc1.row[m].fp16[2*k+1])`. Upstream negated the
+product instead (`softfloat_muladd_negate_product`). Numbers and zeros come
+out the same either way, but softfloat returns a NaN operand unchanged, so a
+NaN there kept its sign: `0x7E00` gave `0x7FC00000` where the pseudocode gives
+`0xFFC00000`, and `0xFE00` the reverse.
+[`patches/bochs/0023-tcmmrlfp16ps-negate-imaginary-input.patch`](../patches/bochs/0023-tcmmrlfp16ps-negate-imaginary-input.patch)
+(`avx/amx.cc`) flips the FP16 sign bit before the conversion.
+`tests/bochs_patches.rs` pins both NaN signs, a numeric control, and
+`tcmmimfp16ps` (no negation) as a second control. This follows the pseudocode
+as written; no AMX-COMPLEX silicon was available to confirm that hardware
+flips the NaN's sign. Still present on upstream master as of 2026-09-29
+(`4b46aea`).
+
+Found 2026-09-29 while checking the other AMX floating-point instructions
+after §4ae. The rest match the SDM / ISE: `tdpbf16ps` (per-step FMA, DAZ=FTZ=1,
+RNE); `tdpfp16ps` and `tcmmimfp16ps` (FP16 denormal inputs kept, FP32
+accumulation with DAZ=FTZ=1); `tcvtrowd2ps` (RNE); `tcvtrowps2bf16[h,l]` (the
+same conversion as `vcvtneps2bf16`, §4ad). The vendored Bochs does not
+implement AMX-TF32 or the transposing AMX instructions.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

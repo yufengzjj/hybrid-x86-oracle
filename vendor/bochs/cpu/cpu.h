@@ -2768,6 +2768,12 @@ public: // for now...
   BX_SMF void HANDLE_AVX_PFP_2OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
   template <xmm_pfp_3op func>
   BX_SMF void HANDLE_AVX_PFP_3OP(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+  template <xmm_pfp_1op func>
+  BX_SMF void HANDLE_AVX_PFP_1OP_HALF(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+  template <xmm_pfp_2op func>
+  BX_SMF void HANDLE_AVX_PFP_2OP_HALF(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
+  template <xmm_pfp_3op func>
+  BX_SMF void HANDLE_AVX_PFP_3OP_HALF(bxInstruction_c *) BX_CPP_AttrRegparmN(1);
 
   BX_SMF void VMOVSS_VssHpsWssR(bxInstruction_c *i) BX_CPP_AttrRegparmN(1);
   BX_SMF void VMOVSD_VsdHpdWsdR(bxInstruction_c *i) BX_CPP_AttrRegparmN(1);

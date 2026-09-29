@@ -25,6 +25,7 @@
 #include "cpu/softfloat3e/include/softfloat.h"
 
 extern softfloat_status_t mxcsr_to_softfloat_status_word(bx_mxcsr_t mxcsr);
+extern softfloat_status_t mxcsr_to_softfloat_status_word_fp16(bx_mxcsr_t mxcsr);
 
 #if BX_SUPPORT_EVEX == 0
 #define softfloat_status_word_rc_override(status, i)
@@ -117,6 +118,62 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_PFP_3OP(bxInstruction_c *i)
   BX_NEXT_INSTR(i);
 }
 
+// FP16 twins of the three templates above: same body, but MXCSR.DAZ/FTZ do not apply to FP16
+template <xmm_pfp_1op func>
+void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_PFP_1OP_HALF(bxInstruction_c *i)
+{
+  BxPackedAvxRegister op = BX_READ_AVX_REG(i->src());
+  unsigned len = i->getVL();
+
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
+  softfloat_status_word_rc_override(status, i);
+
+  for (unsigned n=0; n < len; n++) {
+    (func)(&op.vmm128(n), status);
+  }
+
+  check_exceptionsSSE(softfloat_getExceptionFlags(&status));
+  BX_WRITE_AVX_REGZ(i->dst(), op, len);
+  BX_NEXT_INSTR(i);
+}
+
+template <xmm_pfp_2op func>
+void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_PFP_2OP_HALF(bxInstruction_c *i)
+{
+  BxPackedAvxRegister op1 = BX_READ_AVX_REG(i->src1()), op2 = BX_READ_AVX_REG(i->src2());
+  unsigned len = i->getVL();
+
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
+  softfloat_status_word_rc_override(status, i);
+
+  for (unsigned n=0; n < len; n++) {
+    (func)(&op1.vmm128(n), &op2.vmm128(n), status);
+  }
+
+  check_exceptionsSSE(softfloat_getExceptionFlags(&status));
+  BX_WRITE_AVX_REGZ(i->dst(), op1, len);
+  BX_NEXT_INSTR(i);
+}
+
+template <xmm_pfp_3op func>
+void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX_PFP_3OP_HALF(bxInstruction_c *i)
+{
+  BxPackedAvxRegister op1 = BX_READ_AVX_REG(i->src1());
+  BxPackedAvxRegister op2 = BX_READ_AVX_REG(i->src2());
+  BxPackedAvxRegister op3 = BX_READ_AVX_REG(i->src3());
+  unsigned len = i->getVL();
+
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
+  softfloat_status_word_rc_override(status, i);
+
+  for (unsigned n=0; n < len; n++)
+    (func)(&op1.vmm128(n), &op2.vmm128(n), &op3.vmm128(n), status);
+
+  check_exceptionsSSE(softfloat_getExceptionFlags(&status));
+  BX_WRITE_AVX_REGZ(i->dst(), op1, len);
+  BX_NEXT_INSTR(i);
+}
+
 #if BX_SUPPORT_EVEX
 
 #include "simd_int.h"
@@ -128,7 +185,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_MASK_PFP_1OP_HALF(bxInstruct
   unsigned mask = BX_READ_32BIT_OPMASK(i->opmask());
   unsigned len = i->getVL();
 
-  softfloat_status_t status = mxcsr_to_softfloat_status_word(MXCSR);
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
   softfloat_status_word_rc_override(status, i);
 
   for (unsigned n=0, tmp_mask = mask; n < len; n++, tmp_mask >>= 8)
@@ -258,7 +315,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_MASK_PFP_2OP_HALF(bxInstruct
   unsigned mask = BX_READ_32BIT_OPMASK(i->opmask());
   unsigned len = i->getVL();
 
-  softfloat_status_t status = mxcsr_to_softfloat_status_word(MXCSR);
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
   softfloat_status_word_rc_override(status, i);
 
   for (unsigned n=0, tmp_mask = mask; n < len; n++, tmp_mask >>= 8)
@@ -342,7 +399,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::HANDLE_AVX512_MASK_PFP_3OP_HALF(bxInstruct
   unsigned mask = BX_READ_32BIT_OPMASK(i->opmask());
   unsigned len = i->getVL();
 
-  softfloat_status_t status = mxcsr_to_softfloat_status_word(MXCSR);
+  softfloat_status_t status = mxcsr_to_softfloat_status_word_fp16(MXCSR);
   softfloat_status_word_rc_override(status, i);
 
   for (unsigned n=0, tmp_mask = mask; n < len; n++, tmp_mask >>= 8)

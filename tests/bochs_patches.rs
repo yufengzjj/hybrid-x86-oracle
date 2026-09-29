@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j and §4k–§4z are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ag are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -2254,4 +2254,363 @@ fn tile_store_with_no_sib_index_uses_stride_0() {
     cpu.set_gpr(R12, 64);
     run(&mut cpu, &[&TILELOADD_TMM0_RDI_RSI[..], &[0xC4, 0xA2, 0x7A, 0x4B, 0x04, 0x21]].concat(), 2);
     assert_eq!(read_rows(&cpu, TILE_OUT), consecutive, "tilestored [rcx+r12], tmm0");
+}
+
+// ---------------------------------------------------------------------------
+// §4aa: VRANGE* MIN_ABS / MAX_ABS on equal magnitudes.
+//
+// SDM Tables 5-24 and 5-25: when |src1| = |src2| with opposite signs, MIN_ABS
+// returns the negative operand and MAX_ABS the positive one, whichever
+// position it is in. Upstream picked by position (src2 for MIN_ABS, src1 for
+// MAX_ABS), wrong whenever src1 is the negative one.
+// `patches/bochs/0017-vrange-abs-equal-magnitude.patch` is what makes these pass.
+
+/// `op xmm0, xmm1, xmm2, imm8` with imm8[1:0] = 10 (MIN_ABS) or 11 (MAX_ABS)
+/// and imm8[3:2] = 01, the sign of the compare result: the other three sign
+/// controls rewrite the sign bit, and on a tie that is all that differs.
+/// Element 0 only; the packed forms use the same helper for every element.
+#[test]
+fn vrange_abs_min_max_break_ties_by_sign() {
+    // (mnemonic, opcode, EVEX P1: W · vvvv = xmm1 · 66, is double)
+    const FORMS: &[(&str, u8, u8, bool)] = &[
+        ("vrangeps", 0x50, 0x75, false),
+        ("vrangepd", 0x50, 0xF5, true),
+        ("vrangess", 0x51, 0x75, false),
+        ("vrangesd", 0x51, 0xF5, true),
+    ];
+    // (src1, src2, MIN_ABS result, MAX_ABS result); the last row is the unequal-magnitude control
+    const CASES: &[(f64, f64, f64, f64)] = &[
+        (-2.0, 2.0, -2.0, 2.0),
+        (2.0, -2.0, -2.0, 2.0),
+        (-0.0, 0.0, -0.0, 0.0),
+        (0.0, -0.0, -0.0, 0.0),
+        (-3.0, 2.0, 2.0, -3.0),
+    ];
+    let mut cpu = BochsOracle::new();
+    for (name, op, p1, is_double) in FORMS {
+        let bits = |x: f64| if *is_double { x.to_bits() } else { u64::from((x as f32).to_bits()) };
+        for (src1, src2, min_abs, max_abs) in CASES {
+            for (imm, want) in [(0x06u8, min_abs), (0x07, max_abs)] {
+                let mut v1 = [0u64; ZMM_CHUNKS];
+                let mut v2 = [0u64; ZMM_CHUNKS];
+                v1[0] = bits(*src1);
+                v2[0] = bits(*src2);
+                cpu.set_zmm(1, &v1);
+                cpu.set_zmm(2, &v2);
+                run(&mut cpu, &[0x62, 0xF3, *p1, 0x08, *op, 0xC2, imm], 1);
+                let got = cpu.get_zmm(0)[0];
+                let got = if *is_double { got } else { got & 0xFFFF_FFFF };
+                assert_eq!(got, bits(*want), "{name} xmm0, {src1:+}, {src2:+}, {imm:#04x}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ab: FP16 operands ignore MXCSR.DAZ and MXCSR.FTZ.
+//
+// AVX512-FP16 spec, chapter 4: FP16 inputs are never treated as zero and FP16
+// results never flushed to zero; only FP32/FP64 inputs of a conversion obey
+// DAZ. Upstream built every FP16 handler's softfloat status straight from
+// MXCSR, so with DAZ or FTZ set nearly every AVX512-FP16 instruction (and
+// VMINMAXPH/SH) changed its result or its MXCSR flags.
+// `patches/bochs/0018-fp16-ignore-mxcsr-daz-ftz.patch` is what makes these pass.
+
+const MXCSR_AT: u64 = 0x26_0000;
+const MXCSR_DEFAULT: u32 = 0x1F80;
+const MXCSR_DAZ: u32 = 0x0040;
+const MXCSR_FTZ: u32 = 0x8000;
+
+fn fp16_lanes(lanes: [u16; 4]) -> [u64; ZMM_CHUNKS] {
+    [lanes.iter().enumerate().fold(0, |acc, (i, l)| acc | u64::from(*l) << (16 * i)); ZMM_CHUNKS]
+}
+
+/// `ldmxcsr`, set zmm0..2, run `code`, then read back what an FP instruction
+/// can change: zmm0, k0 (through rcx), rax, the arithmetic RFLAGS and the six
+/// MXCSR flags.
+fn run_under_mxcsr(cpu: &mut BochsOracle, code: &[u8], mxcsr: u32, zmm: &[[u64; ZMM_CHUNKS]; 3]) -> ([u64; ZMM_CHUNKS], u64, u64, u64, u32) {
+    for (n, v) in zmm.iter().enumerate() {
+        cpu.set_zmm(n as u32, v);
+    }
+    cpu.write_mem(MXCSR_AT, &mxcsr.to_le_bytes());
+    cpu.set_gpr(RSI, MXCSR_AT);
+    run(cpu, &[0x0F, 0xAE, 0x16], 1); // ldmxcsr [rsi]
+    cpu.set_gpr(RAX, 0);
+    cpu.set_rflags(0x2);
+    run(cpu, code, 1);
+    let (zmm0, rax, rflags) = (cpu.get_zmm(0), cpu.get_gpr(RAX), cpu.get_rflags() & 0x8D5);
+    run(cpu, &[0x0F, 0xAE, 0x1E, 0xC4, 0xE1, 0xFB, 0x93, 0xC8], 2); // stmxcsr [rsi]; kmovq rcx, k0
+    let mut m = [0u8; 4];
+    cpu.read_mem(MXCSR_AT, &mut m);
+    (zmm0, cpu.get_gpr(RCX), rax, rflags, u32::from_le_bytes(m) & 0x3F)
+}
+
+/// One representative per handler family, encodings as binutils 2.45
+/// assembles them: the unmasked and the {k1} packed templates, the scalar
+/// macros (including the unmasked scalar FMA, which lives in avx_fma.cc),
+/// the complex, compare, fpclass, rcp/rsqrt, minmax and conversion handlers.
+/// The flag marks an FP32 source, whose DAZ is honoured: only FTZ must not matter.
+const FP16_MXCSR_CASES: &[(&str, &[u8], bool)] = &[
+    ("vaddph xmm0, xmm2, xmm1", &[0x62, 0xF5, 0x6C, 0x08, 0x58, 0xC1], false),
+    ("vaddph xmm0{k1}, xmm2, xmm1", &[0x62, 0xF5, 0x6C, 0x09, 0x58, 0xC1], false),
+    ("vaddsh xmm0, xmm2, xmm1", &[0x62, 0xF5, 0x6E, 0x08, 0x58, 0xC1], false),
+    ("vmulph xmm0, xmm2, xmm1", &[0x62, 0xF5, 0x6C, 0x08, 0x59, 0xC1], false),
+    ("vfmadd231ph xmm0, xmm2, xmm1", &[0x62, 0xF6, 0x6D, 0x08, 0xB8, 0xC1], false),
+    ("vfmadd213sh xmm0, xmm2, xmm1", &[0x62, 0xF6, 0x6D, 0x08, 0xA9, 0xC1], false),
+    ("vfmadd213sh xmm0{k1}, xmm2, xmm1", &[0x62, 0xF6, 0x6D, 0x09, 0xA9, 0xC1], false),
+    ("vfmaddcph xmm0, xmm2, xmm1", &[0x62, 0xF6, 0x6E, 0x08, 0x56, 0xC1], false),
+    ("vscalefsh xmm0, xmm2, xmm1", &[0x62, 0xF6, 0x6D, 0x08, 0x2D, 0xC1], false),
+    ("vsqrtph xmm0, xmm1", &[0x62, 0xF5, 0x7C, 0x08, 0x51, 0xC1], false),
+    ("vgetexpph xmm0, xmm1", &[0x62, 0xF6, 0x7D, 0x08, 0x42, 0xC1], false),
+    ("vgetmantph xmm0, xmm1, 3", &[0x62, 0xF3, 0x7C, 0x08, 0x26, 0xC1, 0x03], false),
+    ("vreduceph xmm0, xmm1, 3", &[0x62, 0xF3, 0x7C, 0x08, 0x56, 0xC1, 0x03], false),
+    ("vrndscalesh xmm0, xmm2, xmm1, 3", &[0x62, 0xF3, 0x6C, 0x08, 0x0A, 0xC1, 0x03], false),
+    ("vrcpph xmm0, xmm1", &[0x62, 0xF6, 0x7D, 0x08, 0x4C, 0xC1], false),
+    ("vrsqrtph xmm0, xmm1", &[0x62, 0xF6, 0x7D, 0x08, 0x4E, 0xC1], false),
+    ("vminmaxph xmm0, xmm2, xmm1, 3", &[0x62, 0xF3, 0x6C, 0x08, 0x52, 0xC1, 0x03], false),
+    ("vcmpeqph k0, xmm2, xmm1", &[0x62, 0xF3, 0x6C, 0x08, 0xC2, 0xC1, 0x00], false),
+    ("vcomish xmm0, xmm1", &[0x62, 0xF5, 0x7C, 0x08, 0x2F, 0xC1], false),
+    ("vcomxsh xmm0, xmm1", &[0x62, 0xF5, 0x7E, 0x08, 0x2F, 0xC1], false),
+    ("vfpclassph k0, xmm1, 0x20", &[0x62, 0xF3, 0x7C, 0x08, 0x66, 0xC1, 0x20], false),
+    ("vcvtph2w xmm0, xmm1", &[0x62, 0xF5, 0x7D, 0x08, 0x7D, 0xC1], false),
+    ("vcvtph2ibs xmm0, xmm1", &[0x62, 0xF5, 0x7C, 0x08, 0x69, 0xC1], false),
+    ("vcvtsh2si rax, xmm1", &[0x62, 0xF5, 0xFE, 0x08, 0x2D, 0xC1], false),
+    ("vcvtph2psx xmm0, xmm1", &[0x62, 0xF6, 0x7D, 0x08, 0x13, 0xC1], false),
+    ("vcvtps2phx xmm0, xmm1", &[0x62, 0xF5, 0x7D, 0x08, 0x1D, 0xC1], true),
+    ("vcvtss2sh xmm0, xmm2, xmm1", &[0x62, 0xF5, 0x6C, 0x08, 0x1D, 0xC1], true),
+];
+
+/// Every case, on inputs where DAZ or FTZ would change something: FP16
+/// denormals in every lane, element 0 set up so 2^-14 × 0.5 and a scalef of a
+/// denormal by 4.0 land on denormal results, and for the FP32 sources 2^-20,
+/// whose FP16 conversion is denormal. The result and the MXCSR flags must be
+/// the same under DAZ, FTZ and both as under the default MXCSR.
+#[test]
+fn fp16_instructions_ignore_mxcsr_daz_and_ftz() {
+    let fp16_inputs = [
+        [fp16_lanes([0x0001, 0x0001, 0x8001, 0x0001]), fp16_lanes([0x0400, 0x0001, 0x03FF, 0x8001]), fp16_lanes([0x3800, 0x0001, 0x0001, 0x0200])],
+        [[0; ZMM_CHUNKS], fp16_lanes([0x4400; 4]), fp16_lanes([0x0001, 0x8001, 0x0010, 0x0001])],
+        [fp16_lanes([0x0001, 0x8001, 0x0001, 0x8001]), fp16_lanes([0x0001, 0x03FF, 0x8001, 0x0200]), fp16_lanes([0x0001, 0x0200, 0x8003, 0x03FF])],
+    ];
+    let fp32_inputs = [[[0; ZMM_CHUNKS], [0x3380_0000_3580_0000; ZMM_CHUNKS], [0x3580_0000_3F00_0000; ZMM_CHUNKS]]];
+    let mut cpu = BochsOracle::new();
+    run(&mut cpu, &[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC4, 0xE1, 0xFB, 0x92, 0xC8], 2); // mov rax, -1; kmovq k1, rax
+    for (name, code, fp32_source) in FP16_MXCSR_CASES {
+        let (inputs, variants): (&[_], &[_]) = if *fp32_source {
+            (&fp32_inputs, &[MXCSR_FTZ])
+        } else {
+            (&fp16_inputs, &[MXCSR_DAZ, MXCSR_FTZ, MXCSR_DAZ | MXCSR_FTZ])
+        };
+        for zmm in inputs {
+            let base = run_under_mxcsr(&mut cpu, code, MXCSR_DEFAULT, zmm);
+            for bits in variants {
+                let got = run_under_mxcsr(&mut cpu, code, MXCSR_DEFAULT | bits, zmm);
+                assert_eq!(got, base, "{name} with MXCSR {:#06x}, zmm1 = {:#018x}, zmm2 = {:#018x}", MXCSR_DEFAULT | bits, zmm[1][0], zmm[2][0]);
+            }
+        }
+    }
+}
+
+/// The absolute values behind the comparison above, under DAZ and FTZ both
+/// set: a denormal plus a denormal stays denormal, and 2^-14 × 0.5 = 2^-15 is
+/// not flushed.
+#[test]
+fn fp16_denormals_survive_daz_and_ftz() {
+    let mut cpu = BochsOracle::new();
+    let zmm = [[0; ZMM_CHUNKS], fp16_lanes([0x0400, 0x0001, 0, 0]), fp16_lanes([0x3800, 0x0001, 0, 0])];
+    let mxcsr = MXCSR_DEFAULT | MXCSR_DAZ | MXCSR_FTZ;
+    let (sum, ..) = run_under_mxcsr(&mut cpu, &[0x62, 0xF5, 0x6C, 0x08, 0x58, 0xC1], mxcsr, &zmm);
+    assert_eq!(sum[0] >> 16 & 0xFFFF, 0x0002, "vaddph: 2^-24 + 2^-24");
+    let (product, ..) = run_under_mxcsr(&mut cpu, &[0x62, 0xF5, 0x6C, 0x08, 0x59, 0xC1], mxcsr, &zmm);
+    assert_eq!(product[0] & 0xFFFF, 0x0200, "vmulph: 2^-14 * 0.5");
+}
+
+// ---------------------------------------------------------------------------
+// §4ac: VCVT2PS2PHX sets its MXCSR flags.
+//
+// The AVX10.2 spec: the instruction updates MXCSR as if all exceptions were
+// masked and never raises one; it can set DE, IE, OE, PE and UE. Upstream
+// suppressed every flag, so MXCSR never changed.
+// `patches/bochs/0019-vcvt2ps2phx-mxcsr-flags.patch` is what makes this pass.
+
+/// 1/3 is inexact in FP16, so PE must be set, and with PE unmasked in MXCSR
+/// the instruction must still retire rather than raise #XM.
+#[test]
+fn vcvt2ps2phx_sets_mxcsr_flags_without_faulting() {
+    const VCVT2PS2PHX: [u8; 6] = [0x62, 0xF2, 0x6D, 0x08, 0x67, 0xC1]; // vcvt2ps2phx xmm0, xmm2, xmm1
+    let third = [0x3EAA_AAAB_3EAA_AAAB; ZMM_CHUNKS];
+    let mut cpu = BochsOracle::new();
+    for mxcsr in [MXCSR_DEFAULT, MXCSR_DEFAULT & !0x1000] {
+        let (.., flags) = run_under_mxcsr(&mut cpu, &VCVT2PS2PHX, mxcsr, &[[0; ZMM_CHUNKS], third, third]);
+        assert_eq!(flags, 0x20, "vcvt2ps2phx 1/3 with MXCSR {mxcsr:#06x}: PE only");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ad: VMINBF16 / VMAXBF16 return SRC2 bit for bit.
+//
+// AVX10.2 pseudocode, as MINPS/MAXPS: two zeros, a NaN on either side, or a
+// tie all return SRC2 unchanged (DAZ applies to the inputs). Upstream routed
+// the result through the FP32 -> BF16 conversion, which quiets any NaN, so an
+// SNaN SRC2 came back as a QNaN.
+// `patches/bochs/0020-bf16-min-max-return-src2.patch` is what makes this pass.
+
+/// `op xmm0, xmm2, xmm1`: src1 = xmm2, src2 = xmm1, element 0.
+#[test]
+fn bf16_min_max_return_src2_bit_for_bit() {
+    const VMINBF16: [u8; 6] = [0x62, 0xF5, 0x6D, 0x08, 0x5D, 0xC1];
+    const VMAXBF16: [u8; 6] = [0x62, 0xF5, 0x6D, 0x08, 0x5F, 0xC1];
+    // (src1, src2, min result, max result)
+    const CASES: &[(u16, u16, u16, u16)] = &[
+        (0x3F80, 0x7F81, 0x7F81, 0x7F81), // 1.0, SNaN: the SNaN as is
+        (0x7F81, 0x3F80, 0x3F80, 0x3F80), // SNaN, 1.0: SRC2
+        (0x3F80, 0x7FC1, 0x7FC1, 0x7FC1), // 1.0, QNaN
+        (0x7FC2, 0x7F81, 0x7F81, 0x7F81), // QNaN, SNaN: SRC2
+        (0x0000, 0x8000, 0x8000, 0x8000), // +0, -0: SRC2
+        (0x8000, 0x0000, 0x0000, 0x0000), // -0, +0: SRC2
+        (0x0000, 0x8001, 0x8000, 0x8000), // +0, -denormal: DAZ, then SRC2
+        (0x3F80, 0x4000, 0x3F80, 0x4000), // 1.0, 2.0
+        (0x4000, 0x3F80, 0x3F80, 0x4000), // 2.0, 1.0
+    ];
+    let mut cpu = BochsOracle::new();
+    for (src1, src2, want_min, want_max) in CASES {
+        for (name, code, want) in [("vminbf16", VMINBF16, want_min), ("vmaxbf16", VMAXBF16, want_max)] {
+            let (mut v1, mut v2) = ([0u64; ZMM_CHUNKS], [0u64; ZMM_CHUNKS]);
+            v1[0] = u64::from(*src2);
+            v2[0] = u64::from(*src1);
+            cpu.set_zmm(1, &v1);
+            cpu.set_zmm(2, &v2);
+            run(&mut cpu, &code, 1);
+            assert_eq!(cpu.get_zmm(0)[0] & 0xFFFF, u64::from(*want), "{name} {src1:#06x}, {src2:#06x}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ae: AMX-FP8 dot products are exact, keep FP8 denormals, and turn any NaN
+// into QNaN indefinite.
+//
+// ISE 319433-057, TDP[B,H,BH,HB]F8PS: products and their sum over K are exact
+// (int128), converted to FP32 once and added to srcdest; inputs are not DAZ'd;
+// a NaN anywhere in an element's operands gives 0xFFC00000. Upstream went
+// through FP32 with DAZ=1 and rounded after every multiply and add.
+// `patches/bochs/0021-amx-fp8-exact-dot-product.patch` is what makes this pass.
+
+/// C (1 x 1 FP32) = C + A (1 x 4k FP8) . B (k x 4 FP8), `pp` selecting the
+/// form: NP = tdpbf8ps, 66 = tdphf8ps, F3 = tdphbf8ps, F2 = tdpbhf8ps.
+fn amx_fp8_dot(pp: u8, a: &[u8], b: &[u8], c: u32) -> u32 {
+    let k = a.len() / 4;
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(1, 4), (1, a.len() as u16), (k as u8, 4)]));
+    cpu.write_mem(TILE_OUT, &c.to_le_bytes());
+    cpu.write_mem(TILE_A, a);
+    cpu.write_mem(TILE_B, b);
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RSI, 4);
+    cpu.set_gpr(RDI, TILE_OUT);
+    run(&mut cpu, &[LDTILECFG_RBX.as_slice(), &TILELOADD_TMM0_RDI_RSI].concat(), 2);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RDX, TILE_B);
+    cpu.set_gpr(RCX, TILE_OUT);
+    let tdp = [0xC4, 0xE5, 0x68 | pp, 0xFD, 0xC1]; // tdp??f8ps tmm0, tmm1, tmm2
+    run(&mut cpu, &[TILELOADD_TMM1_RDI_RSI.as_slice(), &TILELOADD_TMM2_RDX_RSI, &tdp, &TILESTORED_RCX_RSI_TMM0].concat(), 4);
+    cpu.read_mem_u64(TILE_OUT) as u32
+}
+
+/// BF8: 1.0 = 3C, 2^15 = 78, 2^-5 = 28, min denormal 2^-16 = 01, +inf = 7C,
+/// NaN = 7D. HF8: 1.0 = 38, min denormal 2^-9 = 01, NaN = 7F.
+#[test]
+fn amx_fp8_dot_products_follow_the_ise() {
+    const CASES: &[(&str, u8, &[u8], &[u8], u32, u32)] = &[
+        ("bf8 denormal 2^-16 * 1.0 is not DAZ'd", 0, &[0x01, 0, 0, 0], &[0x3C, 0, 0, 0], 0, 0x3780_0000),
+        ("bf8 denormal x hf8 1.0 (tdpbhf8ps)", 3, &[0x01, 0, 0, 0], &[0x38, 0, 0, 0], 0, 0x3780_0000),
+        ("hf8 1.0 x bf8 denormal (tdphbf8ps)", 2, &[0x38, 0, 0, 0], &[0x01, 0, 0, 0], 0, 0x3780_0000),
+        ("hf8 denormal 2^-9 * 1.0 (control)", 1, &[0x01, 0, 0, 0], &[0x38, 0, 0, 0], 0, 0x3B00_0000),
+        ("2^30 + 2^-10 - 2^30 within one 4-tuple", 0, &[0x78, 0x28, 0xF8, 0], &[0x78, 0x28, 0x78, 0], 0, 0x3A80_0000),
+        ("2^30 + 2^-10 - 2^30 across k", 0, &[0x78, 0x28, 0, 0, 0xF8, 0, 0, 0], &[0x78, 0x28, 0, 0, 0x78, 0, 0, 0], 0, 0x3A80_0000),
+        ("NaN in src1", 0, &[0x7D, 0, 0, 0], &[0x3C, 0, 0, 0], 0, 0xFFC0_0000),
+        ("NaN in src2 (hf8)", 1, &[0x38, 0, 0, 0], &[0x7F, 0, 0, 0], 0, 0xFFC0_0000),
+        ("NaN in srcdest", 0, &[0x3C, 0, 0, 0], &[0x3C, 0, 0, 0], 0x7FC0_1234, 0xFFC0_0000),
+        ("inf * 0", 0, &[0x7C, 0, 0, 0], &[0x00, 0, 0, 0], 0, 0xFFC0_0000),
+        ("+inf + -inf", 0, &[0x7C, 0xFC, 0, 0], &[0x3C, 0x3C, 0, 0], 0, 0xFFC0_0000),
+        ("+inf * 1.0 + 1.0", 0, &[0x7C, 0, 0, 0], &[0x3C, 0, 0, 0], 0x3F80_0000, 0x7F80_0000),
+        ("-0 + exact zero sum is +0", 0, &[0x3C, 0xBC, 0, 0], &[0x3C, 0x3C, 0, 0], 0x8000_0000, 0x0000_0000),
+        ("1.0 * 1.0 + 1.0 (control)", 0, &[0x3C, 0, 0, 0], &[0x3C, 0, 0, 0], 0x3F80_0000, 0x4000_0000),
+    ];
+    for (label, pp, a, b, c, want) in CASES {
+        assert_eq!(amx_fp8_dot(*pp, a, b, *c), *want, "{label}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4af: TCVTROWPS2PH[H,L] keep FP16 denormal results.
+//
+// ISE 319433-057: "Input FP32 denormals become FP16 zeros on outputs. This
+// instruction can produce FP16 denormal outputs." Upstream converted with
+// FTZ=1 and flushed them.
+// `patches/bochs/0022-tcvtrowps2ph-fp16-denormals.patch` is what makes this pass.
+
+#[test]
+fn tcvtrowps2ph_keeps_fp16_denormal_results() {
+    // 2^-15, 2^-16, 2^-24 (FP16 denormals), an FP32 denormal, 1.0
+    let row: [u32; 16] = [0x3800_0000, 0x3780_0000, 0x3380_0000, 0x0000_0001, 0x3F80_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let want: [u32; 5] = [0x0200, 0x0100, 0x0001, 0, 0x3C00];
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(1, 64), (1, 64)]));
+    cpu.write_mem(TILE_A, &row.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RSI, 64);
+    cpu.set_gpr(RCX, 0);
+    run(&mut cpu, &[LDTILECFG_RBX.as_slice(), &TILELOADD_TMM1_RDI_RSI].concat(), 2);
+    // tcvtrowps2ph{h,l} zmm2, tmm1, ecx
+    for (name, pp, shift) in [("tcvtrowps2phh", 0u8, 16), ("tcvtrowps2phl", 1, 0)] {
+        run(&mut cpu, &[0x62, 0xF2, 0x74 | pp, 0x48, 0x6D, 0xD1], 1);
+        let z = cpu.get_zmm(2);
+        let got: Vec<u32> = (0..5).map(|n| (z[n / 2] >> (32 * (n % 2))) as u32).collect();
+        let want: Vec<u32> = want.iter().map(|w| w << shift).collect();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ag: TCMMRLFP16PS negates the FP16 imaginary part of src1, NaN included.
+//
+// ISE 319433-057 pseudocode: s1o = cvt_fp16_to_fp32(-tsrc1.fp16[2*k+1]), so a
+// NaN there comes out with its sign flipped. Upstream negated the product
+// instead, which leaves a NaN operand as it was.
+// `patches/bochs/0023-tcmmrlfp16ps-negate-imaginary-input.patch` is what makes this pass.
+
+/// C (1 x 1 FP32) += op(A, B), A and B one complex FP16 pair each (real in
+/// the low word). `pp` 0 = tcmmrlfp16ps, 1 = tcmmimfp16ps.
+fn amx_complex_fp16(pp: u8, a: u32, b: u32, c: u32) -> u32 {
+    let mut cpu = BochsOracle::new();
+    cpu.write_mem(CFG_IN, &tilecfg(&[(1, 4), (1, 4), (1, 4)]));
+    cpu.write_mem(TILE_OUT, &c.to_le_bytes());
+    cpu.write_mem(TILE_A, &a.to_le_bytes());
+    cpu.write_mem(TILE_B, &b.to_le_bytes());
+    cpu.set_gpr(RBX, CFG_IN);
+    cpu.set_gpr(RSI, 4);
+    cpu.set_gpr(RDI, TILE_OUT);
+    run(&mut cpu, &[LDTILECFG_RBX.as_slice(), &TILELOADD_TMM0_RDI_RSI].concat(), 2);
+    cpu.set_gpr(RDI, TILE_A);
+    cpu.set_gpr(RDX, TILE_B);
+    cpu.set_gpr(RCX, TILE_OUT);
+    let tcmm = [0xC4, 0xE2, 0x68 | pp, 0x6C, 0xC1]; // tcmm??fp16ps tmm0, tmm1, tmm2
+    run(&mut cpu, &[TILELOADD_TMM1_RDI_RSI.as_slice(), &TILELOADD_TMM2_RDX_RSI, &tcmm, &TILESTORED_RCX_RSI_TMM0].concat(), 4);
+    cpu.read_mem_u64(TILE_OUT) as u32
+}
+
+#[test]
+fn tcmmrlfp16ps_negates_imaginary_src1_nan_included() {
+    const ONE_ONE: u32 = 0x3C00_3C00; // 1 + 1i
+    const CASES: &[(&str, u8, u32, u32)] = &[
+        ("rl: +NaN imaginary src1", 0, 0x7E00_0000, 0xFFC0_0000),
+        ("rl: -NaN imaginary src1", 0, 0xFE00_0000, 0x7FC0_0000),
+        ("rl: 0 + 1i (control)", 0, 0x3C00_0000, 0xBF80_0000),
+        ("im: +NaN imaginary src1 is not negated (control)", 1, 0x7E00_0000, 0x7FC0_0000),
+    ];
+    for (label, pp, a, want) in CASES {
+        assert_eq!(amx_complex_fp16(*pp, *a, ONE_ONE, 0), *want, "{label}");
+    }
 }

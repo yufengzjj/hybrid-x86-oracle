@@ -1,0 +1,63 @@
+VRANGE* MIN_ABS / MAX_ABS broke equal-magnitude ties by position instead of by sign
+
+SDM (VRANGEPD/PS/SD/SS) Tables 5-24 and 5-25: when |src1| = |src2| and the
+signs differ (including +0 / -0), MIN_ABS returns the negative operand and
+MAX_ABS the positive one, whichever position it is in. f{16,32,64}_range
+cleared signA for the absolute compare, so on a tie `tmp_a < tmp_b` was
+false and MIN_ABS always returned src2, MAX_ABS always src1 — wrong whenever
+src1 is the negative one, e.g. vrangeps imm8=06h on (-2, +2) gave +2.
+Only visible with imm8[3:2] = 01 (sign of the compare result); the other
+sign controls rewrite the sign bit, and on a tie that is all that differs.
+
+signA now stays set on a tie, so the existing select picks by sign.
+
+Backport of upstream commit 04b100ae1f ("fix VRANGE* output when both
+arguments are different sign same magnitude ad ABS_MIN and ABS_MAX is
+requsted", 2026-08-30), plus a comment. Upstream has it, so a re-vendor
+at or past that commit should drop this patch.
+
+diff --git a/cpu/softfloat3e/f16_range.cc b/cpu/softfloat3e/f16_range.cc
+index 25bb1cc..6461c2f 100644
+--- a/cpu/softfloat3e/f16_range.cc
++++ b/cpu/softfloat3e/f16_range.cc
+@@ -107,7 +107,9 @@ float16 f16_range(float16 a, float16 b, bool is_max, bool is_abs, int sign_ctrl,
+         if (is_abs) {
+             tmp_a = tmp_a & ~0x8000; // clear the sign bit
+             tmp_b = tmp_b & ~0x8000;
+-            signA = 0;
++            // equal magnitudes: keeping signA makes MIN_ABS pick the negative one and MAX_ABS the positive one (SDM Table 5-25)
++            if (tmp_a != tmp_b)
++              signA = 0;
+         }
+ 
+         if (! is_max) {
+diff --git a/cpu/softfloat3e/f32_range.cc b/cpu/softfloat3e/f32_range.cc
+index bb1af93..4a44f40 100644
+--- a/cpu/softfloat3e/f32_range.cc
++++ b/cpu/softfloat3e/f32_range.cc
+@@ -107,7 +107,9 @@ float32 f32_range(float32 a, float32 b, bool is_max, bool is_abs, int sign_ctrl,
+         if (is_abs) {
+             tmp_a = tmp_a & ~0x80000000; // clear the sign bit
+             tmp_b = tmp_b & ~0x80000000;
+-            signA = 0;
++            // equal magnitudes: keeping signA makes MIN_ABS pick the negative one and MAX_ABS the positive one (SDM Table 5-25)
++            if (tmp_a != tmp_b)
++              signA = 0;
+         }
+         if (! is_max) {
+             z = (signA ^ (tmp_a < tmp_b)) ? a : b;
+diff --git a/cpu/softfloat3e/f64_range.cc b/cpu/softfloat3e/f64_range.cc
+index 1025f47..d44c9e6 100644
+--- a/cpu/softfloat3e/f64_range.cc
++++ b/cpu/softfloat3e/f64_range.cc
+@@ -107,7 +107,9 @@ float64 f64_range(float64 a, float64 b, bool is_max, bool is_abs, int sign_ctrl,
+         if (is_abs) {
+             tmp_a = tmp_a & ~UINT64_C(0x8000000000000000); // clear the sign bit
+             tmp_b = tmp_b & ~UINT64_C(0x8000000000000000);
+-            signA = 0;
++            // equal magnitudes: keeping signA makes MIN_ABS pick the negative one and MAX_ABS the positive one (SDM Table 5-25)
++            if (tmp_a != tmp_b)
++              signA = 0;
+         }
+ 
+         if (! is_max) {

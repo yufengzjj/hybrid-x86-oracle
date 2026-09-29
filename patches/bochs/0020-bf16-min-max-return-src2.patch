@@ -1,0 +1,40 @@
+VMINBF16 / VMAXBF16 quieted an SNaN SRC2 instead of returning it as is
+
+AVX10.2 spec, VMINBF16 / VMAXBF16 pseudocode (the MINPS/MAXPS rule): two
+zeros, a NaN in SRC1, or a NaN in SRC2 all give DEST := SRC2; DAZ applies
+to the inputs. bf16_min/bf16_max went through f32_min/f32_max and then
+convert_ne_fp32_to_bfloat16, which forces every NaN quiet, so
+vmaxbf16 1.0, SNaN returned 0x7FC1 instead of 0x7F81.
+
+They now flush denormal inputs and pick directly: SRC1 only on a strict
+win (bf16_compare is quiet, so a NaN compares unordered and falls through
+to SRC2), SRC2 bit for bit otherwise.
+
+Fixed in avx/bf16_arith.cc. Found 2026-09-29 while checking the AVX10.2
+BF16 instructions against their pseudocode.
+
+diff --git a/cpu/avx/bf16_arith.cc b/cpu/avx/bf16_arith.cc
+index c6ee45e..f77b76e 100644
+--- a/cpu/avx/bf16_arith.cc
++++ b/cpu/avx/bf16_arith.cc
+@@ -47,12 +47,18 @@ bfloat16 bf16_div(bfloat16 a, bfloat16 b) {
+   return convert_ne_fp32_to_bfloat16(f32_div(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
+ }
+ 
++// VMIN/VMAXBF16 pseudocode: every case but a strict win for SRC1 returns SRC2 bit for bit, so a
++// NaN SRC2 (an SNaN included) must not go through convert_ne_fp32_to_bfloat16, which quiets it.
+ bfloat16 bf16_min(bfloat16 a, bfloat16 b) {
+-  return convert_ne_fp32_to_bfloat16(f32_min(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
++  a = bf16_denormal_to_zero(a);
++  b = bf16_denormal_to_zero(b);
++  return (bf16_compare(a, b) == softfloat_relation_less) ? a : b;
+ }
+ 
+ bfloat16 bf16_max(bfloat16 a, bfloat16 b) {
+-  return convert_ne_fp32_to_bfloat16(f32_max(convert_bfloat16_to_fp32(a), convert_bfloat16_to_fp32(b), &tmp_status));
++  a = bf16_denormal_to_zero(a);
++  b = bf16_denormal_to_zero(b);
++  return (bf16_compare(a, b) == softfloat_relation_greater) ? a : b;
+ }
+ 
+ bfloat16 bf16_scalef(bfloat16 a, bfloat16 b) {

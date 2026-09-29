@@ -8514,7 +8514,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VRSQRTSH_MASK_VshHphWshR(bxInstruction_c *
 
   if (! i->opmask() || BX_SCALAR_ELEMENT_MASK(i->opmask())) {
     float16 op2 = BX_READ_XMM_REG_LO_WORD(i->src2());
-    op1.xmm16u(0) = approximate_rsqrt14(op2, MXCSR.get_DAZ());
+    op1.xmm16u(0) = approximate_rsqrt14(op2, false);
   }
   else {
     if (i->isZeroMasking())
@@ -8536,7 +8536,7 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VRSQRTPH_MASK_VphWphR(bxInstruction_c *i)
 
   for (unsigned n=0, tmp_mask = mask; n < num_elements; n++, tmp_mask >>= 1) {
     if (tmp_mask & 0x1)
-      op.vmm16u(n) = approximate_rsqrt14((float16) op.vmm16u(n), MXCSR.get_DAZ());
+      op.vmm16u(n) = approximate_rsqrt14((float16) op.vmm16u(n), false);
     else
       op.vmm16u(n) = 0;
   }

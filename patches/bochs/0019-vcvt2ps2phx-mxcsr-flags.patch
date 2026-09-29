@@ -1,0 +1,38 @@
+VCVT2PS2PHX never set its MXCSR flags
+
+AVX10.2 spec, VCVT2PS2PHX: the instruction "updates MXCSR as if all MXCSR
+numerical exceptions flags are masked and does not generate floating point
+exceptions", and can set DE, IE, OE, PE and UE. The handler set
+softfloat_suppressException to every flag, so softfloat_getExceptionFlags()
+always returned 0 and MXCSR never changed: vcvt2ps2phx of 1/3 left PE clear
+where vcvtps2phx sets it.
+
+Dropping the suppression alone is not enough: check_exceptionsSSE() judges
+masking by MXCSR, so with an exception unmasked there it would raise #XM.
+The flags are now ORed into MXCSR directly.
+
+Fixed in avx/avx10_2_cvt.cc. Found 2026-09-29 while auditing the FP16
+handlers' MXCSR handling.
+
+diff --git a/cpu/avx/avx10_2_cvt.cc b/cpu/avx/avx10_2_cvt.cc
+index 63beb61..1564a22 100644
+--- a/cpu/avx/avx10_2_cvt.cc
++++ b/cpu/avx/avx10_2_cvt.cc
+@@ -47,7 +47,6 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PS2PHX_MASK_VphHpsWpsR(bxInstruction_
+   softfloat_status_word_rc_override(status, i);
+   status.softfloat_flush_underflow_to_zero = 0; // ignore MXCSR.FUZ
+   status.softfloat_exceptionMasks = softfloat_all_exceptions_mask;
+-  status.softfloat_suppressException = softfloat_all_exceptions_mask;
+ 
+   Bit32u mask, opmask = i->opmask() ? BX_READ_32BIT_OPMASK(i->opmask()) : (Bit32u) -1;
+ 
+@@ -67,7 +66,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::VCVT2PS2PHX_MASK_VphHpsWpsR(bxInstruction_
+       dst.vmm16u(n + num_elements_from_source) = 0;
+   }
+ 
+-  check_exceptionsSSE(softfloat_getExceptionFlags(&status));
++  // not check_exceptionsSSE(): it would raise #XM for an exception unmasked in MXCSR
++  MXCSR.set_exceptions(softfloat_getExceptionFlags(&status));
+ 
+   BX_WRITE_AVX_REGZ(i->dst(), dst, len);
+   BX_NEXT_INSTR(i);
