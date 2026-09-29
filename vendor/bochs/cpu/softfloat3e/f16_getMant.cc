@@ -66,11 +66,11 @@ float16 f16_getMant(float16 a, softfloat_status_t *status, int sign_ctrl, int in
                 return defaultNaNF16UI;
             }
         }
-        return packToF16UI(~sign_ctrl & signA, 0x1F, 0);
+        return packToF16UI(~sign_ctrl & signA, 0xF, 0);
     }
 
     if (! expA && (! sigA || softfloat_denormalsAreZeros(status))) {
-        return packToF16UI(~sign_ctrl & signA, 0x1F, 0);
+        return packToF16UI(~sign_ctrl & signA, 0xF, 0);
     }
 
     if (signA) {

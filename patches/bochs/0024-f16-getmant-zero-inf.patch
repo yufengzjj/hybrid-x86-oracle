@@ -1,0 +1,31 @@
+VGETMANTPH / VGETMANTSH of +-0 and +-inf returned +-inf instead of +-1.0
+
+SDM Vol. 2C, VGETMANTPH, Table 5-10 and getmant_fp16(): +0 and +inf give
+1.0; -0, and -inf when SC[1] = 0, give +1.0 or -1.0 by SC[0]; interv is
+ignored. f16_getMant packed those results with exponent 0x1F, which is
+infinity in FP16, instead of the bias 0xF: vgetmantph of +0 gave 0x7C00
+instead of 0x3C00, of -0 (SC = 00) 0xFC00 instead of 0xBC00. The signs and
+the QNaN indefinite for -inf with SC[1] = 1 were right. f32_getMant and
+f64_getMant use their biases (0x7F, 0x3FF) and were right.
+
+Fixed in softfloat3e/f16_getMant.cc. Found 2026-09-29; upstream master has
+the same code.
+
+diff --git a/cpu/softfloat3e/f16_getMant.cc b/cpu/softfloat3e/f16_getMant.cc
+index 4c39cac..b52ddc2 100644
+--- a/cpu/softfloat3e/f16_getMant.cc
++++ b/cpu/softfloat3e/f16_getMant.cc
+@@ -66,11 +66,11 @@ float16 f16_getMant(float16 a, softfloat_status_t *status, int sign_ctrl, int in
+                 return defaultNaNF16UI;
+             }
+         }
+-        return packToF16UI(~sign_ctrl & signA, 0x1F, 0);
++        return packToF16UI(~sign_ctrl & signA, 0xF, 0);
+     }
+ 
+     if (! expA && (! sigA || softfloat_denormalsAreZeros(status))) {
+-        return packToF16UI(~sign_ctrl & signA, 0x1F, 0);
++        return packToF16UI(~sign_ctrl & signA, 0xF, 0);
+     }
+ 
+     if (signA) {

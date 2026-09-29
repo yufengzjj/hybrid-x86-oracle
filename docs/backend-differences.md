@@ -1155,6 +1155,21 @@ accumulation with DAZ=FTZ=1); `tcvtrowd2ps` (RNE); `tcvtrowps2bf16[h,l]` (the
 same conversion as `vcvtneps2bf16`, §4ad). The vendored Bochs does not
 implement AMX-TF32 or the transposing AMX instructions.
 
+## 4ah. `VGETMANTPH` / `VGETMANTSH` of ±0 and ±∞ returned ±∞ — patched (Bochs)
+
+SDM Vol. 2C, VGETMANTPH, Table 5-10: +0 and +∞ give 1.0; −0, and −∞ when
+SC[1] = 0, give +1.0 or −1.0 by SC[0]; interv is ignored. Upstream's
+`f16_getMant` packed these with exponent `0x1F` (FP16 infinity) instead of
+the bias `0xF`, so `vgetmantph` of +0 gave `0x7C00` instead of `0x3C00`, and
+of −0 with SC = 00 `0xFC00` instead of `0xBC00`. The signs and the QNaN
+indefinite for −∞ with SC[1] = 1 were right; `f32_getMant` and `f64_getMant`
+were right.
+[`patches/bochs/0024-f16-getmant-zero-inf.patch`](../patches/bochs/0024-f16-getmant-zero-inf.patch)
+(`softfloat3e/f16_getMant.cc`) uses the bias. `tests/bochs_patches.rs` pins
+the four specials under five imm8 values in `vgetmantph` and under imm8 0 in
+`vgetmantsh`, with ±3.0 as normal controls. Still present on upstream master
+as of 2026-09-29 (`4b46aea`).
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

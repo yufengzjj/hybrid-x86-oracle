@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ag are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ah are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -2612,5 +2612,44 @@ fn tcmmrlfp16ps_negates_imaginary_src1_nan_included() {
     ];
     for (label, pp, a, want) in CASES {
         assert_eq!(amx_complex_fp16(*pp, *a, ONE_ONE, 0), *want, "{label}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ah: VGETMANTPH / VGETMANTSH of ±0 and ±inf give ±1.0.
+//
+// SDM Vol. 2C Table 5-10: +0 and +inf give 1.0; -0, and -inf when SC[1] = 0,
+// give +1.0 or -1.0 by SC[0]; -inf with SC[1] = 1 gives QNaN indefinite.
+// Upstream's f16_getMant packed exponent 0x1F (infinity) instead of the bias.
+// `patches/bochs/0024-f16-getmant-zero-inf.patch` is what makes this pass.
+
+#[test]
+fn vgetmant_fp16_of_zero_and_inf_is_one() {
+    // lanes 0..5: +0, -0, +inf, -inf, 3.0, -3.0 (normal controls)
+    const SRC: [u16; 6] = [0x0000, 0x8000, 0x7C00, 0xFC00, 0x4200, 0xC200];
+    const CASES: &[(u8, [u16; 6])] = &[
+        (0x00, [0x3C00, 0xBC00, 0x3C00, 0xBC00, 0x3E00, 0xBE00]),
+        (0x03, [0x3C00, 0xBC00, 0x3C00, 0xBC00, 0x3A00, 0xBA00]), // interv [3/4, 3/2): ignored for specials
+        (0x04, [0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3E00, 0x3E00]),
+        (0x08, [0x3C00, 0xBC00, 0x3C00, 0xFE00, 0x3E00, 0xFE00]),
+        (0x0C, [0x3C00, 0x3C00, 0x3C00, 0xFE00, 0x3E00, 0xFE00]),
+    ];
+    let lanes = |z: &[u64]| -> Vec<u16> { (0..6).map(|n| (z[n / 4] >> (16 * (n % 4))) as u16).collect() };
+    let mut cpu = BochsOracle::new();
+    let mut src = [0u64; ZMM_CHUNKS];
+    for (n, v) in SRC.iter().enumerate() {
+        src[n / 4] |= u64::from(*v) << (16 * (n % 4));
+    }
+    for (imm, want) in CASES {
+        cpu.set_zmm(1, &src);
+        run(&mut cpu, &[0x62, 0xF3, 0x7C, 0x08, 0x26, 0xC1, *imm], 1); // vgetmantph xmm0, xmm1, imm
+        assert_eq!(lanes(&cpu.get_zmm(0)), want, "vgetmantph imm {imm:#04x}");
+    }
+    for (n, x) in SRC.iter().enumerate() {
+        let mut v = [0u64; ZMM_CHUNKS];
+        v[0] = u64::from(*x);
+        cpu.set_zmm(1, &v);
+        run(&mut cpu, &[0x62, 0xF3, 0x6C, 0x08, 0x27, 0xC1, 0x00], 1); // vgetmantsh xmm0, xmm2, xmm1, 0
+        assert_eq!(cpu.get_zmm(0)[0] as u16, CASES[0].1[n], "vgetmantsh {x:#06x}");
     }
 }
