@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ah are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ai are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -2651,5 +2651,67 @@ fn vgetmant_fp16_of_zero_and_inf_is_one() {
         cpu.set_zmm(1, &v);
         run(&mut cpu, &[0x62, 0xF3, 0x6C, 0x08, 0x27, 0xC1, 0x00], 1); // vgetmantsh xmm0, xmm2, xmm1, 0
         assert_eq!(cpu.get_zmm(0)[0] as u16, CASES[0].1[n], "vgetmantsh {x:#06x}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ai: FP16 → integer conversions round denormals by the rounding mode.
+//
+// A denormal FP16 is a nonzero value below 0.5, so round-up gives 1 for a
+// positive one and round-down gives -1 (signed) or integer indefinite with
+// #IE (unsigned) for a negative one. Upstream's f16_to_{i,ui}{16,32,64}
+// returned 0 for every denormal before rounding.
+// `patches/bochs/0025-f16-to-int-round-denormals.patch` is what makes this pass.
+
+/// `(mnemonic, EVEX P1, opcode, result width in bytes, unsigned)`, all
+/// `op xmm0/eax, xmm1` in map 5; width 0 means the result is in eax.
+const FP16_TO_INT: &[(&str, u8, u8, usize, bool)] = &[
+    ("vcvtsh2si eax", 0x7E, 0x2D, 0, false),
+    ("vcvtsh2usi eax", 0x7E, 0x79, 0, true),
+    ("vcvtph2w", 0x7D, 0x7D, 2, false),
+    ("vcvtph2uw", 0x7C, 0x7D, 2, true),
+    ("vcvtph2dq", 0x7D, 0x5B, 4, false),
+    ("vcvtph2udq", 0x7C, 0x79, 4, true),
+    ("vcvtph2qq", 0x7D, 0x7B, 8, false),
+    ("vcvtph2uqq", 0x7D, 0x79, 8, true),
+];
+
+#[test]
+fn fp16_to_int_rounds_denormals_by_the_rounding_mode() {
+    const MXCSR_PE: u32 = 0x20;
+    const MXCSR_IE: u32 = 0x01;
+    // (label, EVEX P2, MXCSR): embedded rounding {rn,rd,ru,rz}-sae, then MXCSR.RC down / up.
+    const MODES: &[(&str, u8, u32)] = &[
+        ("{rn-sae}", 0x18, MXCSR_DEFAULT),
+        ("{rd-sae}", 0x38, MXCSR_DEFAULT),
+        ("{ru-sae}", 0x58, MXCSR_DEFAULT),
+        ("{rz-sae}", 0x78, MXCSR_DEFAULT),
+        ("MXCSR.RC down", 0x08, MXCSR_DEFAULT | 0x2000),
+        ("MXCSR.RC up", 0x08, MXCSR_DEFAULT | 0x4000),
+    ];
+    let mut cpu = BochsOracle::new();
+    for (name, p1, op, width, unsigned) in FP16_TO_INT {
+        let ones = if *width == 0 { u64::from(u32::MAX) } else { u64::MAX >> (64 - 8 * width) };
+        for (mode, p2, mxcsr) in MODES {
+            let (down, up) = (mode.contains("rd") || mode.contains("down"), mode.contains("ru") || mode.contains("up"));
+            // +2^-24, -2^-24, the largest denormal 0x03FF: (input, positive)
+            for (x, pos) in [(0x0001u64, true), (0x8001, false), (0x03FF, true)] {
+                let (want, mut flags) = match (pos, up, down, unsigned) {
+                    (true, true, _, _) => (1, MXCSR_PE),
+                    (false, _, true, false) => (ones, MXCSR_PE),
+                    (false, _, true, true) => (ones, MXCSR_IE),
+                    _ => (0, MXCSR_PE),
+                };
+                if mode.contains("sae") {
+                    flags = 0;
+                }
+                let mut src = [0u64; ZMM_CHUNKS];
+                src[0] = x;
+                let code = [0x62, 0xF5, *p1, *p2, *op, 0xC1];
+                let (zmm0, _, rax, _, got_flags) = run_under_mxcsr(&mut cpu, &code, *mxcsr, &[[0; ZMM_CHUNKS], src, [0; ZMM_CHUNKS]]);
+                let got = if *width == 0 { rax } else { zmm0[0] & ones };
+                assert_eq!((got, got_flags), (want, flags), "{name} of {x:#06x} under {mode}");
+            }
+        }
     }
 }

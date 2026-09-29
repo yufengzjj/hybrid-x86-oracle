@@ -1,0 +1,158 @@
+FP16 -> integer conversions returned 0 for every denormal, ignoring the rounding mode
+
+f16_to_i16, f16_to_i32, f16_to_i64, f16_to_ui16, f16_to_ui32 and f16_to_ui64
+returned 0 for a denormal input before rounding (raising only inexact). A
+denormal FP16 is nonzero and below 0.5, so under round-up +2^-24 must give 1,
+and under round-down -2^-24 must give -1 (signed) or integer indefinite with
+the invalid flag (unsigned). This affected VCVTSH2SI, VCVTSH2USI,
+VCVTPH2[U]W, VCVTPH2[U]DQ and VCVTPH2[U]QQ under embedded rounding and under
+MXCSR.RC alike; the truncating forms (the _r_minMag functions) and the i8/ui8
+conversions were right.
+
+A denormal now goes to softfloat_roundTo* with its fraction as the fixed-point
+significand, as Berkeley SoftFloat 3e does: that value is below 0.25 in the
+rounding routines' 12-fraction-bit format, the same side of every rounding
+boundary as the true value, so sign, rounding and flags come out right. The
+DAZ early return is kept.
+
+Fixed in softfloat3e/f16_to_{i,ui}{16,32,64}.cc. Found 2026-09-29; upstream
+master has the same code.
+
+diff --git a/cpu/softfloat3e/f16_to_i16.cc b/cpu/softfloat3e/f16_to_i16.cc
+index 3b3897b..ef97a39 100644
+--- a/cpu/softfloat3e/f16_to_i16.cc
++++ b/cpu/softfloat3e/f16_to_i16.cc
+@@ -62,16 +62,10 @@ int16_t f16_to_i16(float16 a, uint8_t roundingMode, bool exact, struct softfloat
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if (0 <= shiftDist) {
+         sig32 <<= shiftDist;
+diff --git a/cpu/softfloat3e/f16_to_i32.cc b/cpu/softfloat3e/f16_to_i32.cc
+index af2ae1e..86c01b5 100644
+--- a/cpu/softfloat3e/f16_to_i32.cc
++++ b/cpu/softfloat3e/f16_to_i32.cc
+@@ -62,16 +62,10 @@ int32_t f16_to_i32(float16 a, uint8_t roundingMode, bool exact, struct softfloat
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if (0 <= shiftDist) {
+         sig32 <<= shiftDist;
+diff --git a/cpu/softfloat3e/f16_to_i64.cc b/cpu/softfloat3e/f16_to_i64.cc
+index 87e2d15..97164e2 100644
+--- a/cpu/softfloat3e/f16_to_i64.cc
++++ b/cpu/softfloat3e/f16_to_i64.cc
+@@ -62,16 +62,10 @@ int64_t f16_to_i64(float16 a, uint8_t roundingMode, bool exact, struct softfloat
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if (0 <= shiftDist) {
+         sig32 <<= shiftDist;
+diff --git a/cpu/softfloat3e/f16_to_ui16.cc b/cpu/softfloat3e/f16_to_ui16.cc
+index 2df9e53..8a91b9e 100644
+--- a/cpu/softfloat3e/f16_to_ui16.cc
++++ b/cpu/softfloat3e/f16_to_ui16.cc
+@@ -61,16 +61,10 @@ uint16_t f16_to_ui16(float16 a, uint8_t roundingMode, bool exact, struct softflo
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if ((0 <= shiftDist) && ! sign) {
+         return sig32<<shiftDist;
+diff --git a/cpu/softfloat3e/f16_to_ui32.cc b/cpu/softfloat3e/f16_to_ui32.cc
+index 63f76ec..d6ea72d 100644
+--- a/cpu/softfloat3e/f16_to_ui32.cc
++++ b/cpu/softfloat3e/f16_to_ui32.cc
+@@ -62,16 +62,10 @@ uint32_t f16_to_ui32(float16 a, uint8_t roundingMode, bool exact, struct softflo
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if ((0 <= shiftDist) && ! sign) {
+         return sig32<<shiftDist;
+diff --git a/cpu/softfloat3e/f16_to_ui64.cc b/cpu/softfloat3e/f16_to_ui64.cc
+index 393007b..ef01a1a 100644
+--- a/cpu/softfloat3e/f16_to_ui64.cc
++++ b/cpu/softfloat3e/f16_to_ui64.cc
+@@ -62,16 +62,10 @@ uint64_t f16_to_ui64(float16 a, uint8_t roundingMode, bool exact, struct softflo
+     }
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    if (! exp) {
+-        if (softfloat_denormalsAreZeros(status)) return 0;
+-        if (exact && frac) {
+-            softfloat_raiseFlags(status, softfloat_flag_inexact);
+-        }
+-        return 0;
+-    }
++    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
+     /*------------------------------------------------------------------------
+     *------------------------------------------------------------------------*/
+-    sig32 = frac | 0x0400;
++    sig32 = exp ? (frac | 0x0400) : frac;
+     shiftDist = exp - 0x19;
+     if ((0 <= shiftDist) && ! sign) {
+         return sig32<<shiftDist;

@@ -61,16 +61,10 @@ uint16_t f16_to_ui16(float16 a, uint8_t roundingMode, bool exact, struct softflo
     }
     /*------------------------------------------------------------------------
     *------------------------------------------------------------------------*/
-    if (! exp) {
-        if (softfloat_denormalsAreZeros(status)) return 0;
-        if (exact && frac) {
-            softfloat_raiseFlags(status, softfloat_flag_inexact);
-        }
-        return 0;
-    }
+    if (! exp && softfloat_denormalsAreZeros(status)) return 0;
     /*------------------------------------------------------------------------
     *------------------------------------------------------------------------*/
-    sig32 = frac | 0x0400;
+    sig32 = exp ? (frac | 0x0400) : frac;
     shiftDist = exp - 0x19;
     if ((0 <= shiftDist) && ! sign) {
         return sig32<<shiftDist;

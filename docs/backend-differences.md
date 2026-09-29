@@ -1170,6 +1170,22 @@ the four specials under five imm8 values in `vgetmantph` and under imm8 0 in
 `vgetmantsh`, with ±3.0 as normal controls. Still present on upstream master
 as of 2026-09-29 (`4b46aea`).
 
+## 4ai. FP16 → integer conversions turned every denormal into 0, whatever the rounding mode — patched (Bochs)
+
+A denormal FP16 is nonzero and below 0.5, so under round-up +2⁻²⁴ converts to
+1, and under round-down −2⁻²⁴ converts to −1 (signed) or to integer
+indefinite with #IE (unsigned). Upstream's `f16_to_{i,ui}{16,32,64}` returned
+0 for any denormal before rounding, so `vcvtsh2si`, `vcvtsh2usi`,
+`vcvtph2[u]w`, `vcvtph2[u]dq` and `vcvtph2[u]qq` gave 0 in every rounding
+mode, embedded or from MXCSR.RC. The truncating forms and the i8/ui8
+conversions were right.
+[`patches/bochs/0025-f16-to-int-round-denormals.patch`](../patches/bochs/0025-f16-to-int-round-denormals.patch)
+passes the denormal's fraction to `softfloat_roundTo*` as Berkeley SoftFloat
+3e does. `tests/bochs_patches.rs` pins all eight instructions on +2⁻²⁴, −2⁻²⁴
+and the largest denormal under the four `{r*-sae}` modes (no MXCSR flags) and
+under MXCSR.RC down and up (PE, or IE alone for the unsigned invalid case).
+Still present on upstream master as of 2026-09-29 (`4b46aea`).
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was
