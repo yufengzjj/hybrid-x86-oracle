@@ -4,7 +4,7 @@
 Usage: fix_cpp_model.py path/to/model.h path/to/model.cpp
 
 Fixes 1-4 work around Sail 0.20.1 `--cpp` backend bugs on large models
-(arm-v9.4-a); fixes 5-7 correct semantic errors in the ACL2->Sail translation
+(arm-v9.4-a); fixes 5-10 correct semantic errors in the ACL2->Sail translation
 itself, so they apply to the C backend too.
 
 1. Some method declarations are emitted TWICE in the class body — valid C, but
@@ -69,6 +69,14 @@ itself, so they apply to the C backend too.
    correctly raise the model's "Opcode Unimplemented" error, which the shim
    classifies as a skippable backend gap. -> make the two aliased arms raise
    the same error. See docs/backend-differences.md §4e.
+
+10. WRONG SEMANTICS: `x86_pop_ev` computes the destination address before it
+    writes the new rsp, so `pop [rsp+...]` writes one slot too low. The SDM
+    (POP: "computes the effective address of the operand after it increments
+    the ESP register"), Bochs and real hardware use the incremented rsp; ACL2
+    x86isa computes the address a second time after `write-*sp`, which the
+    translation dropped. -> recompute the address right after the rsp write.
+    See docs/backend-differences.md §4aj.
 """
 import os
 import re
@@ -556,6 +564,49 @@ def fix_dup_aliasing(cpp_path: str) -> None:
     print(f"{cpp_path}: F3/F2 0F 12 now raise the unimplemented-opcode error")
 
 
+# ------------------------------------------------------------------ fix 10
+
+MARK_POP = "/* oracle-fix-10: address from the incremented rsp */"
+WRITE_SPTR = "zwrite_sptr(zproc_mode, znew_rsp);\n"
+EA_CALL = re.compile(r"= (?P<call>zx86_effective_addr\([^;]*\));")
+MOD_GUARD = re.compile(r"= \((?P<mod>z\w+) == UINT64_C\(0b11\)\);")
+EXC_BLOCK = re.compile(r"\n(?P<ind> +)if \(have_exception\) \{\n.*?\n(?P=ind)\}\n", re.S)
+
+
+def fix_pop_rsp_base(cpp_path: str) -> None:
+    """POP to an rsp-based destination must address it from the incremented rsp."""
+    src = open(cpp_path).read()
+    if MARK_POP in src:
+        print(f"{cpp_path}: pop rsp-base fix already applied, skipped")
+        return
+    start, end = function_body(src, "zx86_pop_ev", "fix 10")
+    body = src[start:end]
+    calls, guards = EA_CALL.findall(body), MOD_GUARD.findall(body)
+    writes = body.count(WRITE_SPTR)
+    if len(calls) != 1 or len(guards) != 1 or writes != 1 or "zaddr = " not in body:
+        raise SystemExit(
+            f"{cpp_path}: expected 1 effective_addr call, 1 mod == 0b11 test and 1 rsp write in "
+            f"x86_pop_ev, found {len(calls)}/{len(guards)}/{writes} — model layout changed, "
+            "fix 10 needs review"
+        )
+    # ACL2 x86-pop-Ev computes the address again after write-*sp; the
+    # translation kept only the computation before it.
+    at = body.index(WRITE_SPTR) + len(WRITE_SPTR)
+    exc = EXC_BLOCK.search(body, at)
+    if not exc:
+        raise SystemExit(f"{cpp_path}: no exception check after the rsp write in x86_pop_ev — fix 10 needs review")
+    ind = exc["ind"][2:]
+    recompute = (
+        f"{ind}if ({guards[0]} != UINT64_C(0b11)) {{ {MARK_POP}\n"
+        f"{exc['ind']}zaddr = {calls[0]}.ztup0;"
+        f"{exc.group(0)}{ind}}}\n"
+    )
+    body = body[:at] + recompute + body[at:]
+    with open(cpp_path, "w", newline="\n") as f:
+        f.write(src[:start] + body + src[end:])
+    print(f"{cpp_path}: pop now addresses an rsp-based destination from the incremented rsp")
+
+
 if __name__ == "__main__":
     header, cpp = sys.argv[1], sys.argv[2]
     kept = dedup_header(header)
@@ -566,3 +617,4 @@ if __name__ == "__main__":
     fix_rep_termination(cpp)
     fix_movd_zero_extend(cpp)
     fix_dup_aliasing(cpp)
+    fix_pop_rsp_base(cpp)

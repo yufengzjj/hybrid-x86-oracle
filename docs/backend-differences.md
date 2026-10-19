@@ -1186,6 +1186,28 @@ and the largest denormal under the four `{r*-sae}` modes (no MXCSR flags) and
 under MXCSR.RC down and up (PE, or IE alone for the unsigned invalid case).
 Still present on upstream master as of 2026-09-29 (`4b46aea`).
 
+## 4aj. `POP` to an rsp-based destination wrote one slot too low — patched
+
+The SDM (POP): "If the ESP register is used as a base register for addressing a
+destination operand in memory, the POP instruction computes the effective
+address of the operand after it increments the ESP register" — RSP likewise.
+`x86_pop_ev` computed the address while the register still held the old rsp,
+so `pop qword [rsp+8]` from rsp = X wrote to X+8 instead of X+16, and
+`pop qword [rsp]` wrote the value back where it came from. Every operand size,
+the 67-prefixed `[esp+…]` form and SIB forms with an index were all off by the
+slot width; rsp itself and the popped value were right. Bochs and real hardware
+follow the SDM. `PUSH [rsp+…]` and `CALL [rsp+…]` use the rsp from before the
+instruction, and the model does too.
+
+Upstream ACL2 `x86-pop-Ev` is correct: it computes the address once before
+`write-*sp` (for its faults) and again after it, and writes to the second. The
+Sail translation
+([`model/push_and_pop.sail`](https://github.com/rems-project/sail-x86-from-acl2/blob/master/model/push_and_pop.sail))
+kept only the first. `scripts/fix_cpp_model.py` (fix 10) restores the second
+computation right after the rsp write, so fault order still matches ACL2.
+Regression cases are the `pop {qword,word} [rsp]` and `pop qword [esp]`
+entries in `tests/differential.rs`, which point rsp at the observed data window.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

@@ -27,7 +27,7 @@ enabled cargo features ask for.
   independent oracles per process.
 
   **Not a byte-for-byte Sail artifact.** Four of that script's fixes work
-  around `--cpp` backend defects; fixes 5-9 change *semantics*, correcting
+  around `--cpp` backend defects; fixes 5-10 change *semantics*, correcting
   errors in the ACL2→Sail translation that the differential suite found:
 
   - **5** — `ror_spec_N` took CF from the result's LSB for rotate counts > 1,
@@ -43,10 +43,12 @@ enabled cargo features ask for.
   - **9** — the F3/F2 arms of 0F 12 (MOVSLDUP/MOVDDUP, unimplemented in
     x86isa) executed as MOVLPS/MOVLPD instead of reporting the opcode
     unimplemented (§4e).
+  - **10** — `x86_pop_ev` addressed an rsp-based destination from the rsp
+    before the pop; ACL2 recomputes the address after writing rsp (§4aj).
 
   Each patched site carries an `oracle-fix-N` comment, so
-  `gzip -dc model.cpp.gz | grep -c oracle-fix` counts them (15: 2 for fix 6, 10
-  for fix 7, 1 for fix 8, 2 for fix 9), and fix 5 shows up as
+  `gzip -dc model.cpp.gz | grep -c oracle-fix` counts them (16: 2 for fix 6, 10
+  for fix 7, 1 for fix 8, 2 for fix 9, 1 for fix 10), and fix 5 shows up as
   `grep -n 'zresult >> INT64_C(63)'` inside `zror_spec_64`. Everything else is
   as generated.
 

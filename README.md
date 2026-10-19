@@ -386,6 +386,7 @@ disagree with hardware:
 | 7 | `REP`-prefixed string operations never terminate | [§4](docs/backend-differences.md) |
 | 8 | `MOVD`/`MOVQ` to an XMM register merge instead of zero-extending | [§4d](docs/backend-differences.md) |
 | 9 | `MOVDDUP`/`MOVSLDUP` silently execute as `MOVLPS` | [§4e](docs/backend-differences.md) |
+| 10 | `POP` to an rsp-based destination addresses it from the old rsp | [§4aj](docs/backend-differences.md) |
 
 ## Limitations
 

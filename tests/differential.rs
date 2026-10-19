@@ -262,6 +262,16 @@ static MEMORY: &[Case] = &[
         .data(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
     Case::new("push rbx", &[0x53]).gprs(&[(RBX, 0xCAFE_BABE)]),
     Case::new("pop rcx", &[0x59]).data(&[]),
+    // an rsp-based POP destination is addressed from the incremented rsp (SDM POP)
+    Case::new("pop qword [rsp]", &[0x8F, 0x04, 0x24])
+        .gprs(&[(RSP, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("pop word [rsp]", &[0x66, 0x8F, 0x04, 0x24])
+        .gprs(&[(RSP, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
+    Case::new("pop qword [esp]", &[0x67, 0x8F, 0x04, 0x24])
+        .gprs(&[(RSP, DATA)])
+        .data(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
     Case::new("xchg [rbx],rax", &[0x48, 0x87, 0x03])
         .gprs(&[(RAX, 0xAA), (RBX, DATA)])
         .data(&[0xBB, 0, 0, 0, 0, 0, 0, 0]),
