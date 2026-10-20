@@ -85,8 +85,8 @@ enabled cargo features ask for.
   license situation) — GMP simply is LGPL either way.
 
 `model.cpp.gz` (~9 MB → ~1 MB) is decompressed into `OUT_DIR` at build time.
-`SAIL_MODEL_C` / `SAIL_LIB_DIR` override the model and runtime for anyone
-building against a freshly generated one.
+`X86_ORACLE_SAIL_MODEL_C` / `SAIL_LIB_DIR` override the model and runtime for
+anyone building against a freshly generated one.
 
 To regenerate after editing `sail/harness.sail`, follow the README section
 (which ends with `fix_cpp_model.py`), then refresh with:
