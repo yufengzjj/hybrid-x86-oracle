@@ -1,0 +1,32 @@
+IRETD and 16-bit IRET in 64-bit mode did not pop SS:RSP
+
+In 64-bit mode IRET pops SS and the stack pointer at every operand size, even
+when returning to the same privilege level (SDM IRET, IA-32e-MODE: "IF
+instruction began in 64-Bit Mode", then ESP/SS, SP/SS or RSP/SS are popped).
+long_iret chose its same-privilege path, which pops only (E)IP, CS and
+(E)FLAGS, by `!i->os64L()`, as if a non-64-bit operand size meant
+compatibility mode. In 64-bit mode CF decodes to IRET64 at every operand size,
+so IRETD (CF) and IRET (66 CF) took that path: RSP only advanced by 12 or 6
+bytes and SS was left unchanged. IRETQ was right.
+
+The same-privilege path is now taken only outside 64-bit mode. The other path
+already reads SS and the stack pointer at the 32- and 16-bit offsets and
+writes RSP in 64-bit mode.
+
+Fixed in cpu/iret.cc. Found 2026-10-20; upstream master has the same code.
+
+diff --git a/cpu/iret.cc b/cpu/iret.cc
+index 6987b3f..bddaf7d 100644
+--- a/cpu/iret.cc
++++ b/cpu/iret.cc
+@@ -402,7 +402,9 @@ BX_CPU_C::long_iret(bxInstruction_c *i)
+   check_cs(&cs_descriptor, raw_cs_selector, 0, cs_selector.rpl);
+
+   /* INTERRUPT RETURN TO SAME PRIVILEGE LEVEL */
+-  if (cs_selector.rpl == CPL && !i->os64L())
++  // In 64-bit mode IRET pops SS:RSP at every operand size, so only
++  // compatibility mode returns without them.
++  if (cs_selector.rpl == CPL && !long64_mode())
+   {
+     BX_DEBUG(("LONG MODE INTERRUPT RETURN TO SAME PRIVILEGE LEVEL"));
+

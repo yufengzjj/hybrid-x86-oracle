@@ -1,7 +1,7 @@
 //! Regression cases for what this crate fixes in, or demands of, the vendored
 //! Bochs — the things a re-vendor or a CPU-model change can silently undo.
 //!
-//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z and §4aa–§4ai are the prose; these are the
+//! `docs/backend-differences.md` §2, §4g, §4i, §4j, §4k–§4z, §4aa–§4ai and §4ak are the prose; these are the
 //! pins. Bochs-only on purpose: no other backend here executes AVX-512 (Sail
 //! has no vector ISA, and the CI hosts have no AVX-512 silicon), so there is
 //! nothing to differ against — these assert against the SDM directly.
@@ -10,8 +10,8 @@
 #![cfg(feature = "bochs")]
 
 use x86_oracle::{
-    BochsOracle, X86Oracle, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, ZMM_CHUNKS, RAX, RBX,
-    RCX, RDI, RDX, RSI, RSP, R12,
+    BochsOracle, X86Oracle, FLAG_AF, FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF, GDT_ADDR, ZMM_CHUNKS,
+    RAX, RBX, RCX, RDI, RDX, RSI, RSP, R12, SEG_SS,
 };
 
 const CODE: u64 = 0x10_0000;
@@ -2713,5 +2713,43 @@ fn fp16_to_int_rounds_denormals_by_the_rounding_mode() {
                 assert_eq!((got, got_flags), (want, flags), "{name} of {x:#06x} under {mode}");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4ak: IRET in 64-bit mode pops SS:RSP at every operand size.
+//
+// Upstream took the same-privilege path, which pops only (E)IP, CS and
+// (E)FLAGS, whenever the operand size was not 64 bits.
+// `patches/bochs/0026-iret-64bit-pops-ss-rsp.patch` is what makes this pass.
+
+#[test]
+fn iret_in_64bit_mode_pops_ss_and_rsp_at_every_operand_size() {
+    const SEL_CODE64: u64 = 0x08;
+    const SEL_DATA: u64 = 0x10;
+    // (mnemonic, code, slot width, new rip, new rsp)
+    const CASES: &[(&str, &[u8], usize, u64, u64)] = &[
+        ("iretq", &[0x48, 0xCF], 8, CODE + 0x100, DATA + 0x1_0000),
+        ("iretd", &[0xCF], 4, CODE + 0x100, DATA + 0x1_0000),
+        ("iret (16-bit)", &[0x66, 0xCF], 2, 0x1000, 0x2000),
+    ];
+    let mut cpu = BochsOracle::new();
+    // Bochs reads the GDT from guest memory, which is all zeros until written.
+    cpu.write_mem(GDT_ADDR + SEL_CODE64, &0x00AF_9B00_0000_FFFFu64.to_le_bytes());
+    cpu.write_mem(GDT_ADDR + SEL_DATA, &0x00CF_9300_0000_FFFFu64.to_le_bytes());
+    for (name, code, width, rip, rsp) in CASES {
+        let mut frame = Vec::new();
+        for v in [*rip, SEL_CODE64, 0x2, *rsp, SEL_DATA] {
+            frame.extend_from_slice(&v.to_le_bytes()[..*width]);
+        }
+        cpu.write_mem(DATA, &frame);
+        cpu.set_gpr(RSP, DATA);
+        cpu.set_seg_selector(SEG_SS, 0);
+        run(&mut cpu, code, 1);
+        assert_eq!(
+            (cpu.get_rip(), cpu.get_gpr(RSP), cpu.get_seg_selector(SEG_SS)),
+            (*rip, *rsp, SEL_DATA as u16),
+            "{name}"
+        );
     }
 }

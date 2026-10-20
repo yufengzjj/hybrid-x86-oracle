@@ -1208,6 +1208,37 @@ computation right after the rsp write, so fault order still matches ACL2.
 Regression cases are the `pop {qword,word} [rsp]` and `pop qword [esp]`
 entries in `tests/differential.rs`, which point rsp at the observed data window.
 
+## 4ak. `IRETD` and 16-bit `IRET` in 64-bit mode did not pop SS:RSP — patched (Bochs)
+
+In 64-bit mode IRET pops SS and the stack pointer at every operand size, also
+when it returns to the same privilege level (SDM IRET, IA-32e-MODE: "IF
+instruction began in 64-Bit Mode", then ESP/SS, SP/SS or RSP/SS are popped).
+Upstream `long_iret` chose its same-privilege path, which pops only (E)IP, CS
+and (E)FLAGS, by "operand size is not 64", as if that meant compatibility mode.
+So `iretd` (`CF`) and `iret` (`66 CF`) only advanced RSP by 12 or 6 bytes and
+left SS unchanged; `iretq` was right. Real hardware (WHP) loads SS and RSP for
+all three.
+[`patches/bochs/0026-iret-64bit-pops-ss-rsp.patch`](../patches/bochs/0026-iret-64bit-pops-ss-rsp.patch)
+takes that path only outside 64-bit mode, so in 64-bit mode all three sizes
+share the path `iretq` already used, shadow-stack handling included.
+`tests/bochs_patches.rs` pins RIP, RSP and SS after each of the three. The Sail
+model does not implement IRET (`Unimplemented`), so there is no differential
+case. Still present on upstream master as of 2026-10-20 (`82f3d65`).
+
+## 4al. 16-bit `POPF` cleared AC, ID and the rest of RFLAGS[31:16] — patched
+
+The SDM (POPF) loads only FLAGS (bits 15:0) for a 16-bit operand: "stores it
+in the lower 16 bits of the EFLAGS register". For a 32/64-bit operand at CPL 0
+it says "VIP, VIF, VM, and all reserved bits are unaffected". `x86_popf`
+instead wrote the whole register at 16 bits, so `66 9D` cleared RF, VM, AC,
+VIF, VIP and ID, and at 32/64 bits it set VIF and VIP to 0. Bochs and real
+hardware keep all of these. The translation is faithful here: upstream ACL2
+`x86-popf` makes the same two mistakes. `scripts/fix_cpp_model.py` (fix 11)
+saves RFLAGS on entry and, after the operand-size match, puts back bits 31:16
+(16-bit) or VIF/VIP (32/64-bit). RF is still kept where the SDM clears it;
+backends mask RF out of `get_rflags`, so that is not visible. Regression cases
+are the `popf (16-bit)` and `popfq` entries in `tests/differential.rs`.
+
 ## 5. Faults
 
 Neither backend vectors through an IDT: a fault leaves the state that was

@@ -272,6 +272,19 @@ static MEMORY: &[Case] = &[
     Case::new("pop qword [esp]", &[0x67, 0x8F, 0x04, 0x24])
         .gprs(&[(RSP, DATA)])
         .data(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
+    // POPF16 loads only FLAGS; POPF32/64 leave VIF and VIP alone (SDM POPF)
+    Case::new("popf (16-bit), AC|ID set", &[0x66, 0x9D])
+        .gprs(&[(RSP, DATA)])
+        .rflags(0x24_0002)
+        .data(&[0xD5, 0x08]),
+    Case::new("popf (16-bit), VIF|VIP set", &[0x66, 0x9D])
+        .gprs(&[(RSP, DATA)])
+        .rflags(0x18_0002)
+        .data(&[0xD5, 0x08]),
+    Case::new("popfq, VIF|VIP set", &[0x9D])
+        .gprs(&[(RSP, DATA)])
+        .rflags(0x18_0002)
+        .data(&[0xD5, 0x08, 0, 0, 0, 0, 0, 0]),
     Case::new("xchg [rbx],rax", &[0x48, 0x87, 0x03])
         .gprs(&[(RAX, 0xAA), (RBX, DATA)])
         .data(&[0xBB, 0, 0, 0, 0, 0, 0, 0]),

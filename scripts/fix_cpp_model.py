@@ -4,8 +4,8 @@
 Usage: fix_cpp_model.py path/to/model.h path/to/model.cpp
 
 Fixes 1-4 work around Sail 0.20.1 `--cpp` backend bugs on large models
-(arm-v9.4-a); fixes 5-10 correct semantic errors in the ACL2->Sail translation
-itself, so they apply to the C backend too.
+(arm-v9.4-a); fixes 5-11 correct semantic errors in the ACL2->Sail translation
+(or, for 11, in ACL2 itself), so they apply to the C backend too.
 
 1. Some method declarations are emitted TWICE in the class body — valid C, but
    a C++ error. -> drop exact duplicate declaration lines.
@@ -77,6 +77,14 @@ itself, so they apply to the C backend too.
     x86isa computes the address a second time after `write-*sp`, which the
     translation dropped. -> recompute the address right after the rsp write.
     See docs/backend-differences.md §4aj.
+
+11. WRONG SEMANTICS: `x86_popf` with a 16-bit operand writes the whole of
+    RFLAGS, clearing RF, VM, AC, VIF, VIP and ID, and at 32/64 bits it clears
+    VIF and VIP. The SDM (POPF) loads only FLAGS (bits 15:0) at 16 bits and
+    leaves VIP and VIF unaffected at 32/64 bits; Bochs and real hardware agree.
+    The translation is faithful: ACL2 x86isa `x86-popf` has the same errors.
+    -> after the operand-size match, put back the bits POPF must not change.
+    See docs/backend-differences.md §4al.
 """
 import os
 import re
@@ -607,6 +615,46 @@ def fix_pop_rsp_base(cpp_path: str) -> None:
     print(f"{cpp_path}: pop now addresses an rsp-based destination from the incremented rsp")
 
 
+# ------------------------------------------------------------------ fix 11
+
+MARK_POPF = "/* oracle-fix-11: POPF keeps the flags it must not change */"
+FINISH_LABEL = re.compile(r"\nfinish_match_\d+: ;\n")
+SIZE2_ARM = re.compile(r"= \(zp\w+ == INT64_C\(2\)\);")
+# Bits 19 (VIF) and 20 (VIP).
+VIF_VIP = "UINT64_C(0x180000)"
+
+
+def fix_popf_kept_flags(cpp_path: str) -> None:
+    """POPF16 loads only FLAGS; POPF32/64 leave VIF and VIP unaffected."""
+    src = open(cpp_path).read()
+    if MARK_POPF in src:
+        print(f"{cpp_path}: popf kept-flags fix already applied, skipped")
+        return
+    start, end = function_body(src, "zx86_popf", "fix 11")
+    body = src[start:end]
+    labels, arms = FINISH_LABEL.findall(body), SIZE2_ARM.findall(body)
+    sets = body.count("zrflags = zMk_rflagsbits(")
+    if len(labels) != 1 or len(arms) != 1 or sets != 2 or "zoperand_sizze = " not in body:
+        raise SystemExit(
+            f"{cpp_path}: expected 1 match-finish label, 1 operand-size-2 arm and 2 rflags writes in "
+            f"x86_popf, found {len(labels)}/{len(arms)}/{sets} — model layout changed, fix 11 needs review"
+        )
+    # Declared without an initializer: the early exception gotos jump past it.
+    save = f"  uint64_t zold_rflags; {MARK_POPF}\n  zold_rflags = zrflags.zbits;\n"
+    restore = (
+        "  zrflags = zMk_rflagsbits(zoperand_sizze == INT64_C(2)\n"
+        "    ? ((zold_rflags & ~UINT64_C(0xFFFF)) | (zrflags.zbits & UINT64_C(0xFFFF)))\n"
+        f"    : ((zrflags.zbits & ~{VIF_VIP}) | (zold_rflags & {VIF_VIP})));\n"
+    )
+    at = body.index("{\n") + 2
+    body = body[:at] + save + body[at:]
+    m = FINISH_LABEL.search(body)
+    body = body[: m.end()] + restore + body[m.end() :]
+    with open(cpp_path, "w", newline="\n") as f:
+        f.write(src[:start] + body + src[end:])
+    print(f"{cpp_path}: popf now keeps RFLAGS[31:16] at 16 bits and VIF/VIP at 32/64 bits")
+
+
 if __name__ == "__main__":
     header, cpp = sys.argv[1], sys.argv[2]
     kept = dedup_header(header)
@@ -618,3 +666,4 @@ if __name__ == "__main__":
     fix_movd_zero_extend(cpp)
     fix_dup_aliasing(cpp)
     fix_pop_rsp_base(cpp)
+    fix_popf_kept_flags(cpp)

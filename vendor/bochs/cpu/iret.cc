@@ -402,7 +402,9 @@ BX_CPU_C::long_iret(bxInstruction_c *i)
   check_cs(&cs_descriptor, raw_cs_selector, 0, cs_selector.rpl);
 
   /* INTERRUPT RETURN TO SAME PRIVILEGE LEVEL */
-  if (cs_selector.rpl == CPL && !i->os64L())
+  // In 64-bit mode IRET pops SS:RSP at every operand size, so only
+  // compatibility mode returns without them.
+  if (cs_selector.rpl == CPL && !long64_mode())
   {
     BX_DEBUG(("LONG MODE INTERRUPT RETURN TO SAME PRIVILEGE LEVEL"));
 

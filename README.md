@@ -387,6 +387,7 @@ disagree with hardware:
 | 8 | `MOVD`/`MOVQ` to an XMM register merge instead of zero-extending | [§4d](docs/backend-differences.md) |
 | 9 | `MOVDDUP`/`MOVSLDUP` silently execute as `MOVLPS` | [§4e](docs/backend-differences.md) |
 | 10 | `POP` to an rsp-based destination addresses it from the old rsp | [§4aj](docs/backend-differences.md) |
+| 11 | 16-bit `POPF` clears RFLAGS[31:16] (AC, ID, ...); `POPF` clears VIF/VIP | [§4al](docs/backend-differences.md) |
 
 ## Limitations
 
