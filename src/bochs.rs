@@ -22,38 +22,38 @@ use crate::{
 };
 
 extern "C" {
-    fn oracle_bochs_new() -> *mut std::ffi::c_void;
-    fn oracle_bochs_free(h: *mut std::ffi::c_void);
-    fn oracle_bochs_cpu_mode() -> u32;
-    fn oracle_bochs_set_gpr(n: u32, v: u64);
-    fn oracle_bochs_get_gpr(n: u32) -> u64;
-    fn oracle_bochs_set_rip(v: u64);
-    fn oracle_bochs_get_rip() -> u64;
-    fn oracle_bochs_set_rflags(v: u64);
-    fn oracle_bochs_get_rflags() -> u64;
-    fn oracle_bochs_set_zmm(n: u32, chunk: u32, v: u64);
-    fn oracle_bochs_get_zmm(n: u32, chunk: u32) -> u64;
-    fn oracle_bochs_set_msr(msr: u32, v: u64);
-    fn oracle_bochs_get_msr(msr: u32) -> u64;
-    fn oracle_bochs_set_cr(n: u32, v: u64);
-    fn oracle_bochs_get_cr(n: u32) -> u64;
-    fn oracle_bochs_set_ssp(v: u64);
-    fn oracle_bochs_get_ssp() -> u64;
-    fn oracle_bochs_enable_shadow_stack(base: u64, len: u64) -> i32;
-    fn oracle_bochs_set_dtr(which: u32, base: u64, limit: u64);
-    fn oracle_bochs_set_tr_selector(v: u64);
-    fn oracle_bochs_set_seg_selector(n: u32, v: u64);
-    fn oracle_bochs_get_seg_selector(n: u32) -> u64;
-    fn oracle_bochs_set_seg_base(n: u32, v: u64);
-    fn oracle_bochs_get_seg_base(n: u32) -> u64;
-    fn oracle_bochs_set_seg_limit(n: u32, v: u64);
-    fn oracle_bochs_get_seg_limit(n: u32) -> u64;
-    fn oracle_bochs_read_mem(addr: u64) -> u8;
-    fn oracle_bochs_write_mem(addr: u64, byte: u8);
-    fn oracle_bochs_read_mem_slice(addr: u64, dst: *mut u8, len: u64);
-    fn oracle_bochs_write_mem_slice(addr: u64, src: *const u8, len: u64);
-    fn oracle_bochs_is_mapped(addr: u64) -> i32;
-    fn oracle_bochs_step(out_vector: *mut u32, out_error: *mut u32) -> u32;
+    fn x86oracle_bochs_new() -> *mut std::ffi::c_void;
+    fn x86oracle_bochs_free(h: *mut std::ffi::c_void);
+    fn x86oracle_bochs_cpu_mode() -> u32;
+    fn x86oracle_bochs_set_gpr(n: u32, v: u64);
+    fn x86oracle_bochs_get_gpr(n: u32) -> u64;
+    fn x86oracle_bochs_set_rip(v: u64);
+    fn x86oracle_bochs_get_rip() -> u64;
+    fn x86oracle_bochs_set_rflags(v: u64);
+    fn x86oracle_bochs_get_rflags() -> u64;
+    fn x86oracle_bochs_set_zmm(n: u32, chunk: u32, v: u64);
+    fn x86oracle_bochs_get_zmm(n: u32, chunk: u32) -> u64;
+    fn x86oracle_bochs_set_msr(msr: u32, v: u64);
+    fn x86oracle_bochs_get_msr(msr: u32) -> u64;
+    fn x86oracle_bochs_set_cr(n: u32, v: u64);
+    fn x86oracle_bochs_get_cr(n: u32) -> u64;
+    fn x86oracle_bochs_set_ssp(v: u64);
+    fn x86oracle_bochs_get_ssp() -> u64;
+    fn x86oracle_bochs_enable_shadow_stack(base: u64, len: u64) -> i32;
+    fn x86oracle_bochs_set_dtr(which: u32, base: u64, limit: u64);
+    fn x86oracle_bochs_set_tr_selector(v: u64);
+    fn x86oracle_bochs_set_seg_selector(n: u32, v: u64);
+    fn x86oracle_bochs_get_seg_selector(n: u32) -> u64;
+    fn x86oracle_bochs_set_seg_base(n: u32, v: u64);
+    fn x86oracle_bochs_get_seg_base(n: u32) -> u64;
+    fn x86oracle_bochs_set_seg_limit(n: u32, v: u64);
+    fn x86oracle_bochs_get_seg_limit(n: u32) -> u64;
+    fn x86oracle_bochs_read_mem(addr: u64) -> u8;
+    fn x86oracle_bochs_write_mem(addr: u64, byte: u8);
+    fn x86oracle_bochs_read_mem_slice(addr: u64, dst: *mut u8, len: u64);
+    fn x86oracle_bochs_write_mem_slice(addr: u64, src: *const u8, len: u64);
+    fn x86oracle_bochs_is_mapped(addr: u64) -> i32;
+    fn x86oracle_bochs_step(out_vector: *mut u32, out_error: *mut u32) -> u32;
 }
 
 /// `BX_MODE_LONG_64` in Bochs' `BxCpuMode` enum.
@@ -164,7 +164,7 @@ impl BochsOracle {
     /// Resets the singleton core; the instance slot must already be claimed.
     fn init() -> Option<Self> {
         let _g = lock();
-        let h = unsafe { oracle_bochs_new() };
+        let h = unsafe { x86oracle_bochs_new() };
         if h.is_null() {
             return None;
         }
@@ -172,7 +172,7 @@ impl BochsOracle {
         // and A20 setup in the shim, the core silently stays in real mode and
         // every fetch reads zeroes.
         assert_eq!(
-            unsafe { oracle_bochs_cpu_mode() },
+            unsafe { x86oracle_bochs_cpu_mode() },
             MODE_LONG_64,
             "Bochs did not enter 64-bit long mode"
         );
@@ -182,13 +182,13 @@ impl BochsOracle {
         // the reset-value IDTR — a fault's delivery does walk the IDT (the
         // instrumentation stop is only a flag), but sparse guest memory reads
         // as zeros, so every gate is non-present and delivery aborts before
-        // committing state (see oracle_bochs_set_dtr in the shim, which also
+        // committing state (see x86oracle_bochs_set_dtr in the shim, which also
         // explains why real tables must never be mirrored into Bochs memory).
         // LDTR is already the null selector from reset.
         unsafe {
-            oracle_bochs_set_dtr(0, GDT_ADDR, GDT_LIMIT as u64);
-            oracle_bochs_set_dtr(1, IDT_ADDR, IDT_LIMIT as u64);
-            oracle_bochs_set_tr_selector(SEL_TSS as u64);
+            x86oracle_bochs_set_dtr(0, GDT_ADDR, GDT_LIMIT as u64);
+            x86oracle_bochs_set_dtr(1, IDT_ADDR, IDT_LIMIT as u64);
+            x86oracle_bochs_set_tr_selector(SEL_TSS as u64);
         }
         Some(BochsOracle { h, last_fault: None })
     }
@@ -197,7 +197,7 @@ impl BochsOracle {
     /// can assert the core really is in long mode.
     pub fn cpu_mode(&self) -> u32 {
         let _g = lock();
-        unsafe { oracle_bochs_cpu_mode() }
+        unsafe { x86oracle_bochs_cpu_mode() }
     }
 
     /// x86 exception vector of the last fault, if any (6 = #UD, 0 = #DE, ...).
@@ -259,7 +259,7 @@ impl Drop for BochsOracle {
     fn drop(&mut self) {
         {
             let _g = lock();
-            unsafe { oracle_bochs_free(self.h) }
+            unsafe { x86oracle_bochs_free(self.h) }
         }
         release_instance(); // lets a waiting new() proceed
     }
@@ -273,28 +273,28 @@ impl X86Oracle for BochsOracle {
     fn set_gpr(&mut self, n: u32, value: u64) {
         debug_assert!(n <= 15);
         let _g = lock();
-        unsafe { oracle_bochs_set_gpr(n, value) }
+        unsafe { x86oracle_bochs_set_gpr(n, value) }
     }
 
     fn get_gpr(&self, n: u32) -> u64 {
         debug_assert!(n <= 15);
         let _g = lock();
-        unsafe { oracle_bochs_get_gpr(n) }
+        unsafe { x86oracle_bochs_get_gpr(n) }
     }
 
     fn set_rip(&mut self, value: u64) {
         let _g = lock();
-        unsafe { oracle_bochs_set_rip(value) }
+        unsafe { x86oracle_bochs_set_rip(value) }
     }
 
     fn get_rip(&self) -> u64 {
         let _g = lock();
-        unsafe { oracle_bochs_get_rip() }
+        unsafe { x86oracle_bochs_get_rip() }
     }
 
     fn set_rflags(&mut self, value: u64) {
         let _g = lock();
-        unsafe { oracle_bochs_set_rflags(value) }
+        unsafe { x86oracle_bochs_set_rflags(value) }
     }
 
     /// Goes through Bochs' `read_eflags()`, which materializes the lazily
@@ -302,7 +302,7 @@ impl X86Oracle for BochsOracle {
     /// CF/PF/AF/ZF/SF/OF.
     fn get_rflags(&self) -> u64 {
         let _g = lock();
-        unsafe { oracle_bochs_get_rflags() }
+        unsafe { x86oracle_bochs_get_rflags() }
     }
 
     fn set_zmm(&mut self, n: u32, data: &[u64]) {
@@ -310,7 +310,7 @@ impl X86Oracle for BochsOracle {
         let _g = lock();
         for i in 0..ZMM_CHUNKS {
             let v = data.get(i).copied().unwrap_or(0);
-            unsafe { oracle_bochs_set_zmm(n, i as u32, v) }
+            unsafe { x86oracle_bochs_set_zmm(n, i as u32, v) }
         }
     }
 
@@ -319,14 +319,14 @@ impl X86Oracle for BochsOracle {
         let _g = lock();
         let mut out = [0u64; ZMM_CHUNKS];
         for (i, slot) in out.iter_mut().enumerate() {
-            *slot = unsafe { oracle_bochs_get_zmm(n, i as u32) };
+            *slot = unsafe { x86oracle_bochs_get_zmm(n, i as u32) };
         }
         out
     }
 
     fn set_msr(&mut self, msr: u32, value: u64) {
         let _g = lock();
-        unsafe { oracle_bochs_set_msr(msr, value) }
+        unsafe { x86oracle_bochs_set_msr(msr, value) }
     }
 
     fn get_msr(&self, msr: u32) -> u64 {
@@ -334,7 +334,7 @@ impl X86Oracle for BochsOracle {
             IA32_EFER | IA32_STAR | IA32_LSTAR | IA32_FMASK | IA32_FS_BASE | IA32_GS_BASE
             | IA32_KERNEL_GS_BASE | IA32_U_CET | IA32_S_CET => {
                 let _g = lock();
-                unsafe { oracle_bochs_get_msr(msr) }
+                unsafe { x86oracle_bochs_get_msr(msr) }
             }
             // Unmodelled MSRs read as zero, per the trait contract.
             _ => 0,
@@ -343,18 +343,18 @@ impl X86Oracle for BochsOracle {
 
     fn set_cr(&mut self, n: u32, value: u64) {
         let _g = lock();
-        unsafe { oracle_bochs_set_cr(n, value) }
+        unsafe { x86oracle_bochs_set_cr(n, value) }
     }
 
     fn get_cr(&self, n: u32) -> u64 {
         let _g = lock();
-        unsafe { oracle_bochs_get_cr(n) }
+        unsafe { x86oracle_bochs_get_cr(n) }
     }
 
     fn enable_shadow_stack(&mut self, base: u64, len: u64) -> Result<(), ShadowStackError> {
         let _g = lock();
         // 0 ok, 1 no CET in this build or CPU model, 2 range refused.
-        match unsafe { oracle_bochs_enable_shadow_stack(base, len) } {
+        match unsafe { x86oracle_bochs_enable_shadow_stack(base, len) } {
             0 => Ok(()),
             2 => Err(ShadowStackError::BadRange),
             _ => Err(ShadowStackError::Unsupported),
@@ -363,24 +363,24 @@ impl X86Oracle for BochsOracle {
 
     fn set_ssp(&mut self, value: u64) {
         let _g = lock();
-        unsafe { oracle_bochs_set_ssp(value) }
+        unsafe { x86oracle_bochs_set_ssp(value) }
     }
 
     fn get_ssp(&self) -> u64 {
         let _g = lock();
-        unsafe { oracle_bochs_get_ssp() }
+        unsafe { x86oracle_bochs_get_ssp() }
     }
 
     fn set_seg_selector(&mut self, n: u32, value: u16) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_set_seg_selector(n, value as u64) }
+        unsafe { x86oracle_bochs_set_seg_selector(n, value as u64) }
     }
 
     fn get_seg_selector(&self, n: u32) -> u16 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_get_seg_selector(n) as u16 }
+        unsafe { x86oracle_bochs_get_seg_selector(n) as u16 }
     }
 
     /// Bochs keeps the FS/GS base in the segment's descriptor cache, and
@@ -389,52 +389,52 @@ impl X86Oracle for BochsOracle {
     fn set_seg_base(&mut self, n: u32, value: u64) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_set_seg_base(n, value) }
+        unsafe { x86oracle_bochs_set_seg_base(n, value) }
     }
 
     fn get_seg_base(&self, n: u32) -> u64 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_get_seg_base(n) }
+        unsafe { x86oracle_bochs_get_seg_base(n) }
     }
 
     fn set_seg_limit(&mut self, n: u32, value: u32) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_set_seg_limit(n, value as u64) }
+        unsafe { x86oracle_bochs_set_seg_limit(n, value as u64) }
     }
 
     fn get_seg_limit(&self, n: u32) -> u32 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = lock();
-        unsafe { oracle_bochs_get_seg_limit(n) as u32 }
+        unsafe { x86oracle_bochs_get_seg_limit(n) as u32 }
     }
 
     fn read_mem_byte(&self, addr: u64) -> u8 {
         let _g = lock();
-        unsafe { oracle_bochs_read_mem(addr) }
+        unsafe { x86oracle_bochs_read_mem(addr) }
     }
 
     fn write_mem_byte(&mut self, addr: u64, byte: u8) {
         let _g = lock();
-        unsafe { oracle_bochs_write_mem(addr, byte) }
+        unsafe { x86oracle_bochs_write_mem(addr, byte) }
     }
 
     fn read_mem(&self, addr: u64, buf: &mut [u8]) {
         let _g = lock();
-        unsafe { oracle_bochs_read_mem_slice(addr, buf.as_mut_ptr(), buf.len() as u64) }
+        unsafe { x86oracle_bochs_read_mem_slice(addr, buf.as_mut_ptr(), buf.len() as u64) }
     }
 
     fn write_mem(&mut self, addr: u64, data: &[u8]) {
         let _g = lock();
-        unsafe { oracle_bochs_write_mem_slice(addr, data.as_ptr(), data.len() as u64) }
+        unsafe { x86oracle_bochs_write_mem_slice(addr, data.as_ptr(), data.len() as u64) }
     }
 
     /// 4 KiB granularity (Bochs' page map), versus the Sail backend's 16 MiB
     /// blocks — so this is a hint, not a portable predicate.
     fn is_mapped(&self, addr: u64) -> bool {
         let _g = lock();
-        unsafe { oracle_bochs_is_mapped(addr) != 0 }
+        unsafe { x86oracle_bochs_is_mapped(addr) != 0 }
     }
 
     fn step(&mut self) -> StepOutcome {
@@ -442,7 +442,7 @@ impl X86Oracle for BochsOracle {
         let mut error = 0u32;
         let status = {
             let _g = lock();
-            unsafe { oracle_bochs_step(&mut vector, &mut error) }
+            unsafe { x86oracle_bochs_step(&mut vector, &mut error) }
         };
         match status {
             0 => {

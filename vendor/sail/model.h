@@ -6,7 +6,7 @@
 #include "elf.h"
 extern void (*sail_rts_set_coverage_file)(const char *);
 
-namespace model {
+namespace sail_x86 {
 // enum write_kind
 enum zwrite_kind { zWrite_plain, zWrite_conditional, zWrite_release, zWrite_exclusive, zWrite_exclusive_release, zWrite_RISCV_release, zWrite_RISCV_strong_release, zWrite_RISCV_conditional, zWrite_RISCV_conditional_release, zWrite_RISCV_conditional_strong_release, zWrite_X86_locked };
 

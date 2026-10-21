@@ -1,5 +1,5 @@
 //! Sail backend: the x86 model translated from the ACL2 **x86isa** formal
-//! model, embedded via `csrc/shim.cpp` (`sail --cpp` → `class model::Model`).
+//! model, embedded via `csrc/shim.cpp` (`sail --cpp` → `class sail_x86::Model`).
 //!
 //! Strengths: the integer ISA semantics (including flag corner cases) are
 //! machine-checked in ACL2 — the highest-confidence reference available.
@@ -19,33 +19,33 @@ use crate::{
 };
 
 extern "C" {
-    fn oracle_new() -> *mut c_void;
-    fn oracle_free(h: *mut c_void);
-    fn oracle_set_gpr(h: *mut c_void, n: u32, value: u64);
-    fn oracle_get_gpr(h: *mut c_void, n: u32) -> u64;
-    fn oracle_set_rip(h: *mut c_void, value: u64);
-    fn oracle_get_rip(h: *mut c_void) -> u64;
-    fn oracle_set_rflags(h: *mut c_void, value: u64);
-    fn oracle_get_rflags(h: *mut c_void) -> u64;
-    fn oracle_step(h: *mut c_void) -> u64;
-    fn oracle_set_zmm(h: *mut c_void, n: u32, chunk: u32, value: u64);
-    fn oracle_get_zmm(h: *mut c_void, n: u32, chunk: u32) -> u64;
-    fn oracle_set_msr(h: *mut c_void, idx: u32, value: u64);
-    fn oracle_get_msr(h: *mut c_void, idx: u32) -> u64;
-    fn oracle_set_ctr(h: *mut c_void, idx: u32, value: u64);
-    fn oracle_get_ctr(h: *mut c_void, idx: u32) -> u64;
-    fn oracle_set_seg_visible(h: *mut c_void, n: u32, value: u64);
-    fn oracle_get_seg_visible(h: *mut c_void, n: u32) -> u64;
-    fn oracle_set_seg_base(h: *mut c_void, n: u32, value: u64);
-    fn oracle_get_seg_base(h: *mut c_void, n: u32) -> u64;
-    fn oracle_set_seg_limit(h: *mut c_void, n: u32, value: u64);
-    fn oracle_get_seg_limit(h: *mut c_void, n: u32) -> u64;
-    fn oracle_set_seg_attr(h: *mut c_void, n: u32, value: u64);
-    fn oracle_get_seg_attr(h: *mut c_void, n: u32) -> u64;
-    fn oracle_get_fault_msg(h: *mut c_void, buf: *mut u8, cap: usize) -> usize;
-    fn oracle_read_mem(h: *mut c_void, addr: u64) -> u8;
-    fn oracle_write_mem(h: *mut c_void, addr: u64, byte: u8);
-    fn oracle_is_mapped(h: *mut c_void, addr: u64) -> bool;
+    fn x86oracle_new() -> *mut c_void;
+    fn x86oracle_free(h: *mut c_void);
+    fn x86oracle_set_gpr(h: *mut c_void, n: u32, value: u64);
+    fn x86oracle_get_gpr(h: *mut c_void, n: u32) -> u64;
+    fn x86oracle_set_rip(h: *mut c_void, value: u64);
+    fn x86oracle_get_rip(h: *mut c_void) -> u64;
+    fn x86oracle_set_rflags(h: *mut c_void, value: u64);
+    fn x86oracle_get_rflags(h: *mut c_void) -> u64;
+    fn x86oracle_step(h: *mut c_void) -> u64;
+    fn x86oracle_set_zmm(h: *mut c_void, n: u32, chunk: u32, value: u64);
+    fn x86oracle_get_zmm(h: *mut c_void, n: u32, chunk: u32) -> u64;
+    fn x86oracle_set_msr(h: *mut c_void, idx: u32, value: u64);
+    fn x86oracle_get_msr(h: *mut c_void, idx: u32) -> u64;
+    fn x86oracle_set_ctr(h: *mut c_void, idx: u32, value: u64);
+    fn x86oracle_get_ctr(h: *mut c_void, idx: u32) -> u64;
+    fn x86oracle_set_seg_visible(h: *mut c_void, n: u32, value: u64);
+    fn x86oracle_get_seg_visible(h: *mut c_void, n: u32) -> u64;
+    fn x86oracle_set_seg_base(h: *mut c_void, n: u32, value: u64);
+    fn x86oracle_get_seg_base(h: *mut c_void, n: u32) -> u64;
+    fn x86oracle_set_seg_limit(h: *mut c_void, n: u32, value: u64);
+    fn x86oracle_get_seg_limit(h: *mut c_void, n: u32) -> u64;
+    fn x86oracle_set_seg_attr(h: *mut c_void, n: u32, value: u64);
+    fn x86oracle_get_seg_attr(h: *mut c_void, n: u32) -> u64;
+    fn x86oracle_get_fault_msg(h: *mut c_void, buf: *mut u8, cap: usize) -> usize;
+    fn x86oracle_read_byte(h: *mut c_void, addr: u64) -> u8;
+    fn x86oracle_write_byte(h: *mut c_void, addr: u64, byte: u8);
+    fn x86oracle_is_mapped(h: *mut c_void, addr: u64) -> bool;
 }
 
 /// The model's compact MSR file (x86isa `concrete-state.lisp` order) — the
@@ -90,8 +90,8 @@ impl SailOracle {
     /// all registers zero, RFLAGS = 0x2, CR4.OSFXSR set.
     pub fn new() -> Self {
         let _g = model_lock();
-        let h = unsafe { oracle_new() };
-        assert!(!h.is_null(), "oracle_new returned null");
+        let h = unsafe { x86oracle_new() };
+        assert!(!h.is_null(), "x86oracle_new returned null");
         SailOracle { h }
     }
 
@@ -101,13 +101,13 @@ impl SailOracle {
     pub fn set_seg_attr(&mut self, n: u32, value: u16) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_set_seg_attr(self.h, n, value as u64) }
+        unsafe { x86oracle_set_seg_attr(self.h, n, value as u64) }
     }
 
     pub fn get_seg_attr(&self, n: u32) -> u16 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_get_seg_attr(self.h, n) as u16 }
+        unsafe { x86oracle_get_seg_attr(self.h, n) as u16 }
     }
 
     /// Classify the model's free-text exception message. ACL2 faults carry the
@@ -144,7 +144,7 @@ impl Default for SailOracle {
 impl Drop for SailOracle {
     fn drop(&mut self) {
         let _g = model_lock();
-        unsafe { oracle_free(self.h) }
+        unsafe { x86oracle_free(self.h) }
     }
 }
 
@@ -156,33 +156,33 @@ impl X86Oracle for SailOracle {
     fn set_gpr(&mut self, n: u32, value: u64) {
         debug_assert!(n <= 15);
         let _g = model_lock();
-        unsafe { oracle_set_gpr(self.h, n, value) }
+        unsafe { x86oracle_set_gpr(self.h, n, value) }
     }
 
     fn get_gpr(&self, n: u32) -> u64 {
         debug_assert!(n <= 15);
         let _g = model_lock();
-        unsafe { oracle_get_gpr(self.h, n) }
+        unsafe { x86oracle_get_gpr(self.h, n) }
     }
 
     fn set_rip(&mut self, value: u64) {
         let _g = model_lock();
-        unsafe { oracle_set_rip(self.h, value) }
+        unsafe { x86oracle_set_rip(self.h, value) }
     }
 
     fn get_rip(&self) -> u64 {
         let _g = model_lock();
-        unsafe { oracle_get_rip(self.h) }
+        unsafe { x86oracle_get_rip(self.h) }
     }
 
     fn set_rflags(&mut self, value: u64) {
         let _g = model_lock();
-        unsafe { oracle_set_rflags(self.h, value) }
+        unsafe { x86oracle_set_rflags(self.h, value) }
     }
 
     fn get_rflags(&self) -> u64 {
         let _g = model_lock();
-        unsafe { oracle_get_rflags(self.h) }
+        unsafe { x86oracle_get_rflags(self.h) }
     }
 
     fn set_zmm(&mut self, n: u32, data: &[u64]) {
@@ -190,7 +190,7 @@ impl X86Oracle for SailOracle {
         let _g = model_lock();
         for i in 0..ZMM_CHUNKS {
             let v = data.get(i).copied().unwrap_or(0);
-            unsafe { oracle_set_zmm(self.h, n, i as u32, v) }
+            unsafe { x86oracle_set_zmm(self.h, n, i as u32, v) }
         }
     }
 
@@ -199,7 +199,7 @@ impl X86Oracle for SailOracle {
         let _g = model_lock();
         let mut out = [0u64; ZMM_CHUNKS];
         for (i, slot) in out.iter_mut().enumerate() {
-            *slot = unsafe { oracle_get_zmm(self.h, n, i as u32) };
+            *slot = unsafe { x86oracle_get_zmm(self.h, n, i as u32) };
         }
         out
     }
@@ -207,7 +207,7 @@ impl X86Oracle for SailOracle {
     fn set_msr(&mut self, msr: u32, value: u64) {
         if let Some(idx) = msr_slot(msr) {
             let _g = model_lock();
-            unsafe { oracle_set_msr(self.h, idx, value) }
+            unsafe { x86oracle_set_msr(self.h, idx, value) }
         }
     }
 
@@ -215,7 +215,7 @@ impl X86Oracle for SailOracle {
         match msr_slot(msr) {
             Some(idx) => {
                 let _g = model_lock();
-                unsafe { oracle_get_msr(self.h, idx) }
+                unsafe { x86oracle_get_msr(self.h, idx) }
             }
             None => 0,
         }
@@ -224,25 +224,25 @@ impl X86Oracle for SailOracle {
     fn set_cr(&mut self, n: u32, value: u64) {
         debug_assert!(n <= 16);
         let _g = model_lock();
-        unsafe { oracle_set_ctr(self.h, n, value) }
+        unsafe { x86oracle_set_ctr(self.h, n, value) }
     }
 
     fn get_cr(&self, n: u32) -> u64 {
         debug_assert!(n <= 16);
         let _g = model_lock();
-        unsafe { oracle_get_ctr(self.h, n) }
+        unsafe { x86oracle_get_ctr(self.h, n) }
     }
 
     fn set_seg_selector(&mut self, n: u32, value: u16) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_set_seg_visible(self.h, n, value as u64) }
+        unsafe { x86oracle_set_seg_visible(self.h, n, value as u64) }
     }
 
     fn get_seg_selector(&self, n: u32) -> u16 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_get_seg_visible(self.h, n) as u16 }
+        unsafe { x86oracle_get_seg_visible(self.h, n) as u16 }
     }
 
     /// In 64-bit mode the model reads the FS/GS bases from
@@ -252,7 +252,7 @@ impl X86Oracle for SailOracle {
         debug_assert!((n as usize) < SEG_COUNT);
         {
             let _g = model_lock();
-            unsafe { oracle_set_seg_base(self.h, n, value) }
+            unsafe { x86oracle_set_seg_base(self.h, n, value) }
         }
         match n {
             SEG_FS => self.set_msr(IA32_FS_BASE, value),
@@ -269,7 +269,7 @@ impl X86Oracle for SailOracle {
             SEG_GS => self.get_msr(IA32_GS_BASE),
             _ => {
                 let _g = model_lock();
-                unsafe { oracle_get_seg_base(self.h, n) }
+                unsafe { x86oracle_get_seg_base(self.h, n) }
             }
         }
     }
@@ -277,49 +277,49 @@ impl X86Oracle for SailOracle {
     fn set_seg_limit(&mut self, n: u32, value: u32) {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_set_seg_limit(self.h, n, value as u64) }
+        unsafe { x86oracle_set_seg_limit(self.h, n, value as u64) }
     }
 
     fn get_seg_limit(&self, n: u32) -> u32 {
         debug_assert!((n as usize) < SEG_COUNT);
         let _g = model_lock();
-        unsafe { oracle_get_seg_limit(self.h, n) as u32 }
+        unsafe { x86oracle_get_seg_limit(self.h, n) as u32 }
     }
 
     fn read_mem_byte(&self, addr: u64) -> u8 {
         let _g = model_lock();
-        unsafe { oracle_read_mem(self.h, addr) }
+        unsafe { x86oracle_read_byte(self.h, addr) }
     }
 
     fn write_mem_byte(&mut self, addr: u64, byte: u8) {
         let _g = model_lock();
-        unsafe { oracle_write_mem(self.h, addr, byte) }
+        unsafe { x86oracle_write_byte(self.h, addr, byte) }
     }
 
     // Batched overrides: one lock acquisition for the whole slice.
     fn read_mem(&self, addr: u64, buf: &mut [u8]) {
         let _g = model_lock();
         for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = unsafe { oracle_read_mem(self.h, addr.wrapping_add(i as u64)) };
+            *slot = unsafe { x86oracle_read_byte(self.h, addr.wrapping_add(i as u64)) };
         }
     }
 
     fn write_mem(&mut self, addr: u64, data: &[u8]) {
         let _g = model_lock();
         for (i, &byte) in data.iter().enumerate() {
-            unsafe { oracle_write_mem(self.h, addr.wrapping_add(i as u64), byte) }
+            unsafe { x86oracle_write_byte(self.h, addr.wrapping_add(i as u64), byte) }
         }
     }
 
     fn is_mapped(&self, addr: u64) -> bool {
         let _g = model_lock();
-        unsafe { oracle_is_mapped(self.h, addr) }
+        unsafe { x86oracle_is_mapped(self.h, addr) }
     }
 
     fn step(&mut self) -> StepOutcome {
         let status = {
             let _g = model_lock();
-            unsafe { oracle_step(self.h) }
+            unsafe { x86oracle_step(self.h) }
         };
         match status {
             0 => StepOutcome::Retired,
@@ -333,9 +333,9 @@ impl X86Oracle for SailOracle {
 
     fn fault_msg(&self) -> String {
         let _g = model_lock();
-        let len = unsafe { oracle_get_fault_msg(self.h, std::ptr::null_mut(), 0) };
+        let len = unsafe { x86oracle_get_fault_msg(self.h, std::ptr::null_mut(), 0) };
         let mut buf = vec![0u8; len + 1];
-        unsafe { oracle_get_fault_msg(self.h, buf.as_mut_ptr(), buf.len()) };
+        unsafe { x86oracle_get_fault_msg(self.h, buf.as_mut_ptr(), buf.len()) };
         buf.truncate(len);
         String::from_utf8_lossy(&buf).into_owned()
     }

@@ -244,9 +244,18 @@ The two software backends follow the same recipe: a C/C++ shim exposes a flat
 `extern "C"` handle ABI, `build.rs` compiles it, and the Rust side is a thin safe
 wrapper that serializes calls.
 
-- **Sail**: `sail --cpp` turns the model into `class model::Model` whose
+- **Sail**: `sail --cpp` turns the model into `class sail_x86::Model` whose
   architectural state is instance members, which is what allows many
-  independent oracles; regeneration steps are below.
+  independent oracles; regeneration steps are below. Every native name this
+  half exports carries this crate's prefix, so it links into the same program
+  as another Sail oracle (sail-riscv-oracle, sail-aarch64-oracle): the shim
+  functions are `x86oracle_*`, the model is in namespace `sail_x86`, and the
+  runtime and model globals are renamed by `csrc/x86oracle_prefix.h`, which
+  `build.rs` force-includes into the model, runtime and shim. That header is
+  generated from the built libraries by `scripts/gen_prefix_header.sh`; re-run
+  it after upgrading Sail or regenerating the model, then rebuild and run
+  `sh scripts/gen_prefix_header.sh --check` (Windows MSVC only).
+  `tests/coexist/` links this crate together with sail-riscv-oracle.
 - **Bochs**: `vendor/bochs/` holds the upstream CPU sources at a pinned
   revision, plus the fixes in `patches/bochs/` that `scripts/vendor-bochs.sh`
   applies on top — upstream bugs this crate's differential suite found and
@@ -342,7 +351,7 @@ sail-x86-from-acl2. Needs Sail 0.20.1 + z3.
 cd sail-x86-from-acl2/model
 ORACLE=/path/to/hybrid-x86-oracle
 
-sail --cpp --c-no-main -O --Oconstant-fold --memo-z3 \
+sail --cpp --cpp-namespace sail_x86 --c-no-main -O --Oconstant-fold --memo-z3 \
     --c-preserve main --c-preserve init_harness \
     --c-preserve set_gpr --c-preserve get_gpr \
     --c-preserve set_rip --c-preserve get_rip \
@@ -364,6 +373,9 @@ sail --cpp --c-no-main -O --Oconstant-fold --memo-z3 \
 
 python3 "$ORACLE/scripts/fix_cpp_model.py" cpp/model.h cpp/model.cpp
 ```
+
+`fix_cpp_model.py` also renames the namespace `model` to `sail_x86`, so a Sail
+without `--cpp-namespace` gives the same result once that flag is dropped.
 
 Two deliberate substitutions: `logging.sail` is replaced by
 `sail/quiet_logging.sail` (the stock one prints every memory access to stdout),

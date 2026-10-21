@@ -125,8 +125,9 @@ struct GuestMemory {
 };
 
 /* The single live instance's memory (one CPU per process, see the header
- * comment). Held as a pointer so oracle_free can tear it down deterministically
- * and a later oracle_new starts from a clean address space. */
+ * comment). Held as a pointer so x86oracle_bochs_free can tear it down
+ * deterministically and a later x86oracle_bochs_new starts from a clean address
+ * space. */
 GuestMemory *g_mem = nullptr;
 
 GuestMemory &mem() {
@@ -412,18 +413,6 @@ Bit8u bx_get_plugin_flags_np(Bit16u, Bit8u) { return 0; }
 int bx_load_plugin_np(const char *, Bit16u) { return 0; }
 int bx_unload_opt_plugin(const char *, bool) { return 0; }
 
-extern "C" {
-/* RDRAND/RDSEED entropy. Deliberately a fixed sequence: an oracle must be
- * reproducible. Callers should exclude these instructions from diffing. */
-Bit64u bochscpu_rand(unsigned) {
-    static Bit64u state = 0x9E37'79B9'7F4A'7C15ull;
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    return state;
-}
-}
-
 
 /* ---------------------------------------------------------------------------
  * 5) The configuration parameter tree
@@ -605,7 +594,7 @@ void build_identity_map() {
  *
  * The identity map uses 2 MiB frames, so this rounds outward to whole frames —
  * a caller must keep ordinary data out of the frames it converts. Seeding is
- * unaffected either way: `oracle_bochs_write_mem` reaches physical memory
+ * unaffected either way: `x86oracle_bochs_write_mem` reaches physical memory
  * directly and never walks the page tables.
  */
 bool map_shadow_stack(uint64_t base, uint64_t len) {
@@ -734,13 +723,13 @@ extern "C" {
 /* Non-zero if a BochsOracle already exists: the Bochs CPU is a process
  * singleton, so the Rust side turns this into a clear error instead of silent
  * state sharing. */
-int oracle_bochs_alive(void) { return g_alive ? 1 : 0; }
+int x86oracle_bochs_alive(void) { return g_alive ? 1 : 0; }
 
 /* Which BxCpuMode the core is in; 4 == BX_MODE_LONG_64. Exposed so a test can
  * assert the oracle really is in long mode rather than silently in real mode. */
-uint32_t oracle_bochs_cpu_mode(void) { return (uint32_t)bx_cpu.cpu_mode; }
+uint32_t x86oracle_bochs_cpu_mode(void) { return (uint32_t)bx_cpu.cpu_mode; }
 
-void *oracle_bochs_new(void) {
+void *x86oracle_bochs_new(void) {
     if (g_alive) {
         return nullptr;
     }
@@ -776,7 +765,7 @@ void *oracle_bochs_new(void) {
          * revision of this shim ran that way for months — hence the hard
          * failure instead of an assert that NDEBUG would compile out. CET
          * still changes nothing until CR4.CET is set (see
-         * oracle_bochs_enable_shadow_stack): until then the instructions
+         * x86oracle_bochs_enable_shadow_stack): until then the instructions
          * behave as the ISA says for "shadow stacks off". Both must precede
          * initialize(), which is what applies these parameters (init.cc reads
          * add_features right after the model's own feature list, then runs
@@ -813,7 +802,7 @@ void *oracle_bochs_new(void) {
     return reinterpret_cast<void *>(1);
 }
 
-void oracle_bochs_free(void *) {
+void x86oracle_bochs_free(void *) {
     if (g_mem != nullptr) {
         g_mem->clear();
     }
@@ -823,15 +812,15 @@ void oracle_bochs_free(void *) {
 /* -- registers ------------------------------------------------------------ */
 
 /* Rust passes the ModRM index; Bochs' gen_reg array uses the same order. */
-void oracle_bochs_set_gpr(uint32_t n, uint64_t v) { bx_cpu.gen_reg[n & 0xF].rrx = v; }
-uint64_t oracle_bochs_get_gpr(uint32_t n) { return bx_cpu.gen_reg[n & 0xF].rrx; }
+void x86oracle_bochs_set_gpr(uint32_t n, uint64_t v) { bx_cpu.gen_reg[n & 0xF].rrx = v; }
+uint64_t x86oracle_bochs_get_gpr(uint32_t n) { return bx_cpu.gen_reg[n & 0xF].rrx; }
 
-void oracle_bochs_set_rip(uint64_t v) {
+void x86oracle_bochs_set_rip(uint64_t v) {
     bx_cpu.gen_reg[BX_64BIT_REG_RIP].rrx = v;
     bx_cpu.prev_rip = v;
     bx_cpu.invalidate_prefetch_q();
 }
-uint64_t oracle_bochs_get_rip(void) { return bx_cpu.gen_reg[BX_64BIT_REG_RIP].rrx; }
+uint64_t x86oracle_bochs_get_rip(void) { return bx_cpu.gen_reg[BX_64BIT_REG_RIP].rrx; }
 
 /* read_eflags() forces the lazy OSZAPC flags — see the header comment.
  *
@@ -842,21 +831,21 @@ uint64_t oracle_bochs_get_rip(void) { return bx_cpu.gen_reg[BX_64BIT_REG_RIP].rr
  * -loop reads back 0x10002 here and 0x2 on hardware. */
 static const Bit32u kHarnessFlags = 0x100 /* TF */ | 0x10000 /* RF */;
 
-uint64_t oracle_bochs_get_rflags(void) { return bx_cpu.read_eflags() & ~kHarnessFlags; }
-void oracle_bochs_set_rflags(uint64_t v) {
+uint64_t x86oracle_bochs_get_rflags(void) { return bx_cpu.read_eflags() & ~kHarnessFlags; }
+void x86oracle_bochs_set_rflags(uint64_t v) {
     bx_cpu.setEFlags(((Bit32u)v & ~kHarnessFlags) | 0x2);
 }
 
-void oracle_bochs_set_zmm(uint32_t n, uint32_t chunk, uint64_t v) {
+void x86oracle_bochs_set_zmm(uint32_t n, uint32_t chunk, uint64_t v) {
     bx_cpu.vmm[n & 0x1F].vmm64u(chunk & 0x7) = v;
 }
-uint64_t oracle_bochs_get_zmm(uint32_t n, uint32_t chunk) {
+uint64_t x86oracle_bochs_get_zmm(uint32_t n, uint32_t chunk) {
     return bx_cpu.vmm[n & 0x1F].vmm64u(chunk & 0x7);
 }
 
 /* MSRs by architectural number, through the CPU's own RDMSR/WRMSR paths where
  * possible so side effects (e.g. EFER.LMA) behave architecturally. */
-void oracle_bochs_set_msr(uint32_t msr, uint64_t v) {
+void x86oracle_bochs_set_msr(uint32_t msr, uint64_t v) {
     switch (msr) {
     case 0xC000'0080: bx_cpu.efer.set32((Bit32u)v); break;
     case 0xC000'0081: bx_cpu.msr.star = v; break;
@@ -877,7 +866,7 @@ void oracle_bochs_set_msr(uint32_t msr, uint64_t v) {
     }
 }
 
-uint64_t oracle_bochs_get_msr(uint32_t msr) {
+uint64_t x86oracle_bochs_get_msr(uint32_t msr) {
     switch (msr) {
     case 0xC000'0080: return bx_cpu.efer.get32();
     case 0xC000'0081: return bx_cpu.msr.star;
@@ -895,8 +884,8 @@ uint64_t oracle_bochs_get_msr(uint32_t msr) {
 }
 
 /* SSP is a register, not an MSR, and it sits past the 16 ModRM slots that
- * `oracle_bochs_set_gpr` masks into — so it needs its own door. */
-void oracle_bochs_set_ssp(uint64_t v) {
+ * `x86oracle_bochs_set_gpr` masks into — so it needs its own door. */
+void x86oracle_bochs_set_ssp(uint64_t v) {
 #if BX_SUPPORT_CET
     bx_cpu.gen_reg[BX_64BIT_REG_SSP].rrx = v;
 #else
@@ -904,7 +893,7 @@ void oracle_bochs_set_ssp(uint64_t v) {
 #endif
 }
 
-uint64_t oracle_bochs_get_ssp(void) {
+uint64_t x86oracle_bochs_get_ssp(void) {
 #if BX_SUPPORT_CET
     return bx_cpu.gen_reg[BX_64BIT_REG_SSP].rrx;
 #else
@@ -920,7 +909,7 @@ uint64_t oracle_bochs_get_ssp(void) {
  * Returns 0 on success, 1 if this build/model has no CET, 2 if the range was
  * refused. The caller turns those into ShadowStackError, and the distinction is
  * the point: "no CET here" is a reason to skip a case, a bad range is a bug. */
-int oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
+int x86oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
 #if BX_SUPPORT_CET
     /* The compile-time guard only says the Bochs *build* has the code. Whether
      * this CPU model claims the extension is a runtime question, and the answer
@@ -955,7 +944,7 @@ int oracle_bochs_enable_shadow_stack(uint64_t base, uint64_t len) {
 #endif
 }
 
-void oracle_bochs_set_cr(uint32_t n, uint64_t v) {
+void x86oracle_bochs_set_cr(uint32_t n, uint64_t v) {
     switch (n) {
     case 0: bx_cpu.cr0.set32((Bit32u)v); bx_cpu.updateFetchModeMask(); break;
     case 2: bx_cpu.cr2 = v; break;
@@ -967,7 +956,7 @@ void oracle_bochs_set_cr(uint32_t n, uint64_t v) {
     }
 }
 
-uint64_t oracle_bochs_get_cr(uint32_t n) {
+uint64_t x86oracle_bochs_get_cr(uint32_t n) {
     switch (n) {
     case 0: return bx_cpu.cr0.get32();
     case 2: return bx_cpu.cr2;
@@ -979,22 +968,22 @@ uint64_t oracle_bochs_get_cr(uint32_t n) {
 
 /* Rust's SEG_* order is the x86isa one (ES CS SS DS FS GS); Bochs' enum is
  * ES=0 CS=1 SS=2 DS=3 FS=4 GS=5 as well, so the index passes through. */
-void oracle_bochs_set_seg_selector(uint32_t n, uint64_t v) {
+void x86oracle_bochs_set_seg_selector(uint32_t n, uint64_t v) {
     bx_cpu.sregs[n % 6].selector.value = (Bit16u)v;
 }
-uint64_t oracle_bochs_get_seg_selector(uint32_t n) {
+uint64_t x86oracle_bochs_get_seg_selector(uint32_t n) {
     return bx_cpu.sregs[n % 6].selector.value;
 }
-void oracle_bochs_set_seg_base(uint32_t n, uint64_t v) {
+void x86oracle_bochs_set_seg_base(uint32_t n, uint64_t v) {
     bx_cpu.sregs[n % 6].cache.u.segment.base = v;
 }
-uint64_t oracle_bochs_get_seg_base(uint32_t n) {
+uint64_t x86oracle_bochs_get_seg_base(uint32_t n) {
     return bx_cpu.sregs[n % 6].cache.u.segment.base;
 }
-void oracle_bochs_set_seg_limit(uint32_t n, uint64_t v) {
+void x86oracle_bochs_set_seg_limit(uint32_t n, uint64_t v) {
     bx_cpu.sregs[n % 6].cache.u.segment.limit_scaled = (Bit32u)v;
 }
-uint64_t oracle_bochs_get_seg_limit(uint32_t n) {
+uint64_t x86oracle_bochs_get_seg_limit(uint32_t n) {
     return bx_cpu.sregs[n % 6].cache.u.segment.limit_scaled;
 }
 
@@ -1008,20 +997,20 @@ uint64_t oracle_bochs_get_seg_limit(uint32_t n) {
  * bx_instr_exception's guard keeps only the first vector. Do NOT mirror real
  * tables into guest memory: a present gate would let delivery SUCCEED and
  * vector through the IDT, breaking the faults-do-not-vector contract. */
-void oracle_bochs_set_dtr(uint32_t which, uint64_t base, uint64_t limit) {
+void x86oracle_bochs_set_dtr(uint32_t which, uint64_t base, uint64_t limit) {
     bx_global_segment_reg_t *r = which ? &bx_cpu.idtr : &bx_cpu.gdtr;
     r->base = (bx_address)base;
     r->limit = (Bit16u)limit;
 }
 /* The selector alone — the hidden TSS base/limit stay at reset, since nothing
  * here delivers through a TSS. STR reads only the selector. */
-void oracle_bochs_set_tr_selector(uint64_t v) {
+void x86oracle_bochs_set_tr_selector(uint64_t v) {
     bx_cpu.tr.selector.value = (Bit16u)v;
 }
 
 /* -- memory (linear addresses; identity-mapped, so linear == physical) ---- */
 
-uint8_t oracle_bochs_read_mem(uint64_t addr) {
+uint8_t x86oracle_bochs_read_mem(uint64_t addr) {
     uint8_t b = 0;
     mem().read(addr, 1, &b);
     return b;
@@ -1043,36 +1032,36 @@ uint8_t oracle_bochs_read_mem(uint64_t addr) {
  *
  * The prefetch queue holds raw bytes for the current page and is not covered by
  * the stamp table, so it goes too. */
-void invalidate_decoded(uint64_t addr) {
+static void invalidate_decoded(uint64_t addr) {
     pageWriteStampTable.decWriteStamp((bx_phy_address)addr, 1);
     bx_cpu.invalidate_prefetch_q();
 }
 
-void oracle_bochs_write_mem(uint64_t addr, uint8_t byte) {
+void x86oracle_bochs_write_mem(uint64_t addr, uint8_t byte) {
     mem().write(addr, 1, &byte);
     invalidate_decoded(addr);
 }
 
-void oracle_bochs_read_mem_slice(uint64_t addr, uint8_t *dst, uint64_t len) {
+void x86oracle_bochs_read_mem_slice(uint64_t addr, uint8_t *dst, uint64_t len) {
     for (uint64_t i = 0; i < len; i++) {
         mem().read(addr + i, 1, dst + i);
     }
 }
 
-void oracle_bochs_write_mem_slice(uint64_t addr, const uint8_t *src, uint64_t len) {
+void x86oracle_bochs_write_mem_slice(uint64_t addr, const uint8_t *src, uint64_t len) {
     for (uint64_t i = 0; i < len; i++) {
         mem().write(addr + i, 1, src + i);
         invalidate_decoded(addr + i);
     }
 }
 
-int oracle_bochs_is_mapped(uint64_t addr) { return mem().mapped(addr) ? 1 : 0; }
+int x86oracle_bochs_is_mapped(uint64_t addr) { return mem().mapped(addr) ? 1 : 0; }
 
 /* -- execution ----------------------------------------------------------- */
 
 /* Returns 0 = retired, 1 = fault (vector/error via the out-params), 2 = HLT.
  * One call runs exactly one instruction (or one REP iteration). */
-uint32_t oracle_bochs_step(uint32_t *out_vector, uint32_t *out_error) {
+uint32_t x86oracle_bochs_step(uint32_t *out_vector, uint32_t *out_error) {
     g_step = StepCtl();
     g_step.armed = true;
 

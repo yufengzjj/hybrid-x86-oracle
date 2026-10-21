@@ -22,7 +22,7 @@ enabled cargo features ask for.
   `model/` (master, 2026-07) plus this crate's `sail/harness.sail` (and with
   `logging.sail` replaced by `sail/quiet_logging.sail`), using the command in
   the README's "Regenerating the Sail model" section **followed by
-  `scripts/fix_cpp_model.py`**. The model is a C++ class (`model::Model`): all
+  `scripts/fix_cpp_model.py`**. The model is a C++ class (`sail_x86::Model`): all
   architectural state is per-instance, which is what enables multiple
   independent oracles per process.
 
@@ -78,6 +78,14 @@ enabled cargo features ask for.
     eight affected GMP entry points are macro-redirected to 64-bit-safe inline
     versions there.
 
+  Not a patch, but applied to every runtime file: `build.rs` force-includes
+  `csrc/x86oracle_prefix.h`, which renames each external runtime and mini-gmp
+  name to `x86oracle_*` so another Sail oracle's copy of the same runtime can
+  link into the same program. The `sail.h` LLP64 macros above `#undef` and
+  redefine some of those `mpz_*` names; that is fine because the calls then go
+  to `sail.h`'s own `static inline` versions, but keep it in mind when editing
+  that hunk.
+
   License: BSD-2-Clause (Sail authors); cJSON is MIT.
 
 - `sail/runtime/mini-gmp.{c,h}`, `mini-mpq.{c,h}` — from **GMP 6.3.0**.
@@ -88,7 +96,10 @@ enabled cargo features ask for.
 
 `model.cpp.gz` (~9 MB → ~1 MB) is decompressed into `OUT_DIR` at build time.
 `X86_ORACLE_SAIL_MODEL_C` / `SAIL_LIB_DIR` override the model and runtime for
-anyone building against a freshly generated one.
+anyone building against a freshly generated one. With `SAIL_LIB_DIR` the
+runtime is not renamed (the prefix header only lists the vendored runtime's
+names), so such a build cannot link into the same program as another Sail
+oracle.
 
 To regenerate after editing `sail/harness.sail`, follow the README section
 (which ends with `fix_cpp_model.py`), then refresh with:
@@ -101,6 +112,9 @@ cp /path/to/sail-x86-from-acl2/model/cpp/model.h \
 
 The runtime is independent of the generated model — only re-copy
 `sail/runtime/` if you upgrade Sail itself, and then re-apply the patch hunks.
+
+After either, run `sh scripts/gen_prefix_header.sh` to refresh
+`csrc/x86oracle_prefix.h`, rebuild, and run it again with `--check`.
 
 ---
 

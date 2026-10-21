@@ -321,9 +321,27 @@ fn build_sail() {
             .flag_if_supported("-Wno-extra");
     };
 
+    // Renames every runtime and model global to x86oracle_*, so another Sail
+    // oracle can link into the same program. Skipped for an external runtime:
+    // its extra sources (elf.c) are not in the list, so it would only be renamed
+    // in part.
+    let prefix_header = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("csrc/x86oracle_prefix.h");
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let force_prefix = |b: &mut cc::Build| {
+        if system_runtime {
+            return;
+        }
+        if msvc {
+            b.flag(format!("/FI{}", prefix_header.display()));
+        } else {
+            b.flag("-include").flag(prefix_header.display().to_string());
+        }
+    };
+
     // ---- 1) C++: generated model class + shim ------------------------------
     // Must be compiled FIRST: the model archive references runtime symbols, so
-    // it must precede libsailruntime on traditional linkers.
+    // it must precede the runtime archive on traditional linkers.
     // C++20 required: generated code uses designated initializers + the `not`
     // token; MSVC needs /std:c++20 (implies /permissive-) for those.
     let mut cxx = cc::Build::new();
@@ -343,13 +361,14 @@ fn build_sail() {
         cxx.file(missing);
     }
     common_flags(&mut cxx);
+    force_prefix(&mut cxx);
     if system_gmp {
         cxx.define("SAIL_SYSTEM_GMP", None); // sail.h: include <gmp.h>
         if let Some(inc) = &gmp_include {
             cxx.include(inc);
         }
     }
-    cxx.compile("sailx86");
+    cxx.compile("x86oracle_sail");
 
     // ---- 2) C: Sail runtime -------------------------------------------------
     let mut crt = cc::Build::new();
@@ -358,6 +377,7 @@ fn build_sail() {
         .file(sail_lib.join("sail.c"))
         .file(sail_lib.join("rts.c"));
     common_flags(&mut crt);
+    force_prefix(&mut crt);
     // Sail >= 0.18 split the runtime: sail_assert (sail_failure.c) and
     // sail_config.c (needs cJSON.c) are referenced by the generated code.
     for extra in ["sail_failure.c", "sail_config.c", "cJSON.c"] {
@@ -379,7 +399,7 @@ fn build_sail() {
         // Only external runtimes compile elf.c; the model references nothing in it.
         crt.file(sail_lib.join("elf.c"));
     }
-    crt.compile("sailruntime");
+    crt.compile("x86oracle_runtime");
 
     // ---- native link deps ----------------------------------------------------
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -423,8 +443,11 @@ fn build_sail() {
     for p in [
         model_src.as_path(),
         Path::new("vendor/sail/model.cpp.gz"),
+        Path::new("vendor/sail/model.h"),
+        Path::new("vendor/sail/model_missing.cpp"),
         Path::new("vendor/sail/runtime"),
         Path::new("csrc/shim.cpp"),
+        Path::new("csrc/x86oracle_prefix.h"),
         Path::new("build.rs"),
     ] {
         println!("cargo:rerun-if-changed={}", p.display());

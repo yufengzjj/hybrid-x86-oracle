@@ -5,7 +5,7 @@
 #include "rts.h"
 #include "model.h"
 
-namespace model {
+namespace sail_x86 {
 
 
-} // namespace model
+} // namespace sail_x86
