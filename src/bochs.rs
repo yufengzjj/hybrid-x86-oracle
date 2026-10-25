@@ -21,7 +21,7 @@ use crate::{
     IA32_S_CET, IA32_U_CET, IDT_ADDR, IDT_LIMIT, SEG_COUNT, SEL_TSS,
 };
 
-extern "C" {
+native_api! {
     fn x86oracle_bochs_new() -> *mut std::ffi::c_void;
     fn x86oracle_bochs_free(h: *mut std::ffi::c_void);
     fn x86oracle_bochs_cpu_mode() -> u32;

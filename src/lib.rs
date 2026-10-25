@@ -57,6 +57,10 @@
 //! Where backends legitimately differ (undefined flags, unimplemented
 //! opcodes), see `docs/backend-differences.md`.
 
+#[cfg(any(feature = "sail", feature = "bochs"))]
+#[macro_use]
+mod native;
+
 #[cfg(feature = "bochs")]
 mod bochs;
 // `backend_kvm` / `backend_whp` come from build.rs: the hardware backends need

@@ -242,7 +242,11 @@ executing one.
 
 The two software backends follow the same recipe: a C/C++ shim exposes a flat
 `extern "C"` handle ABI, `build.rs` compiles it, and the Rust side is a thin safe
-wrapper that serializes calls.
+wrapper that serializes calls. On Windows MSVC `build.rs` links both backends into
+one `x86oracle.dll` in its `OUT_DIR` (with a copy of gmp's DLL beside it under
+`system-gmp`) instead of static libraries, and the crate loads it by absolute path
+on the first call, so each program that uses the oracle no longer carries a copy
+of the model and the emulator.
 
 - **Sail**: `sail --cpp` turns the model into `class sail_x86::Model` whose
   architectural state is instance members, which is what allows many
@@ -413,9 +417,9 @@ disagree with hardware:
   (the host these examples came from: 16 × 256-bit vectors, no AVX-512), and
   implementation-defined behaviour may differ on another CPU.
 - **Licensing**: this crate's own code is BSD-3-Clause. The Sail backend
-  statically links a **mini-gmp (LGPL)** vendored under `vendor/sail/`; the
-  Bochs backend statically links **Bochs (LGPL-2.1)**, vendored under
-  `vendor/bochs/`.
+  links a **mini-gmp (LGPL)** vendored under `vendor/sail/`; the Bochs backend
+  links **Bochs (LGPL-2.1)**, vendored under `vendor/bochs/` (statically,
+  except into `x86oracle.dll` on Windows MSVC).
   Both matter if you redistribute binaries — see `LICENSE` and
   `vendor/README.md`.
 

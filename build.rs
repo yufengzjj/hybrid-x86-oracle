@@ -1,5 +1,9 @@
 //! Build script: compile the Sail C++ model class + the C Sail runtime + shim.
 //!
+//! On Windows MSVC the static libraries of both native backends are linked into
+//! `$OUT_DIR/x86oracle.dll` (see `link_dll`) instead of into each program;
+//! src/native.rs loads it.
+//!
 //! Default is fully self-contained — vendored pre-generated model + patched
 //! runtime with bundled mini-gmp, no Sail/GMP/zlib. Env overrides for building
 //! against a freshly generated model (see README Step 2):
@@ -202,7 +206,79 @@ fn scan_path_flat(static_only: bool) -> (Option<PathBuf>, Option<PathBuf>) {
 }
 
 /// Build the Sail backend (`sail` feature): vendored model + patched runtime.
-fn build_sail() {
+/// What goes into `x86oracle.dll`, built on Windows MSVC instead of one static library per
+/// backend.
+#[derive(Default)]
+struct DllParts {
+    libs: Vec<PathBuf>,
+    link_args: Vec<String>,
+    gmp_bin: Option<PathBuf>,
+    export_sources: Vec<&'static str>,
+}
+
+/// Static libraries, not loose objects, go into the DLL: the linker then takes only the
+/// members it needs, as in a static link (Bochs' SoftFloat defines some helpers in
+/// several objects).
+fn compile(b: &mut cc::Build, name: &str, dll: &mut Option<DllParts>) {
+    if let Some(d) = dll {
+        b.cargo_metadata(false);
+        d.libs.push(PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("{name}.lib")));
+    }
+    b.compile(name);
+}
+
+/// Links `$OUT_DIR/x86oracle.dll`, exporting every `x86oracle_*` function named in the
+/// enabled backends' sources, and copies gmp's DLL beside it.
+fn link_dll(d: DllParts) {
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let mut exports: Vec<String> = Vec::new();
+    for src in &d.export_sources {
+        let text = std::fs::read_to_string(src).expect("read source");
+        for part in text.split("fn x86oracle_").skip(1) {
+            let rest: String = part.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !rest.is_empty() {
+                exports.push(format!("x86oracle_{rest}"));
+            }
+        }
+    }
+    exports.sort();
+    exports.dedup();
+    let def = out.join("x86oracle.def");
+    std::fs::write(&def, format!("LIBRARY x86oracle\nEXPORTS\n{}\n", exports.join("\n"))).expect("write x86oracle.def");
+
+    let target = env::var("TARGET").unwrap();
+    let linker = cc::windows_registry::find_tool(&target, "link.exe").expect("MSVC link.exe not found");
+    let dll = out.join("x86oracle.dll");
+    let mut args = vec![
+        "/NOLOGO".to_string(),
+        "/DLL".to_string(),
+        format!("/OUT:{}", dll.display()),
+        format!("/DEF:{}", def.display()),
+        format!("/IMPLIB:{}", out.join("x86oracle_dll.lib").display()),
+    ];
+    args.extend(d.libs.iter().map(|l| l.display().to_string()));
+    args.extend(d.link_args.iter().cloned());
+    // Long paths can exceed the Windows command-line limit.
+    let rsp = out.join("x86oracle_link.rsp");
+    std::fs::write(&rsp, args.iter().map(|a| format!("\"{a}\"\n")).collect::<String>()).expect("write link response file");
+    let status = linker.to_command().arg(format!("@{}", rsp.display())).status().expect("run link.exe");
+    assert!(status.success(), "linking {} failed", dll.display());
+
+    if let Some(bin) = &d.gmp_bin {
+        for entry in std::fs::read_dir(bin).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.starts_with("gmp") && name.ends_with(".dll") {
+                std::fs::copy(entry.path(), out.join(entry.file_name())).expect("copy gmp DLL");
+            }
+        }
+    }
+
+    println!("cargo::rustc-cfg=x86oracle_dll");
+    println!("cargo::rustc-env=X86ORACLE_DLL={}", dll.display());
+    println!("cargo:rerun-if-changed=src");
+}
+
+fn build_sail(dll: &mut Option<DllParts>) {
     for key in [
         "X86_ORACLE_SAIL_MODEL_C", "X86_ORACLE_SAIL_MODEL_INC",
         "SAIL_LIB_DIR", "SAIL_SYSTEM_GMP", "SAIL_MODEL_DEBUG",
@@ -368,7 +444,7 @@ fn build_sail() {
             cxx.include(inc);
         }
     }
-    cxx.compile("x86oracle_sail");
+    compile(&mut cxx, "x86oracle_sail", dll);
 
     // ---- 2) C: Sail runtime -------------------------------------------------
     let mut crt = cc::Build::new();
@@ -399,16 +475,26 @@ fn build_sail() {
         // Only external runtimes compile elf.c; the model references nothing in it.
         crt.file(sail_lib.join("elf.c"));
     }
-    crt.compile("x86oracle_runtime");
+    compile(&mut crt, "x86oracle_runtime", dll);
 
     // ---- native link deps ----------------------------------------------------
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
-    if let Some(dir) = &gmp_lib_dir {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    }
-    if let Ok(dir) = env::var("ZLIB_LIB_DIR") {
-        println!("cargo:rustc-link-search=native={dir}");
+    if let Some(d) = dll.as_mut() {
+        d.export_sources.push("src/sail.rs");
+        if let Some(dir) = &gmp_lib_dir {
+            d.link_args.push(format!("/LIBPATH:{}", dir.display()));
+        }
+        if let Ok(dir) = env::var("ZLIB_LIB_DIR") {
+            d.link_args.push(format!("/LIBPATH:{dir}"));
+        }
+    } else {
+        if let Some(dir) = &gmp_lib_dir {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        if let Ok(dir) = env::var("ZLIB_LIB_DIR") {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
     }
     if system_gmp {
         let gmp = env::var("GMP_LIB_NAME").unwrap_or_else(|_| "gmp".into());
@@ -431,13 +517,24 @@ fn build_sail() {
                 }
             }
         }
-        let kind = if gmp_static { "static=" } else { "" };
-        println!("cargo:rustc-link-lib={kind}{gmp}");
+        if let Some(d) = dll.as_mut() {
+            d.link_args.push(format!("{gmp}.lib"));
+            if !gmp_static {
+                d.gmp_bin = gmp_lib_dir.as_deref().and_then(Path::parent).map(|p| p.join("bin"));
+            }
+        } else {
+            let kind = if gmp_static { "static=" } else { "" };
+            println!("cargo:rustc-link-lib={kind}{gmp}");
+        }
     }
     if system_runtime {
         let zlib = env::var("ZLIB_LIB_NAME")
             .unwrap_or_else(|_| if target_env == "msvc" { "zlib".into() } else { "z".into() });
-        println!("cargo:rustc-link-lib={zlib}"); // external elf.c may use zlib
+        if let Some(d) = dll.as_mut() {
+            d.link_args.push(format!("{zlib}.lib"));
+        } else {
+            println!("cargo:rustc-link-lib={zlib}"); // external elf.c may use zlib
+        }
     }
 
     for p in [
@@ -541,7 +638,7 @@ fn msvc_config_header(bochs: &Path) -> PathBuf {
 /// Bochs' own `config.cc` is deliberately not compiled: it also initialises the
 /// plugin/device subsystems and aborts without them, so `csrc/bochs_shim.cpp`
 /// builds the small parameter tree the CPU actually reads.
-fn build_bochs() {
+fn build_bochs(dll: &mut Option<DllParts>) {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let bochs = env::var_os("BOCHS_DIR")
         .map(PathBuf::from)
@@ -654,7 +751,7 @@ fn build_bochs() {
     if env::var_os("SAIL_MODEL_DEBUG").is_none() {
         cxx.opt_level(2);
     }
-    cxx.compile("x86oracle_bochs");
+    compile(&mut cxx, "x86oracle_bochs", dll);
 
     // SoftFloat also gets a narrower include set on purpose: Bochs ships a
     // legacy softfloat under cpu/fpu/, and putting cpu/ on the path here lets
@@ -682,7 +779,10 @@ fn build_bochs() {
     if env::var_os("SAIL_MODEL_DEBUG").is_none() {
         sf.opt_level(2);
     }
-    sf.compile("x86oracle_softfloat");
+    compile(&mut sf, "x86oracle_softfloat", dll);
+    if let Some(d) = dll.as_mut() {
+        d.export_sources.push("src/bochs.rs");
+    }
 
     println!("cargo:rerun-if-changed=csrc/bochs_shim.cpp");
     // The whole source root, not just the files listed above: a semantic fix in a
@@ -718,11 +818,18 @@ fn emit_hardware_cfgs() {
 
 fn main() {
     emit_hardware_cfgs();
+    println!("cargo::rustc-check-cfg=cfg(x86oracle_dll)");
+    let mut dll = (env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc"))
+    .then(DllParts::default);
     // Cargo exposes enabled features to the build script as CARGO_FEATURE_*.
     if env::var_os("CARGO_FEATURE_SAIL").is_some() {
-        build_sail();
+        build_sail(&mut dll);
     }
     if env::var_os("CARGO_FEATURE_BOCHS").is_some() {
-        build_bochs();
+        build_bochs(&mut dll);
+    }
+    if let Some(d) = dll.filter(|d| !d.libs.is_empty()) {
+        link_dll(d);
     }
 }

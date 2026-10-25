@@ -18,7 +18,7 @@ use crate::{
     IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_LSTAR, IA32_STAR, SEG_COUNT, SEG_FS, SEG_GS,
 };
 
-extern "C" {
+native_api! {
     fn x86oracle_new() -> *mut c_void;
     fn x86oracle_free(h: *mut c_void);
     fn x86oracle_set_gpr(h: *mut c_void, n: u32, value: u64);
